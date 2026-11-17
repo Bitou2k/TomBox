@@ -727,3 +727,11 @@ Observed: layout hashes are identical across platforms (e.g. `View`); the Xbox c
 writes centroid inputs as `TEXCOORD10_centroid` index 0. Versions differ (14.40 vs 14.50), so
 a key match is a *candidate*, not proof that two shaders come from the same source.
 Not done yet: disambiguation, and comparison by execution.
+
+**First reference check (by inspection, not yet automated).** `xpair --pairs` wrote the 3
+compute pairs whose key is unique on both sides (MaterialSetupCS,
+ComputeDistanceFieldNormalCS, LightGridCompactCS). For ComputeDistanceFieldNormalCS the PC
+disassembly (`fxc /dumpbin`, 17 instructions) and the translation of the Xbox shader agree
+instruction for instruction: same thread-ID math, same constant-buffer elements, same
+texture/sampler/UAV slots and component selections, same store. One shader, read by eye —
+evidence that pairing and register slots line up, not a general correctness claim.

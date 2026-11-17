@@ -46,6 +46,8 @@ fn sig_key(c: &[u8]) -> Vec<u8> {
 }
 
 struct Rec {
+    /// (input file index, offset, compressed size, uncompressed size)
+    loc: (usize, usize, usize, usize),
     sig: Vec<u8>,
     freq: u8,
     head: Vec<u8>,
@@ -53,7 +55,18 @@ struct Rec {
     parsed: bool,
 }
 
-fn load(path: &str) -> Vec<Rec> {
+/// The shader container of a record, re-read from its file.
+fn container(files: &[String], r: &Rec) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&files[r.loc.0]).ok()?;
+    f.seek(SeekFrom::Start(r.loc.1 as u64)).ok()?;
+    let mut src = vec![0u8; r.loc.2];
+    f.read_exact(&mut src).ok()?;
+    let d = if r.loc.2 == r.loc.3 { src } else { lz4_block(&src, r.loc.3)? };
+    split_entry(&d).map(|p| p.container.to_vec())
+}
+
+fn load(path: &str, file_idx: usize) -> Vec<Rec> {
     let data = std::fs::read(path).expect("read");
     let mut out = Vec::new();
     for a in find_archives(&data) {
@@ -63,6 +76,7 @@ fn load(path: &str) -> Vec<Rec> {
             let Some(parts) = split_entry(&d) else { continue };
             let ph = parse_head(parts.head);
             out.push(Rec {
+                loc: (file_idx, off, size, usize_),
                 sig: sig_key(parts.container),
                 freq: a.freq[k],
                 head: parts.head.to_vec(),
@@ -80,10 +94,56 @@ fn main() {
         eprintln!("usage: xpair <xbox pak> <pc archive>...");
         std::process::exit(2);
     }
-    let xb = load(&args[0]);
+    // Options: --pairs <dir> [--stage n] [--limit n] writes pairs whose key (stage + layout
+    // hashes in order + signatures) is unique on both sides as x_<k>.dxbc / p_<k>.dxbc.
+    let mut files: Vec<String> = Vec::new();
+    let (mut pairs_dir, mut stage, mut limit) = (None, None, 50usize);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--pairs" => pairs_dir = it.next().cloned(),
+            "--stage" => stage = it.next().and_then(|v| v.parse::<u8>().ok()),
+            "--limit" => limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(50),
+            _ => files.push(a.clone()),
+        }
+    }
+    let xb = load(&files[0], 0);
     let mut pc = Vec::new();
-    for p in &args[1..] {
-        pc.extend(load(p));
+    for (i, p) in files.iter().enumerate().skip(1) {
+        pc.extend(load(p, i));
+    }
+    if let Some(dir) = pairs_dir {
+        let key = |r: &Rec| {
+            let mut v = vec![r.freq];
+            r.hashes.iter().for_each(|h| v.extend_from_slice(&h.to_le_bytes()));
+            v.extend_from_slice(&r.sig);
+            v
+        };
+        let mut mx: HashMap<Vec<u8>, Vec<&Rec>> = HashMap::new();
+        let mut mp: HashMap<Vec<u8>, Vec<&Rec>> = HashMap::new();
+        xb.iter().for_each(|r| mx.entry(key(r)).or_default().push(r));
+        pc.iter().for_each(|r| mp.entry(key(r)).or_default().push(r));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut n = 0;
+        let mut keys: Vec<&Vec<u8>> = mx.keys().collect();
+        keys.sort();
+        for k in keys {
+            let (x, p) = (&mx[k], mp.get(k));
+            let Some(p) = p else { continue };
+            // Records with no layout hashes at all carry no pairing information.
+            if x.len() != 1 || p.len() != 1 || stage.map(|s| s != x[0].freq).unwrap_or(false) || x[0].hashes.iter().all(|&h| h == 0) {
+                continue;
+            }
+            let (Some(xc), Some(pcc)) = (container(&files, x[0]), container(&files, p[0])) else { continue };
+            std::fs::write(format!("{dir}/x_{n}.dxbc"), xc).expect("write");
+            std::fs::write(format!("{dir}/p_{n}.dxbc"), pcc).expect("write");
+            n += 1;
+            if n >= limit {
+                break;
+            }
+        }
+        println!("wrote {n} unique pairs to {dir}");
+        return;
     }
     println!("xbox entries: {}  (head parsed: {})", xb.len(), xb.iter().filter(|r| r.parsed).count());
     println!("pc entries:   {}  (head parsed: {})", pc.len(), pc.iter().filter(|r| r.parsed).count());
