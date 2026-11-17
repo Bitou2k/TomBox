@@ -161,3 +161,37 @@ item for milestones 13+ (first frame, menu, gameplay).
 Everything *below* the shader is proven working: loader, Xbox PE, physical memory,
 DirectStorage (incl. zlib), 27 GB content load, D3D12.x device/command-list/descriptor/
 resource translation, swap-chain/present, and the game's full init up to UI.
+
+### Update: the native ISA is recoverable (zlib), not encrypted
+
+Further reversing the `XDAT` payload (via the GDK UMD `xgs12_10.dll`, which embeds 53
+reference `XDAT` shaders, and by parsing a dumped VS): the large `XDAT` sub-blob is
+**zlib-compressed** (starts `78 9c`). Inflating it yields an **`FSSM`** container
+(magic `FSSM`, version 0x0101, entry name "Main", `deadbeef` signature placeholders,
+section-offset tables, and resource-binding records). The `FSSM` body is **native RDNA2
+microcode**, confirmed by textbook markers at 4-byte alignment:
+
+* `s_waitcnt`  `0xBF8C....`  (e.g. FSSM+0x2e8, +0x360, +0x39c, +0x400)
+* `s_endpgm`   `0xBF810000`  (FSSM+0x454 — end of the program)
+* `s_code_end` `0xBF9F0000`  (padding after the program)
+* `s_cbranch`  `0xBFA0....`  (control flow)
+
+So the full chain for every shader is:
+
+```
+DXBC container
+  └─ DXIL chunk  (bitcode stripped to "NOBC")
+       └─ XDAT v3  (offset/size section table)
+            └─ zlib (78 9c)
+                 └─ FSSM v0x0101
+                      ├─ resource-binding / register-map metadata
+                      └─ RDNA2 native ISA  (gfx10xx, Series X|S)
+```
+
+**Implication for the translator.** Decompression is trivial (we already link
+`miniz_oxide`). The real work is: (1) parse DXBC→XDAT→FSSM and extract the ISA + bindings
+(tractable); (2) a **RDNA2 disassembler** (documented ISA); (3) a **RDNA2 → DXIL/SPIR-V
+recompiler** (the large subsystem — CFG recovery, SSA, structurization). The outer DXBC
+`ISG1`/`OSG1`/`PSV0`/`RTS0` chunks already give the I/O signatures, pipeline-validation
+info and root signature, which the recompiler needs. Build order: extractor → disassembler
+→ recompiler (simplest shaders first).
