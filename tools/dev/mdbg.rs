@@ -224,8 +224,9 @@ fn main() {
                         let u16s: Vec<u16> = buf[..got].chunks_exact(2).map(|c| u16::from_le_bytes([c[0],c[1]])).collect();
                         String::from_utf16_lossy(&u16s)
                     } else { String::from_utf8_lossy(&buf[..got]).into_owned() };
-                    print!("[ODS] {}", s);
-                    if !s.ends_with('\n') { println!(); }
+                    // The debug string includes its NUL terminator (and usually a newline).
+                    let s = s.replace('\0', "");
+                    println!("[ODS] {}", s.trim_end_matches(['\n', '\r']));
                 }
             }
             1 => { // EXCEPTION. Record: code@0, addr@16, NumParams@24, Info[0]@32, Info[1]@40, firstChance@152

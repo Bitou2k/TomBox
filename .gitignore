@@ -19,3 +19,6 @@ desktop.ini
 
 # Large derived analysis blobs (regenerable)
 analysis/fortnite_symbols.decompressed.bin
+
+# Captured title logs
+analysis/logs/
