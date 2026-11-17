@@ -13,6 +13,8 @@
 //! `docs/FORTNITE_ANALYSIS.md`. Field offsets inferred empirically are validated against
 //! RDNA2 markers before use, so a wrong guess fails loudly rather than yielding garbage.
 
+pub mod rdna2;
+
 /// Little-endian readers with explicit bounds checks.
 fn u32_at(b: &[u8], off: usize) -> Result<u32, String> {
     b.get(off..off + 4)
