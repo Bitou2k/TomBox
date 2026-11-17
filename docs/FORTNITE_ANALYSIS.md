@@ -195,3 +195,34 @@ recompiler** (the large subsystem — CFG recovery, SSA, structurization). The o
 `ISG1`/`OSG1`/`PSV0`/`RTS0` chunks already give the I/O signatures, pipeline-validation
 info and root signature, which the recompiler needs. Build order: extractor → disassembler
 → recompiler (simplest shaders first).
+
+## Server-side code in the client executable (2026-11-17, static, from the symbol DB)
+
+Question: is server gameplay code present in `FortniteClient-XSX-Shipping.exe`? Method:
+function sizes from the symbol database (1,245,949 symbols), spot-checked by disassembly.
+Nothing was executed.
+
+**Present with full-sized bodies**
+- Game mode: `AFortGameModeAthena::StartNewSafeZonePhase` 7,492 bytes, `InitGame` 4,560,
+  `SpawnItemDeliverySupplyDrop` 4,002, `StartAircraftPhase` 2,837, `HandleMatchHasStarted`
+  2,727, `CheckWinConditionLastManStanding` 2,113 (847 symbols in the class).
+- Dedicated-server session: `AFortGameSessionDedicatedAthena::OnPlaylistAssetUpdateComplete`
+  6,578, `AFortGameSessionDedicated::HandleMatchHasEnded` 3,933.
+- Engine login/net path: `UWorld::NotifyControlMessage` 6,995, `UNetConnection::ReceivedPacket`
+  3,620, `AGameModeBase::PreLogin/Login/PostLogin`, `UWorld::SpawnPlayActor`,
+  `UIpNetDriver::InitListen` 333, `AOnlineBeaconHost::InitHost` 415.
+
+**Stripped or stubbed**
+- `UWorld::Listen`: no symbol at all. `AGameModeBase::ProcessServerTravel`: 3 bytes.
+- Player server RPCs: of 372 `A*::Server*_Implementation` symbols, 155 are <= 16 bytes.
+  `ServerExecuteInventoryItem`, `ServerEditBuildingActor`, `ServerRepairBuildingActor`,
+  `ServerPlayEmoteItem`, `ServerAttemptAircraftJump` all share one address whose body is
+  `ret` (identical-code folding of empty functions). `ServerCreateBuildingActor` is 94
+  bytes, `ServerReadyToStartMatch` 10.
+- `UFortKismetLibrary::PickLootDrops`: no native body found under that name.
+
+Reading (inference): the pattern of a client target built without server code — class
+scaffolding and game-mode logic that is not behind the server-code guard survive, the
+listen entry point and most client-to-server RPC bodies do not. Not verified: whether the
+surviving game-mode functions are complete internally (guarded blocks inside a function
+would not show up in its symbol), and nothing here has been run.
