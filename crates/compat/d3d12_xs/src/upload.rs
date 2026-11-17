@@ -351,6 +351,13 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         let mem = core::slice::from_raw_parts((base + map.lo) as *const u8, map.hi - map.lo);
         let h = hash_bytes(mem);
         *hashed += mem.len() as u64;
+        if t.hashes[sub as usize].is_none() && mem.iter().all(|&b| b == 0) {
+            // Never written by the title (fresh committed pages are zero). Do not upload:
+            // the title may instead fill this subresource with a GPU copy
+            // (CopyTextureRegion), which an upload of zeros could overwrite.
+            t.hashes[sub as usize] = Some(h);
+            continue;
+        }
         if t.hashes[sub as usize] != Some(h) {
             changed.push((sub, map, h));
         }
