@@ -24,6 +24,17 @@ fn log_path() -> &'static std::path::PathBuf {
 
 /// Record a call from `module` (e.g. "xmem") to `func` with a short `detail`.
 pub mod net_guard;
+pub mod gdk_user;
+pub mod gdk_store;
+
+/// Value of `key=` in `tombox.cfg` next to the host executable (user-side configuration that
+/// lives with the game data, not in the repository).
+pub fn cfg(key: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let text = std::fs::read_to_string(exe.parent()?.join("tombox.cfg")).ok()?;
+    let prefix = format!("{key}=");
+    text.lines().find_map(|l| l.trim().strip_prefix(prefix.as_str()).map(|v| v.trim().to_string()))
+}
 
 /// Log a compat-layer event. The first call from each compat DLL also installs the
 /// in-process network guard (see `net_guard`), which happens before the title's online
