@@ -6,6 +6,7 @@ members = [
     "crates/tombox-pe",
     "crates/tombox-cli",
     "crates/tombox-archive",
+    "crates/tombox-disasm",
     "crates/compat/compat-common",
     "crates/compat/xmem",
     "crates/compat/d3d12_xs",

@@ -176,3 +176,44 @@ log → implement the next required function. This is a substantial new subsyste
 - `mdbg` debug tracer (OutputDebugString + exception + exit-stack capture) — to be
   formalized into the repo as `tombox-trace`.
 - `mdparse` minidump parser (exception code/address/faulting module).
+
+## 2026-11-16 — Session 2 cont.: root cause pinned to the instruction (UE project load)
+
+### Milestone: the game boots into UE engine init; exit cause fully traced
+Built a self-contained x64 disassembler (`crates/tombox-disasm`, iced-x86 + tombox-pe
+RVA mapping + symbol resolution) and a full symbol resolver from the shipped
+`FortniteClient-XSX-Shipping-Symbols.bin` (1,245,949 named functions; verified: EXE
+entry RVA 0x229a298 -> WinMainCRTStartup). Extended the debug tracer (`mdbg`) with
+EXE breakpoints + register/stack/FString capture + a continuing CreateFileW probe.
+
+### The exit path, traced end to end (all confirmed at runtime)
+`WinMainCRTStartup` -> `WinMain` (0xb45c64): calls `XGameRuntimeInitialize` (succeeds),
+`GuardedMainWrapper` -> `GuardedMain` (0xb46088) -> `EnginePreInit` (0x2bcd12c) ->
+`FEngineLoop::PreInitPreStartupScreen` (0xe6d82c) **returns 1** (captured eax=1 at
+EnginePreInit's test). Bisected PreInitPreStartupScreen by runtime breakpoints to:
+`IProjectManager::Get` -> virtual `[+0x10]` = **`FProjectManager::LoadProjectFile`**
+(RVA 0x15071cc) returns FALSE -> PreInit bails before RHI (no d3d12_xs ever called).
+
+### Root cause (exact)
+`LoadProjectFile` -> `FProjectDescriptor::Load` (0x15072e4) ->
+`FFileHelper::LoadFileToString("../../../FortniteGame/FortniteGame.uproject")`
+**returns FALSE** (captured al=0). The game cannot read its **project descriptor** and
+aborts. Notes:
+- No `.uproject` exists anywhere in the package (archive, EmbeddedXvd, EXE strings).
+- Placing a valid `.uproject` at the resolved relative path (Mount/FortniteGame/) did
+  NOT satisfy it; the read still fails.
+- A `CreateFileW` trace caught **zero** file opens -> the GDK/Xbox platform file layer
+  uses a different API (almost certainly **`CreateFile2`**) and/or a package-mount
+  namespace, not plain Win32 loose-file reads.
+
+### Interpretation
+On real Xbox the project descriptor is served by the console package file system
+(`FXboxPlatformFile`) from the cooked package; our loose-file PC layout + the absent
+Xbox platform-file semantics mean the read fails. **Next subsystem: Xbox platform
+file / content mounting** (how the title resolves and reads packaged files), to make
+`FFileHelper::LoadFileToString` succeed for the descriptor (and later, pak/IoStore).
+
+### Tooling note
+`crates/tombox-disasm` is committed. The diagnostic tracer (`mdbg`), minidump parser
+(`mdparse`), symbol resolver (`symres`) and export/IAT readers currently live in the
+session scratchpad and should be formalized into the repo (`tombox-trace`, `tombox-sym`).
