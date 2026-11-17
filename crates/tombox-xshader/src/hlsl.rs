@@ -159,6 +159,8 @@ struct Emitter<'a> {
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     is_cs: bool,
     is_gs: bool,
+    /// Compute shader uses LDS (groupshared memory).
+    uses_lds: bool,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
     /// Pixel shader needs its position within the 2x2 quad (ds_swizzle).
@@ -194,6 +196,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         tbuf_uint: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
         is_gs: ex.stage == Stage::Geometry,
+        uses_lds: false,
         live: Vec::new(),
         uses_quad: false,
         regs: BTreeSet::new(),
@@ -680,6 +683,10 @@ impl<'a> Emitter<'a> {
         self.line(&format!("// {:#06x} {m}", ins.offset));
         match ins.enc {
             Enc::Sopp if ins.op == 0x10 => self.emit_sendmsg(ins),
+            Enc::Sopp if ins.op == 0x0a && self.is_cs => {
+                self.line("GroupMemoryBarrierWithGroupSync();");
+                Ok(())
+            }
             Enc::Sopp => {
                 let cond = match ins.op {
                     2 => Some("true".to_string()),
@@ -816,6 +823,15 @@ impl<'a> Emitter<'a> {
                     }
                     "s_cmov_b32" => self.ws(&d, &format!("((scc != 0u) ? {a} : {})", name(&d)?)),
                     "s_brev_b32" => self.ws(&d, &format!("reversebits({a})")),
+                    "s_bcnt1_i32_b64" => {
+                        // Population count of a 64-bit value — typically the number of active
+                        // lanes (wave-level allocation). One invocation = one lane, so a lane
+                        // mask counts as 0 or 1.
+                        let ah = r(&hi(&s[0]))?;
+                        self.ws(&d, &format!("(countbits({a}) + countbits({ah}))"))?;
+                        self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
+                        Ok(())
+                    }
                     "s_bcnt1_i32_b32" => {
                         self.ws(&d, &format!("countbits({a})"))?;
                         self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
@@ -949,6 +965,62 @@ impl<'a> Emitter<'a> {
             Enc::Mubuf => self.emit_mubuf(idx, ins),
             Enc::Ds if self.is_gs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
                 self.emit_gs_lds(ins)
+            }
+            Enc::Ds if self.is_cs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
+                // Compute: LDS is the thread group's shared memory → an HLSL `groupshared`
+                // array addressed by byte address / 4 (32 KiB, the D3D groupshared limit).
+                self.uses_lds = true;
+                let off = ins.aux.imm as u32;
+                let (off0, off1) = (off & 0xff, (off >> 8) & 0xff);
+                let addr = r(&s[0])?;
+                let at = |o: u32| format!("tb_lds[(({addr} + {o:#x}u) >> 2) & 8191u]");
+                let vd = match d {
+                    Some(Opnd::Vgpr(v)) => v,
+                    _ => return Err("bad vdst".into()),
+                };
+                let t = self.tmp;
+                self.tmp += 1;
+                match m {
+                    "ds_read_b32" => {
+                        self.line(&format!("uint t{t} = {};", at(off & 0xffff)));
+                        self.wv(&Opnd::Vgpr(vd), &format!("t{t}"))
+                    }
+                    "ds_read2_b32" => {
+                        self.line(&format!("uint t{t}a = {}; uint t{t}b = {};", at(off0 * 4), at(off1 * 4)));
+                        self.wv(&Opnd::Vgpr(vd), &format!("t{t}a"))?;
+                        self.wv(&Opnd::Vgpr(vd + 1), &format!("t{t}b"))
+                    }
+                    "ds_write_b32" => {
+                        self.line(&format!("if (exec_lo & 1u) {} = {};", at(off & 0xffff), r(&s[1])?));
+                        Ok(())
+                    }
+                    _ => {
+                        self.line(&format!(
+                            "if (exec_lo & 1u) {{ {} = {}; {} = {}; }}",
+                            at(off0 * 4),
+                            r(&s[1])?,
+                            at(off1 * 4),
+                            r(&s[2])?
+                        ));
+                        Ok(())
+                    }
+                }
+            }
+            Enc::Ds if self.is_cs && matches!(m, "ds_add_u32" | "ds_add_rtn_u32") => {
+                // Atomic add on group-shared memory (optionally returning the old value).
+                self.uses_lds = true;
+                let off = ins.aux.imm as u32 & 0xffff;
+                let addr = r(&s[0])?;
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!(
+                    "uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedAdd(tb_lds[(({addr} + {off:#x}u) >> 2) & 8191u], {}, t{t}); }}",
+                    r(&s[1])?
+                ));
+                if m == "ds_add_rtn_u32" {
+                    self.wv(&d.ok_or("no dst")?, &format!("t{t}"))?;
+                }
+                Ok(())
             }
             Enc::Ds if m == "ds_swizzle_b32" => {
                 // Quad swizzle (QDMode): each lane of a 2x2 pixel quad reads the lane selected
@@ -1798,6 +1870,9 @@ impl<'a> Emitter<'a> {
                 _ => return Err(format!("UAV dim {dim} unsupported")),
             };
             let _ = writeln!(h, "{ty} uav{slot} : register(u{slot});");
+        }
+        if self.is_cs && self.uses_lds {
+            let _ = writeln!(h, "groupshared uint tb_lds[8192];");
         }
         if self.is_cs {
             // Compute ABI (from ClearCS + FSSM metadata): local thread id in v0..v2, the

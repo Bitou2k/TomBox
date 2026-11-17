@@ -111,7 +111,7 @@ pub fn sop1(op: u32) -> Option<&'static str> {
     Some(match op {
         0x03 => "s_mov_b32", 0x04 => "s_mov_b64", 0x05 => "s_cmov_b32", 0x06 => "s_cmov_b64",
         0x07 => "s_not_b32", 0x08 => "s_not_b64", 0x09 => "s_wqm_b32", 0x0a => "s_wqm_b64",
-        0x0b => "s_brev_b32", 0x0f => "s_bcnt1_i32_b32", 0x13 => "s_ff1_i32_b32",
+        0x0b => "s_brev_b32", 0x0f => "s_bcnt1_i32_b32", 0x10 => "s_bcnt1_i32_b64", 0x13 => "s_ff1_i32_b32",
         0x15 => "s_flbit_i32_b32", 0x19 => "s_sext_i32_i8", 0x1a => "s_sext_i32_i16",
         0x1f => "s_getpc_b64", 0x20 => "s_setpc_b64", 0x21 => "s_swappc_b64",
         0x24 => "s_and_saveexec_b64", 0x25 => "s_or_saveexec_b64", 0x26 => "s_xor_saveexec_b64",
@@ -217,6 +217,8 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
         Enc::Exp => Some("exp"),
         Enc::Ds => match op {
             0x35 => Some("ds_swizzle_b32"),
+            0x00 => Some("ds_add_u32"),
+            0x20 => Some("ds_add_rtn_u32"),
             0x0d => Some("ds_write_b32"),
             0x0e => Some("ds_write2_b32"),
             0x36 => Some("ds_read_b32"),
