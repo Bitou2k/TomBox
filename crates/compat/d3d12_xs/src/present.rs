@@ -313,6 +313,7 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
         return 0;
     }
     let src = *pp;
+    crate::upload::pump(queue); // mirror placed-texture memory into the PC textures
     let mut guard = STATE.lock().unwrap();
     if guard.is_none() {
         match init(queue, src) {

@@ -823,6 +823,87 @@ unsafe extern "system" fn create_placed_resource(
     hr
 }
 
+/// Xbox slot 44 `CreatePlacedResourceX` (see placed.rs for evidence and model).
+unsafe extern "system" fn create_placed_resource_x(
+    this: *mut DeviceWrapper, va: u64, pdesc: *const u8, init_state: u32,
+    pclear: *const c_void, _riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    if pdesc.is_null() || ppv.is_null() {
+        record("d3d12_xs", "CreatePlacedResourceX", "null desc/out -> E_INVALIDARG");
+        return 0x80070057u32 as i32;
+    }
+    let orig: [u8; 0x38] = unsafe { core::slice::from_raw_parts(pdesc, 0x38) }.try_into().unwrap();
+    let mut d = orig;
+    let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
+    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    d[8..16].copy_from_slice(&0u64.to_le_bytes()); // Alignment: let the host choose
+    d[0x2c..0x30].copy_from_slice(&(if dim == 1 { 1u32 } else { 0u32 }).to_le_bytes()); // Layout: ROW_MAJOR for buffers, UNKNOWN for textures (Xbox tile modes have no PC meaning)
+    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
+    let heap: [u32; 5] = [1 /* DEFAULT */, 0, 0, 1, 1];
+    let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(27)) };
+    let hr = unsafe { f(real, heap.as_ptr(), 0, d.as_ptr(), init_state, pclear, &IID_ID3D12RESOURCE, ppv) };
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if hr < 0 || n < 12 {
+        record("d3d12_xs", "CreatePlacedResourceX", &format!(
+            "#{n} va={va:#x} state={init_state:#x} clear={pclear:p} {} -> hr={hr:#010x} res={:p}",
+            desc_str(&orig), unsafe { *ppv }));
+    }
+    if hr >= 0 {
+        // One reference for the placement registry (released by upload.rs).
+        let res = unsafe { *ppv };
+        let addref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*real_vtbl(res).add(1)) };
+        unsafe { addref(res) };
+        crate::placed::register(res, crate::placed::Placed { va, desc: orig, init_state });
+    }
+    hr
+}
+
+/// Xbox slot 61: extended sampler create, `(this, const XboxSamplerDesc*, D3D12_CPU_DESCRIPTOR_HANDLE)`.
+///
+/// Evidence: `FD3D12Device::CreateSamplerInternal` (EXE+0xd2c908). For every filter except
+/// `D3D12_FILTER_ANISOTROPIC` (0x55) it calls the standard `CreateSampler` (slot 22). For
+/// anisotropic it zero-fills a 0x6C-byte block and copies the standard desc into it:
+///   +0x18/+0x1C/+0x20 AddressU/V/W, +0x24 MinLOD, +0x28 MaxLOD, +0x2C MipLODBias,
+///   +0x34 MaxAnisotropy, +0x40 ComparisonFunc
+/// plus constants at +0x04/+0x08 (3), +0x0C (2) and two console-variable clamps at +0x3C
+/// (<= 7) and +0x54 (<= 15) whose meaning is unverified (they look like per-axis anisotropy
+/// limits). The border colour is left zero.
+///
+/// Implemented as the standard anisotropic sampler those fields were copied from; the
+/// unverified extra fields are ignored (so any Xbox-specific anisotropy bias is not modelled).
+unsafe extern "system" fn create_sampler_x(this: *mut DeviceWrapper, xdesc: *const u8, dest: usize) {
+    let real = unsafe { (*this).real };
+    if xdesc.is_null() {
+        record("d3d12_xs", "CreateSamplerX", "null desc - ignored");
+        return;
+    }
+    let x = unsafe { core::slice::from_raw_parts(xdesc, 0x6c) };
+    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+    let mut d = [0u8; 0x34]; // D3D12_SAMPLER_DESC
+    let mut put = |o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    put(0x00, 0x55); // D3D12_FILTER_ANISOTROPIC
+    put(0x04, u(0x18));
+    put(0x08, u(0x1c));
+    put(0x0c, u(0x20));
+    put(0x10, u(0x2c)); // MipLODBias
+    put(0x14, u(0x34).clamp(1, 16)); // MaxAnisotropy
+    put(0x18, u(0x40)); // ComparisonFunc
+    put(0x2c, u(0x24)); // MinLOD
+    put(0x30, u(0x28)); // MaxLOD
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(*real_vtbl(real).add(22)) };
+    unsafe { f(real, d.as_ptr(), dest) };
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        record("d3d12_xs", "CreateSamplerX", &format!(
+            "addr={}/{}/{} maxAniso={} cmp={} lod=[{},{}] bias={} extra(+3c={},+54={}) dest={dest:#x}",
+            u(0x18), u(0x1c), u(0x20), u(0x34), u(0x40), f32::from_bits(u(0x24)), f32::from_bits(u(0x28)),
+            f32::from_bits(u(0x2c)), u(0x3c), u(0x54)));
+    }
+}
+
 // Per-slot logging stubs for the Xbox device extensions (44+): capture slot +
 // caller RVA and return S_OK (most are hints like SetFrameIntervalX that the RHI
 // only checks for success). This reveals which Xbox device methods the game needs.
@@ -890,6 +971,8 @@ fn vtable() -> *const usize {
         v[79] = crate::frame::schedule_frame_event_x as usize;
         v[80] = crate::frame::wait_frame_event_x as usize;
         v[81] = crate::frame::frame_statistics_x as usize;
+        v[44] = create_placed_resource_x as usize; // CreatePlacedResourceX
+        v[61] = create_sampler_x as usize; // Xbox extended (anisotropic) sampler create
         v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
         v[55] = create_derived_pso_x as usize; // Xbox derived-PSO create (base PSO + state patches)
         v[62] = create_compute_pso_x as usize; // Xbox compute PSO create

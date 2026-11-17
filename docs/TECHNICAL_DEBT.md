@@ -76,3 +76,24 @@ Honest ledger. Updated continuously.
 * `v_readfirstlane` / `v_mbcnt` / `s_bcnt1(exec)` are translated under a one-lane-per-
   invocation model (exact only when the compiler used them for wave-level bookkeeping).
 * Translated output has not yet been validated against rendered pixels.
+
+## Placed textures / texel mirroring (2026-11-17)
+
+- **State assumption.** Uploads transition the PC texture from its *creation* state to
+  COPY_DEST and back; the title's own barriers are not tracked. Wrong if the title has moved
+  the texture to another state when the upload list runs.
+- **No write notification.** Changes are found by hashing title memory each frame under a
+  byte budget (96 MiB new, 8 MiB re-check). A changed texture can lag by several frames, and
+  the scan costs CPU every frame. Write-watch (`MEM_WRITE_WATCH`) would be the proper fix.
+- **Racy reads.** Title threads write while we read (repaired on a later frame); a decommit
+  racing the read would fault.
+- **Streamed mips.** Subresources whose memory is not committed are skipped; the PC texture's
+  corresponding mips hold undefined data until the title maps them. Whether the title limits
+  sampling to resident mips has not been checked.
+- **Not mirrored:** Texture3D, multi-plane formats, render-target/depth placed textures.
+- **Layout source.** Element offsets come from the dump's real `xg_xs.dll` (vtable slots
+  verified by probe for layout 261 only; other tile modes untested).
+- **Extended sampler (slot 61).** Fields +0x3C/+0x54 of the Xbox desc are ignored.
+- **XALLOC_ATTRIBUTES** bit layout is recalled from the public XDK header and matches the two
+  attribute values seen; not checked against a header in this repo. Page size / memory type
+  fields are ignored.

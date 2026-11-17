@@ -574,3 +574,39 @@ undebugged; cause unknown).
 
 Tools: `tools/dev/mdbg.rs` gained `MDBG_LIMIT` and `MDBG_HANGDUMP` (all-thread stack scan);
 `tools/dev/hang.sh` symbolises the dump.
+
+## 2026-11-17 (evening) — placed textures, title screen visible
+
+**Slot 44 `CreatePlacedResourceX`.** Call site `FXboxCommonD3D12Adapter::CreatePlacedResourceX`
+(EXE+0x5c4610) passes `(VirtualAddress, desc, InitialState, null clear, riid, ppv)` — the
+public GDK signature. Caller `CreateVirtualTexture` reserves a 64 KiB-aligned block (streamed
+textures) or takes memory from a small-texture pool / `XMemAlloc`. Implemented as a committed
+PC texture plus a registry entry (`d3d12_xs/src/placed.rs`). ~5,100 textures are created on
+the way to the title screen, all with Xbox layout value 261.
+
+**Slot 61 extended sampler.** `FD3D12Device::CreateSamplerInternal` uses it only for
+anisotropic filters, with a 0x6C-byte desc copied from the standard one; implemented as the
+standard anisotropic sampler (two extra clamp fields ignored, meaning unverified).
+
+**Texel mirroring (`d3d12_xs/src/upload.rs`).** The texel memory is in the console's tiled
+layout and the title never announces writes. The real `xg_xs.dll` from the dump runs natively
+and provides the layout: `tools/dev/xgprobe.rs` verified vtable slot 6
+(`GetTexelElementOffsetBytes`) against slot 8 (`CopyIntoSubresource`) for every element of
+five texture shapes. Slot 9 (`CopyFromSubresource`) returns E_INVALIDARG off-console (needs
+an exclusive-lock object), so de-tiling is done from slot-6 offsets. Each PresentX hashes
+title memory (new subresources first, uploaded ones round-robin, byte budgets) and re-uploads
+changes through a private command list.
+
+**`XMemAlloc` alignment.** 469 texture allocations use attributes 0x30804000; decoding the
+XALLOC_ATTRIBUTES bit layout (alignment = bits 24..28, log2) gives 64 KiB. The shim ignored
+it and returned heap pointers; it now page-allocates aligned requests.
+
+**Result (one 170 s debugger run, 2,400 frames):** the host window shows the title's own
+title screen — FORTNITE logo, yellow button with the X-button glyph, Unreal/Epic logos
+(`analysis/evidence/2026-11-17_title_screen_logo.png`). The log reaches
+`UFortUIStateWidget_Login::HandleLoginRequestComplete ... Unable to complete login`, which is
+the expected outcome with the network guard on.
+
+**Not yet true:** no text (font glyph textures are not arriving — path not yet identified);
+no input, no audio; unmapped streamed mips are skipped (re-tried every frame); command-list
+slots 67/68/83 are still no-ops; device slot 74 still a logging stub.

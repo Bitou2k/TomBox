@@ -47,9 +47,65 @@ const PAGE_EXECUTE_ANY: u32 = 0x10 | 0x20 | 0x40 | 0x80; // execute bits
 
 // ---- Heap-backed (real) implementations ----
 
+// XALLOC_ATTRIBUTES bit layout (public XDK xmem.h MAKE_XALLOC_ATTRIBUTES, recalled, and
+// consistent with every value this title passes):
+//   bits  0..13 object type, 14..15 page size, 16..23 allocator id, 24..28 alignment
+//   (log2 bytes), 29..32 memory type.
+// Observed: 0x0480009e -> alignment 2^4 (ordinary allocations) and 0x30804000 -> alignment
+// 2^16, memory type 1, used for texture memory that is then handed to CreatePlacedResourceX.
+// Ignoring the alignment gave the title unaligned texture addresses.
+fn xalloc_alignment(attributes: u64) -> usize {
+    1usize << ((attributes >> 24) & 0x1f)
+}
+
+/// Pointers handed out by the page-aligned path (freed with VirtualFree, not HeapFree).
+static ALIGNED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> = std::sync::Mutex::new(None);
+
+fn alloc_aligned(size: usize, align: usize) -> *mut c_void {
+    const MEM_RELEASE: u32 = 0x8000;
+    let size = size.max(1);
+    let p = if align <= 0x1_0000 {
+        // VirtualAlloc returns addresses aligned to the 64 KiB allocation granularity.
+        unsafe { VirtualAlloc(core::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }
+    } else {
+        // Larger alignments: find a hole with a throwaway reservation, then claim the
+        // aligned address inside it (retry if another thread takes it first).
+        let mut out = core::ptr::null_mut();
+        for _ in 0..16 {
+            let probe = unsafe { VirtualAlloc(core::ptr::null_mut(), size + align, MEM_RESERVE, PAGE_NOACCESS) };
+            if probe.is_null() {
+                break;
+            }
+            unsafe { VirtualFree(probe, 0, MEM_RELEASE) };
+            let want = ((probe as usize + align - 1) & !(align - 1)) as *mut c_void;
+            out = unsafe { VirtualAlloc(want, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            if !out.is_null() {
+                break;
+            }
+        }
+        out
+    };
+    if !p.is_null() {
+        ALIGNED.lock().unwrap().get_or_insert_with(Default::default).insert(p as usize);
+    }
+    p
+}
+
+/// Returns true if `address` came from `alloc_aligned` (and has now been released).
+fn free_aligned(address: *mut c_void) -> bool {
+    const MEM_RELEASE: u32 = 0x8000;
+    let was = ALIGNED.lock().unwrap().as_mut().map_or(false, |s| s.remove(&(address as usize)));
+    if was {
+        unsafe { VirtualFree(address, 0, MEM_RELEASE) };
+    }
+    was
+}
+
 #[no_mangle]
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    let p = unsafe { HeapAlloc(GetProcessHeap(), 0, size.max(1)) };
+    let align = xalloc_alignment(attributes);
+    // HeapAlloc guarantees 16-byte alignment on x64.
+    let p = if align > 16 { alloc_aligned(size, align) } else { unsafe { HeapAlloc(GetProcessHeap(), 0, size.max(1)) } };
     record(M, "XMemAlloc", &format!("size={size} attrs={attributes:#x} -> {p:p}"));
     p
 }
@@ -64,7 +120,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 #[no_mangle]
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     record(M, "XMemFree", &format!("addr={address:p} attrs={attributes:#x}"));
-    if !address.is_null() {
+    if !address.is_null() && !free_aligned(address) {
         unsafe { HeapFree(GetProcessHeap(), 0, address) };
     }
 }
