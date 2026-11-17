@@ -510,24 +510,30 @@ unsafe extern "system" fn create_gfx_pso_x(
     this: *mut DeviceWrapper, pdesc: *const u8, riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
     let real = unsafe { (*this).real };
-    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    if n < 3 && !pdesc.is_null() {
-        // PC D3D12_GRAPHICS_PIPELINE_STATE_DESC: RootSig@0, VS{ptr@8,len@0x10}, PS{ptr@0x18,len@0x20}
-        let rd = |o: usize| unsafe { core::ptr::read_unaligned(pdesc.add(o) as *const u64) };
-        let (rootsig, vs_ptr, vs_len, ps_ptr) = (rd(0), rd(8), rd(0x10), rd(0x18));
-        let magic = if vs_ptr > 0x10000 { unsafe { core::ptr::read_unaligned(vs_ptr as *const u32) } } else { 0 };
-        let magic_s = magic.to_le_bytes();
-        record("d3d12_xs", "CreateGraphicsPSO_X",
-            &format!("rootSig={rootsig:#x} VS={vs_ptr:#x}(len={vs_len}) PS={ps_ptr:#x} shaderMagic={magic:#x} ({:?})",
-                core::str::from_utf8(&magic_s).unwrap_or("?")));
-    }
+    static OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static FAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
     let hr = unsafe { f(real, pdesc, riid, ppv) };
-    if n < 3 {
-        let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
-        record("d3d12_xs", "CreateGraphicsPSO_X", &format!("-> hr={hr:#010x} pso={out:p}"));
+    if hr == 0 {
+        OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let fc = FAIL.fetch_add(1, Ordering::Relaxed);
+        // The Fortnite XSX shaders ship as Xbox-native "XDAT" blobs inside the DXIL
+        // container with the portable LLVM bitcode stripped ("NOBC") — see
+        // docs/FORTNITE_ANALYSIS.md. The PC runtime cannot build a PSO from them, so
+        // every forward returns E_OUTOFMEMORY. Rendering the real game needs an
+        // XDAT -> DXIL/SPIR-V shader translator (not yet built); until then PSO
+        // creation legitimately fails. Log the first couple for visibility.
+        if fc < 2 {
+            record("d3d12_xs", "CreateGraphicsPSO_X",
+                &format!("FAIL hr={hr:#010x} (Xbox-native XDAT shader, portable bytecode stripped — translator pending)"));
+        }
+    }
+    static LOGN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if LOGN.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+        record("d3d12_xs", "CreateGraphicsPSO_X",
+            &format!("counts: ok={} fail={}", OK.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)));
     }
     hr
 }

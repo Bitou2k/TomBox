@@ -88,6 +88,27 @@ fn host_proc(name: &[u8]) -> usize {
     unsafe { GetProcAddress(h, name.as_ptr()) as usize }
 }
 
+/// Enable experimental shader models so the PC D3D12 runtime accepts the game's
+/// DXIL without re-validating/-signing it against the MS validator. Xbox shaders are
+/// standard DXIL but signed by the GDK validator; without this the runtime rejects
+/// every graphics PSO with E_OUTOFMEMORY. Must be called before device creation.
+/// Requires Windows Developer Mode; logs the HRESULT either way.
+fn enable_experimental_shader_models() {
+    #[repr(C)]
+    struct Guid { a: u32, b: u16, c: u16, d: [u8; 8] }
+    // D3D12ExperimentalShaderModels {76f5573e-f13a-40f5-b297-81ce9e18933f}
+    const EXP_SM: Guid = Guid { a: 0x76f5_573e, b: 0xf13a, c: 0x40f5, d: [0xb2, 0x97, 0x81, 0xce, 0x9e, 0x18, 0x93, 0x3f] };
+    let p = host_proc(b"D3D12EnableExperimentalFeatures\0");
+    if p == 0 {
+        record(M, "exp", "D3D12EnableExperimentalFeatures missing");
+        return;
+    }
+    let f: extern "system" fn(u32, *const Guid, *const c_void, *const u32) -> i32 =
+        unsafe { core::mem::transmute(p) };
+    let hr = f(1, &EXP_SM, core::ptr::null(), core::ptr::null());
+    record(M, "exp", &format!("EnableExperimentalFeatures(ShaderModels) hr={hr:#010x}"));
+}
+
 /// Xbox device creation -> real PC D3D12 device. adapter/params ignored; the
 /// device IID matches PC ID3D12Device.
 #[no_mangle]
@@ -97,6 +118,7 @@ pub extern "system" fn D3D12XboxCreateDevice(
     riid: *const c_void,
     pp_device: *mut *mut c_void,
 ) -> i32 {
+    enable_experimental_shader_models();
     maybe_enable_debug_layer();
     let p = host_proc(b"D3D12CreateDevice\0");
     if p == 0 {

@@ -124,3 +124,40 @@ in the system image, and the EXE importing `DxcCreateInstance`. PC D3D12 consume
 3. Shader container format inside IoStore assets.
 4. Which `api-ms-win-*` behaviours diverge from desktop (per-symbol).
 5. Whether `FEngineLoop` can reach a device offline given `RequiresXboxLive`.
+
+## Shader format — DEFINITIVE finding (2026-11-17): Xbox-native "XDAT", DXIL stripped
+
+The single largest rendering risk is now resolved with hard evidence. The RHI creates
+graphics pipelines via **Xbox device vtable slot 60** (compute = slot 55), which we
+forward to PC `ID3D12Device::CreateGraphicsPipelineState` (slot 10). Every forward
+fails with `E_OUTOFMEMORY` (0x8007000E), with NO D3D12 debug-layer validation message
+— i.e. the runtime/driver rejects the shader bytecode itself, not the PSO desc.
+
+Dumping a real VS + PS at runtime and parsing the container (`analysis/`):
+
+* Container is a standard **DXBC wrapper**, 7 chunks: `SFI0 ISG1 OSG1 PSV0 RTS0 HASH DXIL`.
+  Input/output signatures, pipeline-state validation and an **embedded root signature
+  (RTS0)** are all present and well-formed. Shader model reported = **6.0**, type = VS/PS.
+* The `DXIL` chunk's `DxilBitcodeHeader` reports `BitcodeOffset=1580, BitcodeSize=4`, and
+  those 4 bytes are **`NOBC`** ("NO BitCode") — the portable LLVM DXIL bitcode has been
+  **stripped at build time**. The magic `42 43 C0 DE` ("BC\xC0\xDE") appears **nowhere**
+  in the container.
+* In its place, immediately after the `DxilProgramHeader`, is an Xbox-proprietary blob
+  beginning **`XDAT`** (version 3) with a table of offset/size sub-blobs (e.g. 72/904,
+  976/587). This is the console's precompiled native shader payload.
+* No AMD `s_endpgm` (`0xBF810000`) terminator is visible in the obvious encoding, so the
+  `XDAT` payload is either an Xbox shader IR consumed by the GDK UMD (`xgs12_10.dll`) at
+  PSO-create time, or packed/relocated native RDNA2 microcode — not final raw ISA in the
+  clear.
+
+**Consequence.** This build does not carry portable shader bytecode. The PC D3D12 runtime
+cannot build any graphics/compute PSO from `XDAT`. The game therefore boots fully, opens
+its "Gaming UI" window, starts the render + RHI threads, but renders **black** because no
+pipeline can be created. Reaching a real first frame requires an **`XDAT` → DXIL/SPIR-V
+shader translator** — reverse-engineering the Xbox shader container (and, if it is native
+ISA, an RDNA2 recompiler). This is now the dominant remaining subsystem and the gating
+item for milestones 13+ (first frame, menu, gameplay).
+
+Everything *below* the shader is proven working: loader, Xbox PE, physical memory,
+DirectStorage (incl. zlib), 27 GB content load, D3D12.x device/command-list/descriptor/
+resource translation, swap-chain/present, and the game's full init up to UI.
