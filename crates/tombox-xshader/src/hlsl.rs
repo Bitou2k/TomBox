@@ -42,6 +42,17 @@ enum Res {
 
 const XYZW: [&str; 4] = ["x", "y", "z", "w"];
 
+/// RDNA2 cube-map helpers. v_cube{ma,sc,tc,id}_f32 follow the ISA definition (major axis ×2,
+/// face-local S/T, face index 0..5 = +X,-X,+Y,-Y,+Z,-Z). Hardware cube sampling takes
+/// (s, t, face) with s,t = sc/|ma| + 1.5 (so each is in [1, 2]); `tb_cube_dir` inverts that
+/// to the direction vector HLSL TextureCube sampling expects.
+const CUBE_HELPERS: &str = r#"float tb_cubema(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return 2.0 * z; if (ay >= ax) return 2.0 * y; return 2.0 * x; }
+float tb_cubesc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? -x : x; if (ay >= ax) return x; return x < 0.0 ? z : -z; }
+float tb_cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return -y; if (ay >= ax) return y < 0.0 ? -z : z; return -y; }
+float tb_cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? 5.0 : 4.0; if (ay >= ax) return y < 0.0 ? 3.0 : 2.0; return x < 0.0 ? 1.0 : 0.0; }
+float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v = (t - 1.5) * 2.0; int f = (int)round(face); if (f == 0) return float3(1.0, -v, -u); if (f == 1) return float3(-1.0, -v, u); if (f == 2) return float3(u, 1.0, v); if (f == 3) return float3(u, -1.0, -v); if (f == 4) return float3(u, -v, 1.0); return float3(-u, -v, -1.0); }
+"#;
+
 fn name(o: &Opnd) -> Result<String, String> {
     Ok(match o {
         Opnd::Sgpr(n) => format!("s{n}"),
@@ -138,8 +149,11 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         out_params: ex.output_sig.iter().filter(|e| e.sysval == 0).collect(),
     };
     em.resolve_resources()?;
+    let live_in = em.live_in();
     em.emit_body(is_ps)?;
-    let hlsl = em.finish(is_ps)?;
+    let mut hlsl = em.finish(is_ps)?;
+    hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
+", live_in.join(" ")));
     Ok(Translated { hlsl, entry: "main", profile })
 }
 
@@ -283,6 +297,44 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Registers read before any write in program order — i.e. the shader's entry ABI
+    /// (interpolation barycentrics, fragment position, user-data SGPRs, thread ids...).
+    fn live_in(&self) -> Vec<String> {
+        let mut written: BTreeSet<String> = BTreeSet::new();
+        let mut live: BTreeSet<(u8, u32)> = BTreeSet::new();
+        for ins in &self.insns {
+            if ins.mnemonic == "v_nop" {
+                continue;
+            }
+            for o in &ins.src {
+                if let Opnd::Sgpr(n) | Opnd::Vgpr(n) = o {
+                    let nm = name(o).unwrap_or_default();
+                    if !written.contains(&nm) {
+                        live.insert((if matches!(o, Opnd::Vgpr(_)) { 1 } else { 0 }, *n as u32));
+                    }
+                }
+            }
+            // Multi-register destinations: SMEM loads, MIMG results, 64-bit scalar ops.
+            let extra = match ins.enc {
+                Enc::Smem => (1u32 << (ins.op & 7)) - 1,
+                Enc::Mimg => (ins.aux.mask.count_ones()).saturating_sub(1),
+                _ if ins.mnemonic.ends_with("_b64") => 1,
+                _ => 0,
+            };
+            for o in &ins.dst {
+                if let Ok(nm) = name(o) {
+                    written.insert(nm);
+                }
+                match o {
+                    Opnd::Sgpr(n) => (1..=extra).for_each(|k| { written.insert(format!("s{}", *n as u32 + k)); }),
+                    Opnd::Vgpr(n) => (1..=extra).for_each(|k| { written.insert(format!("v{}", *n as u32 + k)); }),
+                    _ => {}
+                }
+            }
+        }
+        live.iter().map(|(k, n)| format!("{}{}", if *k == 1 { "v" } else { "s" }, n)).collect()
+    }
+
     fn line(&mut self, s: &str) {
         self.body.push_str("    ");
         self.body.push_str(s);
@@ -312,34 +364,99 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Condition under which a SOPP branch opcode is taken (None = not a branch).
+    fn branch_cond(op: u32) -> Option<&'static str> {
+        Some(match op {
+            2 => "true",
+            4 => "scc == 0u",
+            5 => "scc != 0u",
+            6 => "(vcc_lo & 1u) == 0u",
+            7 => "(vcc_lo & 1u) != 0u",
+            8 => "(exec_lo & 1u) == 0u",
+            9 => "(exec_lo & 1u) != 0u",
+            _ => return None,
+        })
+    }
+
+    /// Control flow.
+    ///
+    /// * Forward branches use skip flags: `jT` is set when a branch to instruction T is
+    ///   taken, and every instruction before T that lies after such a branch is wrapped in
+    ///   `if (!(jT || ...))`. This handles arbitrary forward-only CFGs (if/else, breaks).
+    /// * A backward branch at B to header L becomes `do { ... } while (cond)` around
+    ///   [L..=B]. Flags for labels inside the body are reset each iteration; flags for
+    ///   labels past B (loop exits) terminate the loop and keep skipping until their label.
+    ///   Loops must be properly nested, have one back-edge per header, and must not be
+    ///   entered from outside except through the header — otherwise `Err`.
     fn emit_body(&mut self, is_ps: bool) -> Result<(), String> {
-        // Branch targets (forward only).
         let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
-        let mut target: HashMap<usize, usize> = HashMap::new();
+        let mut target: HashMap<usize, usize> = HashMap::new(); // forward: branch idx -> target idx
+        let mut back: HashMap<usize, usize> = HashMap::new(); // backward: branch idx B -> header idx L
         for (i, ins) in self.insns.iter().enumerate() {
-            if ins.enc == Enc::Sopp && matches!(ins.op, 2 | 4..=9) {
+            if ins.enc == Enc::Sopp && Self::branch_cond(ins.op).is_some() {
                 let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
                 let ti = *off2idx
                     .get(&(t as usize))
                     .ok_or_else(|| format!("branch at {:#x} targets mid-instruction {t:#x}", ins.offset))?;
                 if ti <= i {
-                    return Err(format!("backward branch (loop) at {:#x} not supported yet", ins.offset));
+                    back.insert(i, ti);
+                } else {
+                    target.insert(i, ti);
                 }
-                target.insert(i, ti);
+            }
+        }
+        // Validate loop structure.
+        let mut heads: HashMap<usize, usize> = HashMap::new(); // L -> B
+        for (&b, &l) in &back {
+            if heads.insert(l, b).is_some() {
+                return Err(format!("loop header {:#x} has multiple back-edges", self.insns[l].offset));
+            }
+        }
+        let loops: Vec<(usize, usize)> = heads.iter().map(|(&l, &b)| (l, b)).collect();
+        for &(l1, b1) in &loops {
+            for &(l2, b2) in &loops {
+                let disjoint = b1 < l2 || b2 < l1;
+                let nested = (l1 <= l2 && b2 <= b1) || (l2 <= l1 && b1 <= b2);
+                if !(disjoint || nested) {
+                    return Err("irreducible/overlapping loops".into());
+                }
+            }
+            for (&fb, &ft) in &target {
+                if fb < l1 && ft > l1 && ft <= b1 {
+                    return Err(format!("branch into the middle of a loop at {:#x}", self.insns[fb].offset));
+                }
             }
         }
         let labels: BTreeSet<usize> = target.values().copied().collect();
         for l in &labels {
             self.line(&format!("bool j{l} = false;"));
         }
+        if !loops.is_empty() {
+            self.line("uint tb_guard = 0u;");
+            for &(_, b) in &loops {
+                self.line(&format!("bool tb_c{b} = false;"));
+            }
+        }
 
         let insns = self.insns.clone();
         let mut open = false;
         let mut cur: Vec<usize> = vec![];
         for (i, ins) in insns.iter().enumerate() {
+            if let Some(&b) = heads.get(&i) {
+                if open {
+                    self.line("}");
+                    open = false;
+                }
+                cur.clear();
+                self.line("do {");
+                self.line(&format!("tb_c{b} = false;"));
+                for t in labels.iter().filter(|&&t| t > i && t <= b) {
+                    self.line(&format!("j{t} = false;"));
+                }
+            }
             let active: Vec<usize> =
                 labels.iter().copied().filter(|&t| t > i && target.iter().any(|(&b, &bt)| bt == t && b < i)).collect();
-            if active != cur {
+            if active != cur || (open && heads.contains_key(&i)) {
                 if open {
                     self.line("}");
                     open = false;
@@ -356,6 +473,19 @@ impl<'a> Emitter<'a> {
             }
             self.emit_insn(i, ins, is_ps, target.get(&i).copied())
                 .map_err(|e| format!("{e} [{} @ {:#x}]", ins.mnemonic, ins.offset))?;
+            if back.contains_key(&i) {
+                // Evaluate the back-edge condition inside the guard (a skipped branch is not taken).
+                let cond = Self::branch_cond(ins.op).unwrap_or("false");
+                self.line(&format!("tb_c{i} = ({cond});"));
+                if open {
+                    self.line("}");
+                    open = false;
+                }
+                cur.clear();
+                let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
+                let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(" || ")) };
+                self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < 65536u);"));
+            }
         }
         if open {
             self.line("}");
@@ -541,6 +671,20 @@ impl<'a> Emitter<'a> {
                         Ok(())
                     }
                     "s_cmov_b32" => self.ws(&d, &format!("((scc != 0u) ? {a} : {})", name(&d)?)),
+                    "s_brev_b32" => self.ws(&d, &format!("reversebits({a})")),
+                    "s_bcnt1_i32_b32" => {
+                        self.ws(&d, &format!("countbits({a})"))?;
+                        self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
+                        Ok(())
+                    }
+                    "s_ff1_i32_b32" => self.ws(&d, &format!("firstbitlow({a})")),
+                    "s_sext_i32_i8" => self.ws(&d, &format!("asuint(asint({a} << 24) >> 24)")),
+                    "s_sext_i32_i16" => self.ws(&d, &format!("asuint(asint({a} << 16) >> 16)")),
+                    "s_abs_i32" => {
+                        self.ws(&d, &format!("asuint(abs(asint({a})))"))?;
+                        self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
+                        Ok(())
+                    }
                     "s_swappc_b64" => {
                         // Vertex-fetch shader call: inputs are materialised from the D3D input layout.
                         self.line("// (fetch-shader call: vertex attributes come from the input layout)");
@@ -682,6 +826,11 @@ impl<'a> Emitter<'a> {
             }
             return Ok(());
         }
+        if m == "v_readfirstlane_b32" {
+            // Lane model: the first active lane's value. Compilers only use this on values
+            // that are uniform across the wave, so this lane's value is equivalent.
+            return self.ws(&d, &r(&s[0])?);
+        }
         let vop3 = ins.enc == Enc::Vop3;
         let k = format!("asfloat({:#x}u)", ins.raw.last().copied().unwrap_or(0));
         let dn = name(&d)?;
@@ -730,6 +879,10 @@ impl<'a> Emitter<'a> {
             "v_rsq_f32" => Some(format!("rsqrt({})", fa()?)),
             "v_sqrt_f32" => Some(format!("sqrt({})", fa()?)),
             "v_sin_f32" => Some(format!("sin({} * 6.28318530718)", fa()?)),
+            "v_cubema_f32" => Some(format!("tb_cubema({}, {}, {})", fa()?, fb()?, fc()?)),
+            "v_cubesc_f32" => Some(format!("tb_cubesc({}, {}, {})", fa()?, fb()?, fc()?)),
+            "v_cubetc_f32" => Some(format!("tb_cubetc({}, {}, {})", fa()?, fb()?, fc()?)),
+            "v_cubeid_f32" => Some(format!("tb_cubeid({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_cos_f32" => Some(format!("cos({} * 6.28318530718)", fa()?)),
             _ => None,
         };
@@ -884,7 +1037,12 @@ impl<'a> Emitter<'a> {
             self.touch(&o);
             coords.push(f(&o)?);
         }
-        let cvec = format!("float{ncoord}({})", coords.join(", "));
+        // Cube images are addressed by hardware (s, t, face) coordinates (see tb_cube_dir).
+        let cvec = if dim == 3 {
+            format!("tb_cube_dir({})", coords.join(", "))
+        } else {
+            format!("float{ncoord}({})", coords.join(", "))
+        };
         let call = match ins.mnemonic.as_str() {
             "image_sample" => format!("tex{tslot}.Sample(samp{sslot}, {cvec})"),
             "image_sample_lz" => format!("tex{tslot}.SampleLevel(samp{sslot}, {cvec}, 0.0)"),
@@ -975,6 +1133,7 @@ impl<'a> Emitter<'a> {
         let ex = self.ex;
         let mut h = String::new();
         let _ = writeln!(h, "// Generated by tombox-xshader from RDNA2 microcode ({:?}, {} instrs).", ex.stage, self.insns.len());
+        h.push_str(CUBE_HELPERS);
         for (slot, dwords) in &self.cb_size {
             let _ = writeln!(h, "cbuffer CB{slot} : register(b{slot}) {{ uint4 cb{slot}[{}]; }};", dwords.div_ceil(4).max(1));
         }

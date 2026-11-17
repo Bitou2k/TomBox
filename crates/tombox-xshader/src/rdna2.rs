@@ -284,7 +284,9 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
         Enc::Vop1 => {
             let vdst = (w >> 17) & 0xff;
             let src0 = w & 0x1ff;
-            (vec![Opnd::Vgpr(vdst as u8)], vec![src9(src0 as u16, lit)], aux)
+            // v_readfirstlane_b32 (op 2) writes a scalar register.
+            let dst = if (w >> 9) & 0xff == 0x02 { ssrc8(vdst as u16, None) } else { Opnd::Vgpr(vdst as u8) };
+            (vec![dst], vec![src9(src0 as u16, lit)], aux)
         }
         Enc::Vopc => {
             let vsrc1 = (w >> 9) & 0xff;
