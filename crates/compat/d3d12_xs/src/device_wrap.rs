@@ -379,6 +379,33 @@ fn alloc_size_for(dim: u32, width: u64, height: u64, arr: u64, mips: u64, fmt: u
     (tiles * arr * samples * TILE).max(TILE)
 }
 
+/// Intercept CreateConstantBufferView (slot 17). Xbox allows a CBV SizeInBytes that
+/// is not a multiple of 256; PC D3D12 rejects it and REMOVES THE DEVICE
+/// (DXGI_ERROR_INVALID_CALL). Round SizeInBytes up to 256.
+/// Args: rcx=this, rdx=pDesc, r8=DestDescriptor (CPU handle, by value).
+/// D3D12_CONSTANT_BUFFER_VIEW_DESC { u64 BufferLocation; u32 SizeInBytes; }.
+unsafe extern "system" fn create_cbv(this: *mut DeviceWrapper, pdesc: *const u8, dest: usize) {
+    let real = unsafe { (*this).real };
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(17)) };
+    if pdesc.is_null() {
+        unsafe { f(real, pdesc, dest) };
+        return;
+    }
+    let mut desc = [0u8; 16];
+    unsafe { core::ptr::copy_nonoverlapping(pdesc, desc.as_mut_ptr(), 12) };
+    let size = u32::from_le_bytes([desc[8], desc[9], desc[10], desc[11]]);
+    let aligned = (size + 255) & !255;
+    if aligned != size {
+        desc[8..12].copy_from_slice(&aligned.to_le_bytes());
+        static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 6 {
+            record("d3d12_xs", "CreateConstantBufferView", &format!("size {size} -> {aligned} (256-aligned)"));
+        }
+    }
+    unsafe { f(real, desc.as_ptr(), dest) };
+}
+
 /// PC IID_ID3D12Resource = {696442be-a72e-4059-bc79-5b5c98040fad}
 static IID_ID3D12RESOURCE: Guid = Guid {
     d1: 0x6964_42be, d2: 0xa72e, d3: 0x4059, d4: [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
@@ -397,7 +424,19 @@ unsafe extern "system" fn create_committed_resource(
     let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u32, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(27)) };
     let use_riid: *const Guid = &IID_ID3D12RESOURCE;
-    let hr = unsafe { f(real, pheap, heap_flags, pdesc, init_state, pclear, use_riid, ppv) };
+    // Mask D3D12_RESOURCE_DESC::Flags (offset 0x30) to PC-valid bits: Xbox sets
+    // console-only flags (e.g. 0x300000) that PC D3D12 rejects, removing the device.
+    let mut desc_copy = [0u8; 0x40];
+    let desc_ptr = if pdesc.is_null() {
+        pdesc
+    } else {
+        unsafe { core::ptr::copy_nonoverlapping(pdesc as *const u8, desc_copy.as_mut_ptr(), 0x40) };
+        let flags = u32::from_le_bytes(desc_copy[0x30..0x34].try_into().unwrap());
+        const PC_RESOURCE_FLAGS: u32 = 0xFF; // RT|DSV|UAV|DENY_SRV|CROSS_ADAPTER|SIMUL|VIDEO*
+        desc_copy[0x30..0x34].copy_from_slice(&(flags & PC_RESOURCE_FLAGS).to_le_bytes());
+        desc_copy.as_ptr() as *const u32
+    };
+    let hr = unsafe { f(real, pheap, heap_flags, desc_ptr, init_state, pclear, use_riid, ppv) };
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 10 {
         let htype = if pheap.is_null() { 0xffff_ffff } else { unsafe { *pheap } };
@@ -463,6 +502,46 @@ unsafe extern "system" fn dev_stub() -> i32 {
     0x8000_4001u32 as i32 // E_NOTIMPL
 }
 
+// Per-slot logging stubs for the Xbox device extensions (44+): capture slot +
+// caller RVA and return S_OK (most are hints like SetFrameIntervalX that the RHI
+// only checks for success). This reveals which Xbox device methods the game needs.
+static DEVSTUB_EXE_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static DEVSTUB_HITS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+unsafe extern "system" fn dev_stub_impl(_this: *mut c_void, _a: u64, caller: usize, slot: u64) -> i32 {
+    if DEVSTUB_HITS.fetch_add(1, Ordering::Relaxed) < 60 {
+        if DEVSTUB_EXE_BASE.load(Ordering::Relaxed) == 0 {
+            extern "system" { fn GetModuleHandleW(n: *const u16) -> *mut c_void; }
+            DEVSTUB_EXE_BASE.store(unsafe { GetModuleHandleW(core::ptr::null()) } as usize, Ordering::Relaxed);
+        }
+        let base = DEVSTUB_EXE_BASE.load(Ordering::Relaxed);
+        record("d3d12_xs", "dev_ext", &format!("slot={slot} caller={:#x} -> S_OK", caller.wrapping_sub(base)));
+    }
+    S_OK
+}
+macro_rules! dev_stubs {
+    ($(($name:ident, $slot:literal)),* $(,)?) => {
+        $(
+            #[unsafe(naked)]
+            unsafe extern "system" fn $name() -> i32 {
+                core::arch::naked_asm!(
+                    "mov r8, [rsp]", "mov r9d, {s}", "jmp {i}",
+                    s = const $slot, i = sym dev_stub_impl,
+                );
+            }
+        )*
+        unsafe fn install_dev_stubs(v: &mut [usize]) {
+            $( v[$slot] = $name as usize; )*
+        }
+    };
+}
+dev_stubs!(
+    (d44,44),(d45,45),(d46,46),(d47,47),(d49,49),(d50,50),(d51,51),(d52,52),(d53,53),(d54,54),
+    (d55,55),(d56,56),(d57,57),(d58,58),(d59,59),(d60,60),(d61,61),(d62,62),(d63,63),(d64,64),
+    (d65,65),(d66,66),(d67,67),(d68,68),(d69,69),(d70,70),(d71,71),(d72,72),(d74,74),(d75,75),
+    (d76,76),(d77,77),(d78,78),(d79,79),(d80,80),(d81,81),(d82,82),(d83,83),(d84,84),(d85,85),
+    (d86,86),(d87,87),(d88,88),(d89,89),(d90,90),
+);
+
 fn vtable() -> *const usize {
     static VT: OnceLock<usize> = OnceLock::new();
     *VT.get_or_init(|| {
@@ -482,9 +561,11 @@ fn vtable() -> *const usize {
         while v.len() < 160 {
             v.push(dev_stub as usize);
         }
+        unsafe { install_dev_stubs(&mut v); } // 44..90: logging S_OK stubs (diagnostic)
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
         v[25] = get_resource_alloc_info as usize; // GetResourceAllocationInfo (null-safe)
+        v[17] = create_cbv as usize; // CreateConstantBufferView (256-align size)
         v[27] = create_committed_resource as usize; // CreateCommittedResource (IID subst)
         v[73] = create_command_list_x as usize;  // Xbox command-list create
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
