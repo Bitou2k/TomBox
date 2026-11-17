@@ -1,0 +1,45 @@
+{
+  "path": "input/extracted/EmbeddedXvd/Windows/System32/xg_xs.dll",
+  "size_bytes": 532480,
+  "machine": 34404,
+  "machine_name": "AMD64 (x86-64)",
+  "is_dll": true,
+  "entry_point_rva": 312624,
+  "image_base": 6442450944,
+  "size_of_image": 552960,
+  "subsystem": 3,
+  "subsystem_name": "WINDOWS_CUI (console)",
+  "sections": [
+    { "name": ".text", "va": 4096, "vsize": 321740, "raw": 1024, "rawsize": 322048, "characteristics": 1610612768 },
+    { "name": ".rdata", "va": 327680, "vsize": 194740, "raw": 323072, "rawsize": 195072, "characteristics": 1073741888 },
+    { "name": ".data", "va": 524288, "vsize": 3168, "raw": 518144, "rawsize": 512, "characteristics": 3221225536 },
+    { "name": ".pdata", "va": 528384, "vsize": 8904, "raw": 518656, "rawsize": 9216, "characteristics": 1073741888 },
+    { "name": ".xbld", "va": 540672, "vsize": 222, "raw": 527872, "rawsize": 512, "characteristics": 3254779968 },
+    { "name": ".rsrc", "va": 544768, "vsize": 992, "raw": 528384, "rawsize": 1024, "characteristics": 1073741888 },
+    { "name": ".reloc", "va": 548864, "vsize": 2800, "raw": 529408, "rawsize": 3072, "characteristics": 1107296320 }
+  ],
+  "imports": [
+    { "module": "msvcrt.dll", "functions": ["_initterm", "free", "_amsg_exit", "_XcptFilter", "memmove", "memcpy", "?terminate@@YAXXZ", "_lock", "_CxxThrowException", "?what@exception@@UEBAPEBDXZ", "_unlock", "??1exception@@UEAA@XZ", "??0exception@@QEAA@AEBV0@@Z", "??0exception@@QEAA@AEBQEBDH@Z", "__dllonexit", "_onexit", "vprintf", "printf", "sprintf", "??_V@YAXPEAX@Z", "??1bad_cast@@UEAA@XZ", "??0bad_cast@@QEAA@PEBD@Z", "??0bad_cast@@QEAA@AEBV0@@Z", "??0exception@@QEAA@AEBQEBD@Z", "localeconv", "sprintf_s", "__iob_func", "fclose", "fflush", "fgetc", "fgetpos", "fputc", "fsetpos", "_fseeki64", "??1type_info@@UEAA@XZ", "setvbuf", "ungetc", "memcpy_s", "memset", "setlocale", "__uncaught_exception", "__pctype_func", "isupper", "___lc_handle_func", "___lc_codepage_func", "calloc", "___mb_cur_max_func", "_ismbblead", "islower", "abort", "_wcsdup", "__crtLCMapStringA", "_wsetlocale", "memcmp", "__C_specific_handler", "fwrite", "_callnewh", "malloc", "??3@YAXPEAX@Z", "_purecall", "__CxxFrameHandler3", "strcspn", "vsprintf_s"] },
+    { "module": "api-ms-win-core-debug-l1-1-0.dll", "functions": ["OutputDebugStringA"] },
+    { "module": "api-ms-win-core-synch-l1-2-0.dll", "functions": ["InitOnceExecuteOnce", "Sleep"] },
+    { "module": "api-ms-win-core-synch-l1-1-0.dll", "functions": ["InitializeCriticalSectionEx", "DeleteCriticalSection", "InitializeCriticalSection", "LeaveCriticalSection", "EnterCriticalSection"] },
+    { "module": "api-ms-win-core-profile-l1-1-0.dll", "functions": ["QueryPerformanceCounter"] },
+    { "module": "api-ms-win-core-processthreads-l1-1-0.dll", "functions": ["TerminateProcess", "GetCurrentProcessId", "GetCurrentThreadId", "GetCurrentProcess"] },
+    { "module": "api-ms-win-core-sysinfo-l1-1-0.dll", "functions": ["GetTickCount", "GetSystemTimeAsFileTime"] },
+    { "module": "api-ms-win-core-rtlsupport-l1-1-0.dll", "functions": ["RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind"] },
+    { "module": "api-ms-win-core-errorhandling-l1-1-0.dll", "functions": ["SetUnhandledExceptionFilter", "UnhandledExceptionFilter"] },
+    { "module": "xmem.dll", "functions": ["XMemFree", "XMemAlloc"] },
+    { "module": "api-ms-win-core-util-l1-1-0.dll", "functions": ["EncodePointer", "DecodePointer"] }
+  ],
+  "delay_imports": [],
+  "exports": {
+    "dll_name": "xg_xs.dll",
+    "number_of_functions": 19,
+    "number_of_names": 19,
+    "forwarder_count": 0,
+    "named": [{"name": "XGComputeBufferLayout", "ordinal": 1}, {"name": "XGComputeOptimalDepthStencilSwizzleMode", "ordinal": 2}, {"name": "XGComputeOptimalSwizzleMode", "ordinal": 3}, {"name": "XGComputeTexture1DLayout", "ordinal": 4}, {"name": "XGComputeTexture2DLayout", "ordinal": 5}, {"name": "XGComputeTexture3DLayout", "ordinal": 6}, {"name": "XGComputeTileShape", "ordinal": 7}, {"name": "XGCreateTexture1DComputer", "ordinal": 8}, {"name": "XGCreateTexture2DComputer", "ordinal": 9}, {"name": "XGCreateTexture3DComputer", "ordinal": 10}, {"name": "XGCreateTextureComputer", "ordinal": 11}, {"name": "XGCreateTextureComputerFromDescriptor", "ordinal": 12}, {"name": "XGDecodeDCC", "ordinal": 13}, {"name": "XGEnableExclusiveLocking", "ordinal": 14}, {"name": "XGEncodeDCC", "ordinal": 15}, {"name": "XGEnterExclusiveLock", "ordinal": 16}, {"name": "XGLeaveExclusiveLock", "ordinal": 17}, {"name": "XGSetHardwareVersion", "ordinal": 18}, {"name": "XGValidateDepthStencilSwizzleMode", "ordinal": 19}]
+  },
+  "relocations": { "total_blocks": 8, "total_entries": 1368, "by_type": [{"type": 0, "count": 5}, {"type": 10, "count": 1363}] },
+  "tls": { "address_of_callbacks": 6442803816, "callback_count": 0, "size_of_zero_fill": 0 },
+  "notes": []
+}

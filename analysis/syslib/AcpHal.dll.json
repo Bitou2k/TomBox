@@ -1,0 +1,46 @@
+{
+  "path": "input/extracted/EmbeddedXvd/Windows/System32/AcpHal.dll",
+  "size_bytes": 29184,
+  "machine": 34404,
+  "machine_name": "AMD64 (x86-64)",
+  "is_dll": true,
+  "entry_point_rva": 20304,
+  "image_base": 6442450944,
+  "size_of_image": 49152,
+  "subsystem": 2,
+  "subsystem_name": "WINDOWS_GUI",
+  "sections": [
+    { "name": ".text", "va": 4096, "vsize": 19029, "raw": 1024, "rawsize": 19456, "characteristics": 1610612768 },
+    { "name": ".rdata", "va": 24576, "vsize": 5530, "raw": 20480, "rawsize": 5632, "characteristics": 1073741888 },
+    { "name": ".data", "va": 32768, "vsize": 1576, "raw": 26112, "rawsize": 512, "characteristics": 3221225536 },
+    { "name": ".pdata", "va": 36864, "vsize": 1068, "raw": 26624, "rawsize": 1536, "characteristics": 1073741888 },
+    { "name": ".xbld", "va": 40960, "vsize": 222, "raw": 28160, "rawsize": 512, "characteristics": 3254779968 },
+    { "name": ".reloc", "va": 45056, "vsize": 112, "raw": 28672, "rawsize": 512, "characteristics": 1107296320 }
+  ],
+  "imports": [
+    { "module": "msvcrt.dll", "functions": ["__C_specific_handler", "_lock", "_initterm", "free", "strcpy_s", "_amsg_exit", "_unlock", "_XcptFilter", "__dllonexit", "_callnewh", "malloc", "_purecall", "_onexit", "memset"] },
+    { "module": "api-ms-win-core-synch-l1-1-0.dll", "functions": ["EnterCriticalSection", "LeaveCriticalSection", "DeleteCriticalSection", "InitializeCriticalSection"] },
+    { "module": "api-ms-win-core-synch-l1-2-0.dll", "functions": ["Sleep"] },
+    { "module": "api-ms-win-core-profile-l1-1-0.dll", "functions": ["QueryPerformanceCounter"] },
+    { "module": "api-ms-win-core-processthreads-l1-1-0.dll", "functions": ["TerminateProcess", "GetCurrentProcess", "GetCurrentProcessId", "GetCurrentThreadId"] },
+    { "module": "api-ms-win-core-sysinfo-l1-1-0.dll", "functions": ["GetSystemTimeAsFileTime", "GetTickCount"] },
+    { "module": "api-ms-win-core-rtlsupport-l1-1-0.dll", "functions": ["RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind"] },
+    { "module": "api-ms-win-core-errorhandling-l1-1-0.dll", "functions": ["UnhandledExceptionFilter", "GetLastError", "SetUnhandledExceptionFilter"] },
+    { "module": "xmem.dll", "functions": ["XMemFree", "XMemAlloc"] },
+    { "module": "api-ms-win-core-io-l1-1-0.dll", "functions": ["DeviceIoControl"] },
+    { "module": "api-ms-win-eventing-provider-l1-1-0.dll", "functions": ["EventUnregister", "EventSetInformation", "EventWriteTransfer", "EventRegister"] },
+    { "module": "api-ms-win-core-file-l1-1-0.dll", "functions": ["CreateFileW"] },
+    { "module": "api-ms-win-core-handle-l1-1-0.dll", "functions": ["CloseHandle"] }
+  ],
+  "delay_imports": [],
+  "exports": {
+    "dll_name": "AcpHal.dll",
+    "number_of_functions": 10,
+    "number_of_names": 10,
+    "forwarder_count": 0,
+    "named": [{"name": "AcpHalAllocateShapeContexts", "ordinal": 1}, {"name": "AcpHalCreate", "ordinal": 2}, {"name": "AcpHalReleaseShapeContexts", "ordinal": 3}, {"name": "ApuAlloc", "ordinal": 4}, {"name": "ApuCreateHeap", "ordinal": 5}, {"name": "ApuFree", "ordinal": 6}, {"name": "ApuHeapGetState", "ordinal": 7}, {"name": "ApuIsVirtualAddressValid", "ordinal": 8}, {"name": "ApuMapApuAddress", "ordinal": 9}, {"name": "ApuMapVirtualAddress", "ordinal": 10}]
+  },
+  "relocations": { "total_blocks": 2, "total_entries": 48, "by_type": [{"type": 0, "count": 2}, {"type": 10, "count": 46}] },
+  "tls": null,
+  "notes": []
+}

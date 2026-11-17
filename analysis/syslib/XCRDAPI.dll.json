@@ -1,0 +1,50 @@
+{
+  "path": "input/extracted/EmbeddedXvd/Windows/System32/XCRDAPI.dll",
+  "size_bytes": 96256,
+  "machine": 34404,
+  "machine_name": "AMD64 (x86-64)",
+  "is_dll": true,
+  "entry_point_rva": 58912,
+  "image_base": 6442450944,
+  "size_of_image": 114688,
+  "subsystem": 3,
+  "subsystem_name": "WINDOWS_CUI (console)",
+  "sections": [
+    { "name": ".text", "va": 4096, "vsize": 57912, "raw": 1024, "rawsize": 58368, "characteristics": 1610612768 },
+    { "name": ".rdata", "va": 65536, "vsize": 24932, "raw": 59392, "rawsize": 25088, "characteristics": 1073741888 },
+    { "name": ".data", "va": 94208, "vsize": 1532, "raw": 84480, "rawsize": 512, "characteristics": 3221225536 },
+    { "name": ".pdata", "va": 98304, "vsize": 2436, "raw": 84992, "rawsize": 2560, "characteristics": 1073741888 },
+    { "name": ".rsrc", "va": 102400, "vsize": 7816, "raw": 87552, "rawsize": 8192, "characteristics": 1073741888 },
+    { "name": ".reloc", "va": 110592, "vsize": 192, "raw": 95744, "rawsize": 512, "characteristics": 1107296320 }
+  ],
+  "imports": [
+    { "module": "msvcrt.dll", "functions": ["_lock", "_amsg_exit", "_unlock", "__dllonexit", "_XcptFilter", "free", "_callnewh", "_onexit", "malloc", "wcsrchr", "memcpy", "_vsnwprintf", "__C_specific_handler", "wcschr", "_wcsnicmp", "wcscat_s", "wcscpy_s", "_putws", "_initterm", "memset"] },
+    { "module": "api-ms-win-core-libraryloader-l1-2-0.dll", "functions": ["DisableThreadLibraryCalls"] },
+    { "module": "api-ms-win-core-file-l1-1-0.dll", "functions": ["FindClose", "GetDriveTypeW", "FindNextFileW", "WriteFile", "SetFilePointerEx", "ReadFile", "FindFirstFileW", "CreateFileW"] },
+    { "module": "api-ms-win-core-errorhandling-l1-1-0.dll", "functions": ["GetLastError", "SetUnhandledExceptionFilter", "SetLastError", "UnhandledExceptionFilter"] },
+    { "module": "api-ms-win-core-synch-l1-1-0.dll", "functions": ["DeleteCriticalSection", "SetEvent", "ResetEvent", "EnterCriticalSection", "InitializeCriticalSection", "CreateEventW", "WaitForSingleObject", "InitializeCriticalSectionEx", "LeaveCriticalSection"] },
+    { "module": "api-ms-win-core-io-l1-1-0.dll", "functions": ["GetOverlappedResult", "DeviceIoControl", "CancelIoEx"] },
+    { "module": "api-ms-win-core-namedpipe-l1-1-0.dll", "functions": ["DisconnectNamedPipe", "CreateNamedPipeW", "ConnectNamedPipe"] },
+    { "module": "api-ms-win-core-synch-l1-2-1.dll", "functions": ["WaitForMultipleObjects"] },
+    { "module": "api-ms-win-core-synch-l1-2-0.dll", "functions": ["Sleep"] },
+    { "module": "api-ms-win-core-sysinfo-l1-1-0.dll", "functions": ["GetTickCount", "GetSystemTimeAsFileTime", "GetTickCount64"] },
+    { "module": "api-ms-win-core-handle-l1-1-0.dll", "functions": ["DuplicateHandle", "CloseHandle"] },
+    { "module": "api-ms-win-core-processthreads-l1-1-0.dll", "functions": ["GetCurrentThreadId", "GetCurrentProcess", "GetCurrentProcessId", "CreateThread", "TerminateProcess"] },
+    { "module": "api-ms-win-core-localization-l1-2-0.dll", "functions": ["FormatMessageA"] },
+    { "module": "api-ms-win-core-debug-l1-1-0.dll", "functions": ["DebugBreak"] },
+    { "module": "api-ms-win-core-profile-l1-1-0.dll", "functions": ["QueryPerformanceCounter"] },
+    { "module": "api-ms-win-core-rtlsupport-l1-1-0.dll", "functions": ["RtlVirtualUnwind", "RtlLookupFunctionEntry", "RtlCaptureContext"] },
+    { "module": "ntdll.dll", "functions": ["RtlSubscribeWnfStateChangeNotification", "RtlEqualUnicodeString", "NtDeviceIoControlFile", "RtlQueryWnfStateData", "RtlAllocateHeap", "RtlUnsubscribeWnfNotificationWaitForCompletion", "NtQueryVolumeInformationFile", "NtWaitForSingleObject", "DbgPrintEx", "vDbgPrintEx", "RtlFreeHeap", "RtlNtStatusToDosErrorNoTeb"] }
+  ],
+  "delay_imports": [],
+  "exports": {
+    "dll_name": "XCRDAPI.dll",
+    "number_of_functions": 109,
+    "number_of_names": 109,
+    "forwarder_count": 0,
+    "named": [{"name": "DStorageGetFactory", "ordinal": 1}, {"name": "XCloudQueryFeatureBits", "ordinal": 2}, {"name": "XCloudSetFeatureBits", "ordinal": 3}, {"name": "XCrdBuildPath", "ordinal": 4}, {"name": "XCrdCancelUpdate", "ordinal": 5}, {"name": "XCrdCloseAdapter", "ordinal": 6}, {"name": "XCrdCloseMetadataHandle", "ordinal": 7}, {"name": "XCrdCreateXVD", "ordinal": 8}, {"name": "XCrdDefragXvc", "ordinal": 9}, {"name": "XCrdDeleteXVD", "ordinal": 10}, {"name": "XCrdFindCloseBlob", "ordinal": 11}, {"name": "XCrdFindCloseStorageDevice", "ordinal": 12}, {"name": "XCrdFindFirstBlob", "ordinal": 13}, {"name": "XCrdFindFirstStorageDevice", "ordinal": 14}, {"name": "XCrdFindNextBlob", "ordinal": 15}, {"name": "XCrdFindNextStorageDevice", "ordinal": 16}, {"name": "XCrdFindStorageDevice", "ordinal": 17}, {"name": "XCrdFreeDevicePathBuffer", "ordinal": 18}, {"name": "XCrdGrowThinProvisionedXvd", "ordinal": 19}, {"name": "XCrdHasInternalDeviceId", "ordinal": 20}, {"name": "XCrdIsCorrupt", "ordinal": 21}, {"name": "XCrdIsCorruptionError", "ordinal": 22}, {"name": "XCrdIsInternalStorageDevice", "ordinal": 23}, {"name": "XCrdMount", "ordinal": 24}, {"name": "XCrdMountContentType", "ordinal": 25}, {"name": "XCrdOddPmAcquireReleaseReference", "ordinal": 26}, {"name": "XCrdOpenAdapter", "ordinal": 27}, {"name": "XCrdOpenMetadataHandle", "ordinal": 28}, {"name": "XCrdParsePath", "ordinal": 29}, {"name": "XCrdQueryAttestationBlob", "ordinal": 30}, {"name": "XCrdQueryCorruptXvc", "ordinal": 31}, {"name": "XCrdQueryCrdInformation", "ordinal": 32}, {"name": "XCrdQueryCrdLogInformation", "ordinal": 33}, {"name": "XCrdQueryCrdVendorInformation", "ordinal": 34}, {"name": "XCrdQueryDevicePath", "ordinal": 35}, {"name": "XCrdQueryDevicePathByPath", "ordinal": 36}, {"name": "XCrdQueryWriteStats", "ordinal": 37}, {"name": "XCrdQueryXRscInformation", "ordinal": 38}, {"name": "XCrdQueryXvdInformation", "ordinal": 39}, {"name": "XCrdReadBatInfoXVD", "ordinal": 40}, {"name": "XCrdReadUserDataXVD", "ordinal": 41}, {"name": "XCrdRegisterCorruptionCallback", "ordinal": 42}, {"name": "XCrdRegisterExternalStorageChangeCallback", "ordinal": 43}, {"name": "XCrdRegisterWriteBudgetCallback", "ordinal": 44}, {"name": "XCrdRemapReload", "ordinal": 45}, {"name": "XCrdRemapTest", "ordinal": 46}, {"name": "XCrdRepairXvc", "ordinal": 47}, {"name": "XCrdResetStreamedState", "ordinal": 48}, {"name": "XCrdResizeXVD", "ordinal": 49}, {"name": "XCrdSetEraLaunchMapping", "ordinal": 50}, {"name": "XCrdSetExternalPlsMapping", "ordinal": 51}, {"name": "XCrdSetTraceFlags", "ordinal": 52}, {"name": "XCrdSetXRscInformation", "ordinal": 53}, {"name": "XCrdSetXvdInformation", "ordinal": 54}, {"name": "XCrdStorageAttachExternalDevice", "ordinal": 55}, {"name": "XCrdStorageCheck", "ordinal": 56}, {"name": "XCrdStorageConnectDevice", "ordinal": 57}, {"name": "XCrdStorageCreateBlob", "ordinal": 58}, {"name": "XCrdStorageDeleteBlob", "ordinal": 59}, {"name": "XCrdStorageDetachExternalDevice", "ordinal": 60}, {"name": "XCrdStorageDisconnectDevice", "ordinal": 61}, {"name": "XCrdStorageFormat", "ordinal": 62}, {"name": "XCrdStorageQueryBlobAttributes", "ordinal": 63}, {"name": "XCrdStorageQueryExternalDeviceAddress", "ordinal": 64}, {"name": "XCrdStorageReadBlob", "ordinal": 65}, {"name": "XCrdStorageReadBlobEx", "ordinal": 66}, {"name": "XCrdStorageRemapDevice", "ordinal": 67}, {"name": "XCrdStorageSetDeviceName", "ordinal": 68}, {"name": "XCrdStorageSetLastUsedConsole", "ordinal": 69}, {"name": "XCrdStorageWriteBlob", "ordinal": 70}, {"name": "XCrdStorageWriteBlobEx", "ordinal": 71}, {"name": "XCrdStreamingAdjustStreamingFlags", "ordinal": 72}, {"name": "XCrdStreamingQueryActiveInstanceId", "ordinal": 73}, {"name": "XCrdStreamingQueryInformation", "ordinal": 74}, {"name": "XCrdStreamingQueryInformationByPath", "ordinal": 75}, {"name": "XCrdStreamingQueryRegionIdByOffset", "ordinal": 76}, {"name": "XCrdStreamingQueryRegionInformation", "ordinal": 77}, {"name": "XCrdStreamingQueryRegionInformationByPath", "ordinal": 78}, {"name": "XCrdStreamingQueryRegionSpecifiers", "ordinal": 79}, {"name": "XCrdStreamingQueryRegionSpecifiersByPath", "ordinal": 80}, {"name": "XCrdStreamingQueueInsertRegion", "ordinal": 81}, {"name": "XCrdStreamingQueueQueryRegionList", "ordinal": 82}, {"name": "XCrdStreamingQueueQueryRegionListByPath", "ordinal": 83}, {"name": "XCrdStreamingStart", "ordinal": 84}, {"name": "XCrdStreamingStop", "ordinal": 85}, {"name": "XCrdSuspendResumeIoBalancer", "ordinal": 86}, {"name": "XCrdTrimDeallocatedClusters", "ordinal": 87}, {"name": "XCrdTrimXvc", "ordinal": 88}, {"name": "XCrdUnmount", "ordinal": 89}, {"name": "XCrdUnmountByPath", "ordinal": 90}, {"name": "XCrdUnmountEx", "ordinal": 91}, {"name": "XCrdUnregisterCorruptionCallback", "ordinal": 92}, {"name": "XCrdUnregisterExternalStorageChangeCallback", "ordinal": 93}, {"name": "XCrdUnregisterWriteBudgetCallback", "ordinal": 94}, {"name": "XCrdUpdatePath", "ordinal": 95}, {"name": "XCrdUpdateXvc", "ordinal": 96}, {"name": "XCrdUpdateXvcEx", "ordinal": 97}, {"name": "XCrdXBlobCopy", "ordinal": 98}, {"name": "XCrdXBlobCreate", "ordinal": 99}, {"name": "XCrdXBlobDelete", "ordinal": 100}, {"name": "XCrdXasBuildPath", "ordinal": 101}, {"name": "XCrdXasBuildPathEx", "ordinal": 102}, {"name": "XCrdXpfOp", "ordinal": 103}, {"name": "XCrdXvdXferGetResult", "ordinal": 104}, {"name": "XCrdXvdXferInitialize", "ordinal": 105}, {"name": "XCrdXvdXferRead", "ordinal": 106}, {"name": "XCrdXvdXferStart", "ordinal": 107}, {"name": "XCrdXvdXferStop", "ordinal": 108}, {"name": "XCrdXvdXferUninitialize", "ordinal": 109}]
+  },
+  "relocations": { "total_blocks": 2, "total_entries": 88, "by_type": [{"type": 0, "count": 1}, {"type": 10, "count": 87}] },
+  "tls": null,
+  "notes": []
+}

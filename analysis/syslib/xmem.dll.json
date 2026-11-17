@@ -1,0 +1,52 @@
+{
+  "path": "input/extracted/EmbeddedXvd/Windows/System32/xmem.dll",
+  "size_bytes": 50176,
+  "machine": 34404,
+  "machine_name": "AMD64 (x86-64)",
+  "is_dll": true,
+  "entry_point_rva": 30976,
+  "image_base": 6442450944,
+  "size_of_image": 73728,
+  "subsystem": 3,
+  "subsystem_name": "WINDOWS_CUI (console)",
+  "sections": [
+    { "name": ".text", "va": 4096, "vsize": 29536, "raw": 1024, "rawsize": 29696, "characteristics": 1610612768 },
+    { "name": ".rdata", "va": 36864, "vsize": 14670, "raw": 30720, "rawsize": 14848, "characteristics": 1073741888 },
+    { "name": ".data", "va": 53248, "vsize": 2180, "raw": 45568, "rawsize": 512, "characteristics": 3221225536 },
+    { "name": ".pdata", "va": 57344, "vsize": 1092, "raw": 46080, "rawsize": 1536, "characteristics": 1073741888 },
+    { "name": ".xbld", "va": 61440, "vsize": 222, "raw": 47616, "rawsize": 512, "characteristics": 3254779968 },
+    { "name": ".rsrc", "va": 65536, "vsize": 1048, "raw": 48128, "rawsize": 1536, "characteristics": 1073741888 },
+    { "name": ".reloc", "va": 69632, "vsize": 48, "raw": 49664, "rawsize": 512, "characteristics": 1107296320 }
+  ],
+  "imports": [
+    { "module": "msvcrt.dll", "functions": ["malloc", "_XcptFilter", "free", "_initterm", "sprintf_s", "_vsnprintf", "_amsg_exit", "__C_specific_handler", "memset"] },
+    { "module": "xbthunk.dll", "functions": ["XbCreatePartitionHeap", "XbGetPartitionHandleAndId", "XbGetPartitionHeap", "XbReportUnknownNtAvmError", "XbRegisterXMemOperationCallback", "XbRegisterXMemCallback"] },
+    { "module": "api-ms-win-eventing-provider-l1-1-0.dll", "functions": ["EventUnregister", "EventRegister", "EventWriteTransfer"] },
+    { "module": "api-ms-win-core-synch-l1-2-0.dll", "functions": ["Sleep"] },
+    { "module": "api-ms-win-core-profile-l1-1-0.dll", "functions": ["QueryPerformanceCounter"] },
+    { "module": "api-ms-win-core-processthreads-l1-1-0.dll", "functions": ["GetCurrentProcess", "TerminateProcess", "GetCurrentThreadId", "GetCurrentProcessId"] },
+    { "module": "api-ms-win-core-sysinfo-l1-1-0.dll", "functions": ["GetSystemTimeAsFileTime", "GetTickCount"] },
+    { "module": "api-ms-win-core-rtlsupport-l1-1-0.dll", "functions": ["RtlLookupFunctionEntry", "RtlCaptureContext", "RtlVirtualUnwind"] },
+    { "module": "api-ms-win-core-errorhandling-l1-1-0.dll", "functions": ["GetLastError", "SetUnhandledExceptionFilter", "SetLastError", "UnhandledExceptionFilter"] },
+    { "module": "api-ms-win-core-memory-l1-1-0.dll", "functions": ["ReadProcessMemory", "VirtualFree"] },
+    { "module": "ntdll.dll", "functions": ["NtManagePartition", "NtCreateSectionEx", "RtlNtStatusToDosError", "RtlCreateHeap", "RtlLeaveCriticalSection", "NtQueryInformationThread", "RtlRbInsertNodeEx", "RtlReleaseSRWLockExclusive", "RtlAcquireSRWLockExclusive", "RtlQueryHeapInformation", "RtlReleaseSRWLockShared", "RtlRbRemoveNode", "NtAllocateVirtualMemoryEx", "NtMapUserPhysicalPages", "NtMapUserPhysicalPagesScatter", "NtOpenJobObject", "RtlEnterCriticalSection", "NtClose", "NtDeviceIoControlFile", "RtlRunOnceExecuteOnce", "RtlAcquireSRWLockShared", "NtQueryInformationJobObject", "NtGetNextThread", "RtlInitUnicodeString", "NtQuerySystemInformation", "NtQueryVirtualMemory", "DbgPrintEx", "NtCreateFile"] },
+    { "module": "api-ms-win-core-debug-l1-1-0.dll", "functions": ["OutputDebugStringA"] },
+    { "module": "api-ms-win-core-libraryloader-l1-2-0.dll", "functions": ["LoadLibraryExA", "GetModuleHandleW", "GetProcAddress", "GetModuleHandleA"] },
+    { "module": "api-ms-win-core-processthreads-l1-1-1.dll", "functions": ["OpenProcess"] },
+    { "module": "api-ms-win-core-file-l1-1-0.dll", "functions": ["GetFileAttributesA"] },
+    { "module": "api-ms-win-core-handle-l1-1-0.dll", "functions": ["CloseHandle"] },
+    { "module": "api-ms-win-core-heap-l1-1-0.dll", "functions": ["HeapAlloc", "GetProcessHeap", "HeapFree"] },
+    { "module": "api-ms-win-core-synch-l1-1-0.dll", "functions": ["LeaveCriticalSection", "EnterCriticalSection", "InitializeCriticalSection"] }
+  ],
+  "delay_imports": [],
+  "exports": {
+    "dll_name": "xmem.dll",
+    "number_of_functions": 28,
+    "number_of_names": 28,
+    "forwarder_count": 1,
+    "named": [{"name": "XMemAlloc", "ordinal": 1}, {"name": "XMemAllocDefault", "ordinal": 2}, {"name": "XMemAllocatePhysicalPages", "ordinal": 3}, {"name": "XMemCreateWin32Heap", "ordinal": 4}, {"name": "XMemDumpMemoryStats", "ordinal": 5}, {"name": "XMemFree", "ordinal": 6}, {"name": "XMemFreeDefault", "ordinal": 7}, {"name": "XMemFreePhysicalPages", "ordinal": 8}, {"name": "XMemGetAllocationHysteresis", "ordinal": 9}, {"name": "XMemGetAllocationStatistics", "ordinal": 10}, {"name": "XMemGetFreePageStatistics", "ordinal": 11}, {"name": "XMemGetPartitionHandleAndId", "ordinal": 12}, {"name": "XMemGetPhysicalMemoryLayout", "ordinal": 13}, {"name": "XMemGetTitleHeap", "ordinal": 14}, {"name": "XMemGetWin32HeapStatistics", "ordinal": 15}, {"name": "XMemGetWorkingSetStatistics", "ordinal": 16}, {"name": "XMemIsToolsMemAvailable", "ordinal": 17}, {"name": "XMemMakeTag", "ordinal": 18}, {"name": "XMemMapPhysicalPages", "ordinal": 19}, {"name": "XMemMapPhysicalPagesScatter", "ordinal": 20}, {"name": "XMemPreallocateFreeSpace", "ordinal": 21}, {"name": "XMemSetAllocationHooks", "ordinal": 22}, {"name": "XMemSetAllocationHysteresis", "ordinal": 23}, {"name": "XMemSetOption", "ordinal": 24}, {"name": "XMemSetWin32HeapTrackingHooks", "ordinal": 25}, {"name": "XMemTransferMemory", "ordinal": 26}, {"name": "XMemVirtualAlloc", "ordinal": 27}, {"name": "XMemVirtualQuery", "ordinal": 28}]
+  },
+  "relocations": { "total_blocks": 2, "total_entries": 16, "by_type": [{"type": 0, "count": 2}, {"type": 10, "count": 14}] },
+  "tls": null,
+  "notes": []
+}

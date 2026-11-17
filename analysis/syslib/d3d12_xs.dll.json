@@ -1,0 +1,46 @@
+{
+  "path": "input/extracted/EmbeddedXvd/Windows/System32/d3d12_xs.dll",
+  "size_bytes": 33280,
+  "machine": 34404,
+  "machine_name": "AMD64 (x86-64)",
+  "is_dll": true,
+  "entry_point_rva": 15072,
+  "image_base": 6442450944,
+  "size_of_image": 53248,
+  "subsystem": 3,
+  "subsystem_name": "WINDOWS_CUI (console)",
+  "sections": [
+    { "name": ".text", "va": 4096, "vsize": 14079, "raw": 1024, "rawsize": 14336, "characteristics": 1610612768 },
+    { "name": ".rdata", "va": 20480, "vsize": 13768, "raw": 15360, "rawsize": 13824, "characteristics": 1073741888 },
+    { "name": ".data", "va": 36864, "vsize": 1912, "raw": 29184, "rawsize": 512, "characteristics": 3221225536 },
+    { "name": ".pdata", "va": 40960, "vsize": 1116, "raw": 29696, "rawsize": 1536, "characteristics": 1073741888 },
+    { "name": ".rsrc", "va": 45056, "vsize": 1080, "raw": 31232, "rawsize": 1536, "characteristics": 1073741888 },
+    { "name": ".reloc", "va": 49152, "vsize": 436, "raw": 32768, "rawsize": 512, "characteristics": 1107296320 }
+  ],
+  "imports": [
+    { "module": "msvcrt.dll", "functions": ["__CxxFrameHandler3", "_purecall", "malloc", "_callnewh", "??1type_info@@UEAA@XZ", "_onexit", "??3@YAXPEAX@Z", "wcscat_s", "__dllonexit", "_unlock", "_lock", "__C_specific_handler", "_initterm", "free", "_amsg_exit", "wcscpy_s", "_XcptFilter", "memmove", "memcpy", "_CxxThrowException", "?what@exception@@UEBAPEBDXZ", "??1exception@@UEAA@XZ", "vsprintf_s", "??0exception@@QEAA@AEBV0@@Z", "??0exception@@QEAA@AEBQEBDH@Z", "??0exception@@QEAA@AEBQEBD@Z", "memset"] },
+    { "module": "api-ms-win-core-debug-l1-1-0.dll", "functions": ["OutputDebugStringA"] },
+    { "module": "api-ms-win-core-io-l1-1-0.dll", "functions": ["DeviceIoControl"] },
+    { "module": "api-ms-win-core-file-l1-1-0.dll", "functions": ["CreateFileW", "GetFileAttributesA", "GetFileAttributesW"] },
+    { "module": "api-ms-win-core-libraryloader-l1-2-0.dll", "functions": ["DisableThreadLibraryCalls", "LoadLibraryExW", "FreeLibrary", "GetProcAddress"] },
+    { "module": "api-ms-win-core-handle-l1-1-0.dll", "functions": ["CloseHandle"] },
+    { "module": "api-ms-win-core-synch-l1-2-0.dll", "functions": ["Sleep"] },
+    { "module": "api-ms-win-core-rtlsupport-l1-1-0.dll", "functions": ["RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind"] },
+    { "module": "api-ms-win-core-errorhandling-l1-1-0.dll", "functions": ["UnhandledExceptionFilter", "SetUnhandledExceptionFilter", "GetLastError"] },
+    { "module": "api-ms-win-core-processthreads-l1-1-0.dll", "functions": ["GetCurrentThreadId", "GetCurrentProcessId", "GetCurrentProcess", "TerminateProcess"] },
+    { "module": "api-ms-win-core-profile-l1-1-0.dll", "functions": ["QueryPerformanceCounter"] },
+    { "module": "api-ms-win-core-sysinfo-l1-1-0.dll", "functions": ["GetSystemTimeAsFileTime", "GetTickCount"] },
+    { "module": "ntdll.dll", "functions": ["NtDirectGraphicsCall"] }
+  ],
+  "delay_imports": [],
+  "exports": {
+    "dll_name": "d3d12_xs.dll",
+    "number_of_functions": 52,
+    "number_of_names": 52,
+    "forwarder_count": 0,
+    "named": [{"name": "D3D10CreateBlob", "ordinal": 2}, {"name": "D3D12ConfigureVirtualMemoryX", "ordinal": 3}, {"name": "D3D12CreateDevice", "ordinal": 4}, {"name": "D3D12CreateRootSignatureDeserializer", "ordinal": 5}, {"name": "D3D12CreateVersionedRootSignatureDeserializer", "ordinal": 6}, {"name": "D3D12GetDebugInterface", "ordinal": 7}, {"name": "D3D12SerializeRootSignature", "ordinal": 8}, {"name": "D3D12SerializeVersionedRootSignature", "ordinal": 9}, {"name": "D3D12UploadCustomMicrocodeX", "ordinal": 10}, {"name": "D3D12XboxCreateDevice", "ordinal": 11}, {"name": "D3D12XboxEnableMemoryProfiling", "ordinal": 12}, {"name": "D3D12XboxGetProcessDebugFlags", "ordinal": 13}, {"name": "D3D12XboxSetProcessDebugFlags", "ordinal": 14}, {"name": "D3DFlushEntireCpuCache", "ordinal": 15}, {"name": "DXGIXGetFrameStatistics", "ordinal": 16}, {"name": "DXGIXPresentArray", "ordinal": 17}, {"name": "DXGIXSetFrameNotification", "ordinal": 18}, {"name": "DXGIXSetVLineNotification", "ordinal": 19}, {"name": "IID_ID3D12CommandAllocator", "ordinal": 20}, {"name": "IID_ID3D12CommandList", "ordinal": 21}, {"name": "IID_ID3D12CommandQueue", "ordinal": 22}, {"name": "IID_ID3D12Debug", "ordinal": 23}, {"name": "IID_ID3D12DescriptorHeap", "ordinal": 24}, {"name": "IID_ID3D12Device", "ordinal": 25}, {"name": "IID_ID3D12DeviceChild", "ordinal": 26}, {"name": "IID_ID3D12Fence", "ordinal": 27}, {"name": "IID_ID3D12GraphicsCommandList", "ordinal": 28}, {"name": "IID_ID3D12Heap", "ordinal": 29}, {"name": "IID_ID3D12Object", "ordinal": 30}, {"name": "IID_ID3D12Pageable", "ordinal": 31}, {"name": "IID_ID3D12PipelineState", "ordinal": 32}, {"name": "IID_ID3D12Resource", "ordinal": 33}, {"name": "IID_ID3D12RootSignature", "ordinal": 34}, {"name": "IID_ID3D12RootSignatureDeserializer", "ordinal": 35}, {"name": "IID_ID3D12XboxDmaCommandList", "ordinal": 36}, {"name": "IID_IDXGIAdapter", "ordinal": 37}, {"name": "IID_IDXGIAdapter1", "ordinal": 38}, {"name": "IID_IDXGIAdapter2", "ordinal": 39}, {"name": "IID_IDXGIDevice", "ordinal": 40}, {"name": "IID_IDXGIDevice1", "ordinal": 41}, {"name": "IID_IDXGIDevice2", "ordinal": 42}, {"name": "IID_IDXGIDeviceSubObject", "ordinal": 43}, {"name": "IID_IDXGIFactory", "ordinal": 44}, {"name": "IID_IDXGIFactory1", "ordinal": 45}, {"name": "IID_IDXGIFactory2", "ordinal": 46}, {"name": "IID_IDXGIObject", "ordinal": 47}, {"name": "IID_IDXGISwapChain", "ordinal": 48}, {"name": "IID_IDXGISwapChain1", "ordinal": 49}, {"name": "IID_IGraphicsUnknown", "ordinal": 50}, {"name": "InternalDriverCallX", "ordinal": 51}, {"name": "PixGetPixieEntryPoints", "ordinal": 1}, {"name": "WKPDID_D3DDebugObjectNameW", "ordinal": 52}]
+  },
+  "relocations": { "total_blocks": 2, "total_entries": 210, "by_type": [{"type": 0, "count": 2}, {"type": 10, "count": 208}] },
+  "tls": null,
+  "notes": []
+}

@@ -60,3 +60,50 @@ All times UTC. This log is append-only and records what was actually done, run, 
   DECISIONS (ADR-0001/0002), ANYPS5_STUDY. Initialized local git (game data/refs/target excluded).
 - **17 tests total, all passing.** Toolchain: full Rust build/link/run confirmed; MSVC
   toolset located (VS 2026, 14.16).
+
+---
+
+## 2026-11-16 — Session 1 (cont.): download complete + real binary analysis
+
+### Download & verification
+- Archive downloaded in full: 27,385,950,541 bytes (size matches server exactly).
+- **SHA-256 (archive):** `433E7B3B65C0C51A4F20001721F7CC9FDA9AE97A0022A7F7B5AA94914BEFCA95`
+- `zip-inspect` on the real archive: ZIP64, 834 entries, **safe** (0 blocking findings).
+
+### Extraction (selective, safe)
+- Vetted first, then extracted **code only** (Binaries + System32 DLLs/EXEs + manifests +
+  symbols = ~390 MB) via .NET ZipFile with a path-traversal guard; skipped 24 GB of assets.
+- Structure: `EmbeddedXvd/` (Xbox GameOS system image, 276 System32 DLLs) + `Mount/`
+  (game package). **Loose decrypted files — not an encrypted XVC** (premise confirmed).
+
+### Main executable (parsed with pe-inspect)
+- `FortniteClient-XSX-Shipping.exe`, 150 MiB, **PE32+/AMD64**, WINDOWS_GUI, MSVC linker 14.24,
+  entry RVA `0x229a298`, image base `0x140000000`, ASLR/DEP, **2,045,522 DIR64 relocations**,
+  TLS present, 8 sections incl. Xbox-specific **`.xbld`**.
+- **SHA-256 (EXE):** `0B3D2E5968B0913EB01F52612793BFCC1984FF9764BD15D1C5AABF4830FCC3A0`
+- **67 import modules / 670 functions.** ~52 are standard Windows API-Sets/UCRT (BindOS
+  candidates). Reimplementation list is short: `d3d12_xs`, `xmem`, `xg_xs`, `GameInput`,
+  `XAudio2_9`, `AcpHal`, `XCRDAPI`(DirectStorage), `dxcompiler_xs`, + dynamic `xgameruntime`.
+- Analyzed each Xbox system DLL's exports/imports (`analysis/syslib/*.json`): `d3d12_xs` is
+  a 33 KB **thin shim** exporting standard D3D12 COM + Xbox ext; `xgameruntime` exports only
+  `QueryApiImpl` dispatch and is **dynamically loaded** (not a static import).
+
+### Shaders
+- **DXBC/DXIL confirmed** (not alien microcode): `dxcompiler_x/xs.dll` (DXC) + `dxbc2dxil_xs.dll`
+  present; EXE imports `DxcCreateInstance`. Top graphics risk (R1) downgraded.
+
+### Symbols
+- `FortniteClient-XSX-Shipping-Symbols.bin` = UE console symbol DB, decompresses to 118 MB of
+  demangled C++ names. Startup chain: `GuardedMain`→`FEngineLoop`→`RHIInit`→`FD3D12DynamicRHI`.
+
+### Milestones reached (CLAUDE.md §12)
+- [x] 1 Archive downloaded + checksum. [x] 2 Extracted + inventoried. [x] 3 Main exe + modules
+  identified. [x] 4 Executable parsed/validated. [x] 5 Dependencies/imports mapped.
+- [~] 6 Xbox loader requirements: substantially understood (dynamic xgameruntime, `.xbld`,
+  import redirection). [~] 7 Architecture: ADR-0002 confirmed by evidence.
+
+### Next priorities
+1. Decode `-Symbols.bin` address↔name map; inspect `.xbld`.
+2. Enumerate GDK `QueryApiImpl` surface via symbol-labelled call sites (REA/IDA).
+3. Begin the loader PoC: map + DIR64 reloc + import table build with redirection + fail-loud
+   unsupported-feature table (now evidence-justified).

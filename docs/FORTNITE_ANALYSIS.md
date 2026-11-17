@@ -1,47 +1,126 @@
 # Fortnite Xbox Series X|S — Target Analysis
 
-Target: **Fortnite Xbox Series X|S, version 2.0.1461.7919**.
+Target: **Fortnite Xbox Series X|S, version 2.0.1461.7919**. All facts below are
+**observed from the supplied build** unless noted.
 
-## Source archive
+## Source archive (verified)
 
 | Field | Value |
 |---|---|
 | Source URL | https://ia801000.us.archive.org/10/items/fortnite-xbox-series-xs/436609B6.FortniteClient_2.0.1461.7919_neutral__9ncxwbgmmv7m8_xs.zip |
-| Container | ZIP (`application/zip`), server supports range requests |
-| Size | 27,385,950,541 bytes (25.51 GB) |
-| Download started (UTC) | recorded in `input/original/download_metadata.json` |
-| SHA-256 (archive) | _pending — computed after download completes_ |
-| Status | **download in progress** |
+| Size | 27,385,950,541 bytes (25.51 GB) — downloaded size matches server exactly |
+| Container | ZIP64, `application/zip`, 834 entries (770 files, 64 dirs, 0 symlinks) |
+| **SHA-256 (archive)** | `433E7B3B65C0C51A4F20001721F7CC9FDA9AE97A0022A7F7B5AA94914BEFCA95` |
+| Safety | `zip-inspect` verdict: **safe** (no traversal/absolute/symlink/bomb findings) |
 
-The filename component `_xs` and `9ncxwbgmmv7m8` (a Store package family-name style
-token) are consistent with an Xbox Series MSIXVC-origin package. To verify after
-extraction, not assume.
+## Archive structure
 
-## Dump inventory
-_Pending extraction._ Will record full tree, per-file size + SHA-256, candidate
-executables/modules, asset containers, config/manifest files, and unknowns.
+Two top-level trees (**not** an encrypted XVC — loose decrypted files, premise confirmed):
 
-## Executables and modules
-_Pending._ Expected: a main `FortniteClient*.exe` (PE32+/x64) plus dependent DLLs.
+- **`EmbeddedXvd/`** (607 entries) — the Xbox GameOS system image. `Windows/System32/`
+  holds 276 system DLLs/EXEs (~223 MB): the game's import targets, incl. `d3d12_x.dll`,
+  `d3d12_xs.dll`, `xgameruntime.dll`, `xmem.dll`, `xg_xs.dll`, `GameInput.dll`,
+  `XAudio2_9.dll`, `AcpHal.dll`, `XCRDAPI.dll`, `dxcompiler_x/xs.dll`, `dxbc2dxil_xs.dll`,
+  `xbthunk.dll`, `GameConfigHelper.dll`, plus ordinary Windows DLLs (combase, crypt32, …).
+- **`Mount/`** (223 entries) — the game package: `MicrosoftGame.config`, `appxmanifest.xml`,
+  `package.manifest`, `FortniteGame/Binaries/XSX/` (the code), `FortniteGame/Content/Paks/`
+  (24 GB of `.pak`/`.ucas`/`.utoc` IoStore assets), `Content/Movies/`, and `Symbols/`.
 
-## Dependencies / imports
-_Pending._ Will be generated with `pe-inspect --json` and classified into
-Xbox/GDK vs. standard Windows vs. unknown (see `COMPATIBILITY.md`).
+What we extracted locally (code only, assets skipped): `input/extracted/` — Binaries +
+System32 DLLs/EXEs + manifests + symbols = ~390 MB.
 
-## Startup sequence
-_Pending._ Will be mapped via static analysis (entry → CRT → GDK init → RHI/device).
+## MicrosoftGame.config (authoritative)
 
-## Engine
-_Hypothesis:_ Unreal Engine (Fortnite). Version to be recovered from strings/metadata.
+- Executable: `FortniteGame\Binaries\XSX\FortniteClient-XSX-Shipping.exe`, Id `AppFortnite`,
+  **`TargetDeviceFamily="Scarlett"`** (Xbox Series).
+- Identity `436609B6.FortniteClient`, Publisher Epic Games, Version `2.0.1461.7919`.
+- `TitleId 0FF4B5BD`, `StoreId BT5P2X999VH2`, **`RequiresXboxLive=true`**,
+  PersistentLocalStorage 1024 MB.
 
-## Dependency-graph tiers (CLAUDE.md §5) — to populate
-1. Required to load the EXE
-2. Required to enter initialization
-3. Required to create the first window/device
-4. Required to render the first frame
-5. Required to reach the main menu
-6. Required for gameplay
-7. Optional platform functionality
+## Main executable
 
-## Target-specific findings
-_Pending._
+| Field | Value |
+|---|---|
+| Path | `Mount/FortniteGame/Binaries/XSX/FortniteClient-XSX-Shipping.exe` |
+| SHA-256 | `0B3D2E5968B0913EB01F52612793BFCC1984FF9764BD15D1C5AABF4830FCC3A0` |
+| Size | 157,572,608 bytes (150 MiB) |
+| Format | **PE32+ / AMD64**, EXECUTABLE_IMAGE \| LARGE_ADDRESS_AWARE |
+| Subsystem | 2 = WINDOWS_GUI |
+| Linker | 14.24 (MSVC, ~VS 2019 16.4) |
+| Image base | `0x140000000`; Entry point RVA `0x0229a298` (in `.text`) |
+| SizeOfImage | `0x099b7000` (~161 MB) |
+| DLL characteristics | HIGH_ENTROPY_VA \| DYNAMIC_BASE (ASLR) \| NX_COMPAT \| TERMINAL_SERVER_AWARE |
+| Relocations | **2,045,522** base relocations (all DIR64) → image is relocatable |
+| TLS | TLS directory present (callbacks array; 0 resolved by static walk) |
+| Build timestamp | `0x5f9b76c4` (≈ Oct 2020) |
+
+**Sections (8):** `.text` (code, ~99 MB), `.rdata`, `.data`, `.pdata` (SEH unwind),
+`.msvcjmc` (MSVC Just-My-Code), `_RDATA`, **`.xbld`** (Xbox-specific, MEM_DISCARDABLE,
+0x45d bytes — loader metadata, to be examined), `.reloc`.
+
+## Engine & symbols
+
+- **Unreal Engine** (Fortnite). `Mount/Symbols/FortniteClient-XSX-Shipping-Symbols.bin`
+  is UE's console symbol DB: `[magic 0x076b85ee][size][zlib]`, **decompresses to 118 MB**
+  of demangled C++ symbol names.
+- Startup chain visible in symbols: `WinMain`/`GuardedMain` → `FEngineLoop` (PreInit/Init)
+  → `RHIInit` → **`FD3D12DynamicRHI`** → device creation. `FScarlett*`/`ScarlettRHI` absent
+  as class names → the Series path lives inside `FD3D12DynamicRHI` behind platform `#if`s.
+  This symbol DB enables labelling EXE functions by name for startup tracing.
+
+## Imports — the dependency surface (67 modules / 670 functions)
+
+**~52 of 67 modules are standard Windows API-Sets / UCRT** (`api-ms-win-core-*`,
+`api-ms-win-crt-*`, `ext-ms-win-rtcore-ntuser-*`) plus `bcrypt`, `crypt32`, `ws2_32`,
+`msvcp140`, `vcruntime140`, `mfplat`/`mfreadwrite`, `winhttp` — all of which desktop
+Windows implements. Candidate for binding to the real OS (verify per symbol).
+
+**Xbox-only / special modules actually imported by the EXE** (the reimplementation list):
+
+| Module | Fns used | Role (from exports) | PC equivalent exists? |
+|---|---|---|---|
+| `d3d12_xs.dll` | 6 | Xbox D3D12 (std COM + Xbox ext: `D3D12XboxCreateDevice`, `DXGIXPresentArray`, `D3DFlushEntireCpuCache`) | PC `d3d12.dll` (translate) |
+| `xmem.dll` | 10 | Memory (`XMemAlloc`, `XMemVirtualAlloc`, `XMemAllocatePhysicalPages`, …) over ntdll | VirtualAlloc2 + D3D12 heaps |
+| `xg_xs.dll` | 1 (`XGCreateTextureComputer`) | RDNA2 texture tiling/swizzle/DCC math (self-contained) | none (reimplement/bypass) |
+| `GameInput.dll` | 1 (`GameInputCreate`) | Input (IGameInput COM) | **PC GameInput redist** |
+| `XAudio2_9.dll` | 5 (ordinals #1–#6) | Audio | **PC XAudio2_9** |
+| `AcpHal.dll` | 6 (`ApuAlloc`, `AcpHalCreate`, …) | Xbox audio-DSP (ACP/APU) HAL | none (stub/software) |
+| `XCRDAPI.dll` | 1 (`DStorageGetFactory`) | **DirectStorage** for `.ucas` streaming | **PC DirectStorage** |
+| `dxcompiler_xs.dll` | 1 (`DxcCreateInstance`) | Runtime DXIL compiler (DXC) | **PC `dxcompiler.dll`** |
+| `EOSSDK-XboxOneGDK-Shipping.dll` | 48 | Epic Online Services (bundled w/ game) | stub for offline first-frame |
+| `GameChat2.dll` | delay-load | GDK game chat (bundled) | stub |
+
+**`xgameruntime.dll` is NOT a static import.** It exports only `InitializeApiImpl`,
+`QueryApiImplEx`, `QueryApiImpl`, `UninitializeApiImpl`, `XErrorReport` — the GDK's
+runtime dispatcher. The game's statically-linked `XGameRuntime.lib` resolves GDK services
+(XTaskQueue/XUser/XGameSave/…) through `QueryApiImpl` after a **dynamic `LoadLibrary`**.
+⇒ the loader must intercept dynamic loads of `xgameruntime.dll` and provide our impl.
+
+## Shaders (risk downgraded)
+
+Shaders are in the **DirectX bytecode family (DXBC/DXIL)**, not an alien format — evidenced
+by `dxcompiler_x/xs.dll` (DXC, HLSL→DXIL) and **`dxbc2dxil_xs.dll`** (DXBC→DXIL converter)
+in the system image, and the EXE importing `DxcCreateInstance`. PC D3D12 consumes DXIL.
+*Still to confirm:* the exact shader container inside the `.ucas`/`.pak` assets.
+
+## Dependency-graph tiers (CLAUDE.md §5) — current best mapping
+
+1. **Load the EXE:** PE loader + relocations (DIR64) + TLS + SEH; satisfy/redirect the 67
+   import modules. Bind the ~52 standard modules to Windows; stub/implement the Xbox-only.
+2. **Enter init (`FEngineLoop::PreInit`):** CRT + `xmem` + GDK bootstrap (dynamic
+   `xgameruntime` `QueryApiImpl`) + config (`GameConfigHelper`).
+3. **First device (`RHIInit`/`FD3D12DynamicRHI`):** `d3d12_xs` `D3D12XboxCreateDevice` →
+   translate to PC `d3d12.dll` device; `xg_xs` texture layout; windowing via
+   `ext-ms-win-rtcore-ntuser-*`.
+4. **First frame:** command lists, resource creation, `DXGIXPresentArray` → PC present.
+5. **Main menu:** asset streaming (`DStorageGetFactory`, IoStore `.ucas`/`.utoc`), DXC
+   shader compile, UI.
+6. **Gameplay / 7. Optional:** EOS, chat, Xbox Live services (`RequiresXboxLive` — will
+   not connect to production services; assess whether first-frame can proceed offline).
+
+## Open questions
+1. Decode `-Symbols.bin` address↔name mapping to label EXE RVAs.
+2. Inspect `.xbld` section contents (Xbox loader metadata).
+3. Shader container format inside IoStore assets.
+4. Which `api-ms-win-*` behaviours diverge from desktop (per-symbol).
+5. Whether `FEngineLoop` can reach a device offline given `RequiresXboxLive`.
