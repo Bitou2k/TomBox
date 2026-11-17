@@ -1312,7 +1312,7 @@ impl<'a> Emitter<'a> {
     fn emit_mubuf(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         if let Some(Res::CbDyn(slot)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
             let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-            if idxen || !matches!(ins.src[2], Opnd::ConstInt(0)) || !ins.mnemonic.starts_with("buffer_load_dword") {
+            if (idxen && offen) || !matches!(ins.src[2], Opnd::ConstInt(0)) || !ins.mnemonic.starts_with("buffer_load_dword") {
                 return Err("constant-buffer MUBUF form unsupported".into());
             }
             let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
@@ -1320,7 +1320,16 @@ impl<'a> Emitter<'a> {
                 Opnd::Vgpr(v) => v,
                 _ => return Err("bad vdata".into()),
             };
-            let base = if offen { format!("({:#x}u + {})", ins.aux.imm as u32, r(&ins.src[0])?) } else { format!("{:#x}u", ins.aux.imm as u32) };
+            let base = if offen {
+                format!("({:#x}u + {})", ins.aux.imm as u32, r(&ins.src[0])?)
+            } else if idxen {
+                // Indexed access to a constant buffer = a dynamically indexed cbuffer array.
+                // Elements of cbuffer arrays are 16-byte registers, which is the stride the
+                // CBV descriptor carries (inferred: the title reads 3 dwords per element).
+                format!("({:#x}u + {} * 16u)", ins.aux.imm as u32, r(&ins.src[0])?)
+            } else {
+                format!("{:#x}u", ins.aux.imm as u32)
+            };
             let t = self.tmp;
             self.tmp += 1;
             self.line(&format!("uint t{t} = {base} >> 2;"));
