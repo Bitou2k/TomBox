@@ -362,7 +362,8 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             let d1 = raw.get(1).copied().unwrap_or(0);
             aux.imm = (w & 0xffff) as i64;
             (vec![Opnd::Vgpr((d1 >> 24) as u8)],
-             vec![Opnd::Vgpr((d1 & 0xff) as u8), Opnd::Vgpr(((d1 >> 8) & 0xff) as u8)], aux)
+             vec![Opnd::Vgpr((d1 & 0xff) as u8), Opnd::Vgpr(((d1 >> 8) & 0xff) as u8),
+                  Opnd::Vgpr(((d1 >> 16) & 0xff) as u8)], aux)
         }
         Enc::Mubuf => {
             let d1 = raw.get(1).copied().unwrap_or(0);

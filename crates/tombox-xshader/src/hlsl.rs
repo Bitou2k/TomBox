@@ -49,7 +49,7 @@ const XYZW: [&str; 4] = ["x", "y", "z", "w"];
 /// face-local S/T, face index 0..5 = +X,-X,+Y,-Y,+Z,-Z). Hardware cube sampling takes
 /// (s, t, face) with s,t = sc/|ma| + 1.5 (so each is in [1, 2]); `tb_cube_dir` inverts that
 /// to the direction vector HLSL TextureCube sampling expects.
-const CUBE_HELPERS: &str = r#"uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
+const CUBE_HELPERS: &str = r#"uint tb_bfe_i32(uint a, uint b) { uint o = b & 31u, w = (b >> 16) & 127u; if (w == 0u) return 0u; if (w + o >= 32u) return asuint(asint(a) >> o); return asuint(asint(a << (32u - w - o)) >> (32u - w)); }uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
 uint tb_mulhi_i32(uint a, uint b) { uint h = tb_mulhi_u32(a, b); if (asint(a) < 0) h -= b; if (asint(b) < 0) h -= a; return h; }
 float tb_cubema(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return 2.0 * z; if (ay >= ax) return 2.0 * y; return 2.0 * x; }
 float tb_cubesc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? -x : x; if (ay >= ax) return x; return x < 0.0 ? z : -z; }
@@ -157,6 +157,7 @@ struct Emitter<'a> {
     sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
     is_cs: bool,
+    is_gs: bool,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
     /// Pixel shader needs its position within the 2x2 quad (ds_swizzle).
@@ -175,6 +176,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         Stage::Vertex => ("vs_5_0", false),
         Stage::Pixel => ("ps_5_0", true),
         Stage::Compute => ("cs_5_0", false),
+        Stage::Geometry => ("gs_5_0", false),
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let insns = disassemble(&ex.isa);
@@ -189,6 +191,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         sbuf: BTreeMap::new(),
         tbuf: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
+        is_gs: ex.stage == Stage::Geometry,
         live: Vec::new(),
         uses_quad: false,
         regs: BTreeSet::new(),
@@ -652,6 +655,7 @@ impl<'a> Emitter<'a> {
         let d = ins.dst.first().cloned();
         self.line(&format!("// {:#06x} {m}", ins.offset));
         match ins.enc {
+            Enc::Sopp if ins.op == 0x10 => self.emit_sendmsg(ins),
             Enc::Sopp => {
                 let cond = match ins.op {
                     2 => Some("true".to_string()),
@@ -675,6 +679,25 @@ impl<'a> Emitter<'a> {
             Enc::Sop2 => {
                 let d = d.ok_or("no dst")?;
                 let (a, b) = (r(&s[0])?, r(&s[1])?);
+                if m == "s_bfm_b64" || m == "s_cselect_b64" {
+                    let (lo, hi_e) = if m == "s_bfm_b64" {
+                        // Bitfield mask ((1 << a) - 1) << b. Lane model keeps the low word;
+                        // counts >= 32 saturate it.
+                        (format!("((({a} & 63u) >= 32u ? 0xffffffffu : ((1u << ({a} & 31u)) - 1u)) << ({b} & 31u))"), "0u".to_string())
+                    } else {
+                        (
+                            format!("((scc != 0u) ? {a} : {b})"),
+                            format!("((scc != 0u) ? {} : {})", r(&hi(&s[0]))?, r(&hi(&s[1]))?),
+                        )
+                    };
+                    let t = self.tmp;
+                    self.tmp += 1;
+                    self.line(&format!("uint t{t}l = {lo}; uint t{t}h = {hi_e};"));
+                    self.ws(&d, &format!("t{t}l"))?;
+                    let dh = hi(&d);
+                    self.touch(&dh);
+                    return self.ws(&dh, &format!("t{t}h"));
+                }
                 let is64 = m.ends_with("_b64");
                 let bit = |op: &str, a: &str, b: &str| -> Option<String> {
                     Some(match op {
@@ -723,6 +746,8 @@ impl<'a> Emitter<'a> {
                     "s_max_i32" => format!("asuint(max(asint({a}), asint({b})))"),
                     "s_cselect_b32" => format!("((scc != 0u) ? {a} : {b})"),
                     "s_bfe_u32" => format!("(({a} >> ({b} & 31u)) & ((1u << (({b} >> 16) & 31u)) - 1u))"),
+                    "s_bfe_i32" => format!("tb_bfe_i32({a}, {b})"),
+                    "s_bfm_b32" => format!("(((1u << ({a} & 31u)) - 1u) << ({b} & 31u))"),
                     "s_lshl1_add_u32" => format!("(({a} << 1) + {b})"),
                     "s_lshl2_add_u32" => format!("(({a} << 2) + {b})"),
                     "s_lshl3_add_u32" => format!("(({a} << 3) + {b})"),
@@ -898,6 +923,9 @@ impl<'a> Emitter<'a> {
             }
             Enc::Mimg => self.emit_mimg(idx, ins),
             Enc::Mubuf => self.emit_mubuf(idx, ins),
+            Enc::Ds if self.is_gs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
+                self.emit_gs_lds(ins)
+            }
             Enc::Ds if m == "ds_swizzle_b32" => {
                 // Quad swizzle (QDMode): each lane of a 2x2 pixel quad reads the lane selected
                 // by a 2-bit field of the 8-bit mask — how RDNA2 pixel shaders fetch neighbour
@@ -1144,6 +1172,9 @@ impl<'a> Emitter<'a> {
             "v_mul_u32_u24" => format!("(({a} & 0xffffffu) * ({b} & 0xffffffu))"),
             "v_mul_i32_i24" => format!("asuint((asint({a} << 8) >> 8) * (asint({b} << 8) >> 8))"),
             "v_mul_lo_u32" | "v_mul_lo_i32" => format!("({a} * {b})"),
+            // Count of mask bits below this lane, plus src1. One invocation = one lane with
+            // nothing below it, so the count term is zero.
+            "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => b,
             "v_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
             "v_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),| "v_mul_lo_i32" => format!("({a} * {b})"),
             "v_mad_u32_u24" => format!("(({a} & 0xffffffu) * ({b} & 0xffffffu) + {c})"),
@@ -1289,6 +1320,130 @@ impl<'a> Emitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Geometry-shader LDS layout (read off WriteToSliceMainGS): input vertex data lives at
+    /// `vertexBase + register*16 + component*4`, emitted vertices at
+    /// `primBase + vertex*stride + register*16 + component*4`, stride = 16 * output registers.
+    /// The translation seeds the vertex-offset registers with synthetic offsets (vertex k at
+    /// dword offset k*0x400, i.e. byte k*0x1000 after the shader's own <<2), so an input
+    /// address decodes exactly as (vertex = A >> 12, slot = (A & 0xfff) >> 2).
+    fn gs_dims(&self) -> Result<(usize, usize, usize, &'static str, &'static str), String> {
+        let gi = self.ex.gs_info.ok_or("geometry shader without PSV0 GS info")?;
+        let (prim, nv) = match gi.input_primitive {
+            1 => ("point", 1usize),
+            2 => ("line", 2),
+            3 => ("triangle", 3),
+            other => return Err(format!("GS input primitive {other} unsupported")),
+        };
+        let stream = match gi.output_topology {
+            1 => "PointStream",
+            3 => "LineStream",
+            5 => "TriangleStream",
+            other => return Err(format!("GS output topology {other} unsupported")),
+        };
+        let in_dw = 4 * (self.ex.input_sig.iter().map(|e| e.register).max().unwrap_or(0) as usize + 1);
+        let out_dw = 4 * (self.ex.output_sig.iter().map(|e| e.register).max().unwrap_or(0) as usize + 1);
+        Ok((nv, in_dw, out_dw, prim, stream))
+    }
+
+    fn gs_max_vertices(&self) -> usize {
+        let emits = self
+            .insns
+            .iter()
+            .filter(|i| i.enc == Enc::Sopp && i.op == 0x10 && (i.aux.imm as u32 & 0xf) == 2 && (i.aux.imm as u32 >> 4) & 2 != 0)
+            .count();
+        (self.ex.gs_info.map(|g| g.max_vertex_count as usize).unwrap_or(0)).max(emits).max(1)
+    }
+
+    fn emit_gs_lds(&mut self, ins: &Insn) -> Result<(), String> {
+        let (nv, in_dw, out_dw, _, _) = self.gs_dims()?;
+        let gs_dw = out_dw * self.gs_max_vertices();
+        let off = ins.aux.imm as u32;
+        let (off0, off1) = (off & 0xff, (off >> 8) & 0xff);
+        let addr = r(&ins.src[0])?;
+        let t = self.tmp;
+        self.tmp += 1;
+        let in_at = |a: String| format!("tb_in[({a} >> 12) % {nv}u][(({a} & 0xfffu) >> 2) % {in_dw}u]");
+        let vd = match ins.dst[0] {
+            Opnd::Vgpr(v) => v,
+            _ => return Err("bad vdst".into()),
+        };
+        match ins.mnemonic.as_str() {
+            "ds_read_b32" => {
+                self.line(&format!("uint t{t} = {};", in_at(format!("({addr} + {:#x}u)", off & 0xffff))));
+                self.wv(&Opnd::Vgpr(vd), &format!("t{t}"))
+            }
+            "ds_read2_b32" => {
+                self.line(&format!(
+                    "uint t{t}a = {}; uint t{t}b = {};",
+                    in_at(format!("({addr} + {:#x}u)", off0 * 4)),
+                    in_at(format!("({addr} + {:#x}u)", off1 * 4))
+                ));
+                self.wv(&Opnd::Vgpr(vd), &format!("t{t}a"))?;
+                self.wv(&Opnd::Vgpr(vd + 1), &format!("t{t}b"))
+            }
+            "ds_write_b32" => {
+                self.line(&format!(
+                    "if (exec_lo & 1u) tb_gs[(({addr} + {:#x}u) >> 2) % {gs_dw}u] = {};",
+                    off & 0xffff,
+                    r(&ins.src[1])?
+                ));
+                Ok(())
+            }
+            "ds_write2_b32" => {
+                self.line(&format!(
+                    "if (exec_lo & 1u) {{ tb_gs[(({addr} + {:#x}u) >> 2) % {gs_dw}u] = {}; tb_gs[(({addr} + {:#x}u) >> 2) % {gs_dw}u] = {}; }}",
+                    off0 * 4,
+                    r(&ins.src[1])?,
+                    off1 * 4,
+                    r(&ins.src[2])?
+                ));
+                Ok(())
+            }
+            _ => Err("unsupported LDS op".into()),
+        }
+    }
+
+    /// `s_sendmsg`: in a geometry shader, message 2 = GS with op bits (1 = cut, 2 = emit),
+    /// message 3 = GS_DONE.
+    fn emit_sendmsg(&mut self, ins: &Insn) -> Result<(), String> {
+        if !self.is_gs {
+            return Err("s_sendmsg outside a geometry shader".into());
+        }
+        let imm = ins.aux.imm as u32 & 0xffff;
+        let (msg, op, stream) = (imm & 0xf, (imm >> 4) & 3, (imm >> 8) & 3);
+        match msg {
+            3 => Ok(()),
+            2 => {
+                if stream != 0 {
+                    return Err("GS output stream != 0 unsupported".into());
+                }
+                let (_, _, out_dw, _, _) = self.gs_dims()?;
+                let maxv = self.gs_max_vertices();
+                if op & 2 != 0 {
+                    let mut body = format!("if (exec_lo & 1u) {{ SOut o = (SOut)0; uint tb_b = min(tb_emit, {}u) * {out_dw}u;", maxv - 1);
+                    for (ei, e) in self.ex.output_sig.iter().enumerate() {
+                        let (ty, _) = sig_type(e);
+                        let comps: Vec<String> = (0..4)
+                            .filter(|c| (e.mask >> c) & 1 != 0)
+                            .map(|c| {
+                                let w = format!("tb_gs[tb_b + {}u]", e.register as usize * 4 + c);
+                                if e.comp_type == 3 { format!("asfloat({w})") } else { w }
+                            })
+                            .collect();
+                        let _ = write!(body, " o.o{ei} = ({ty}){};", if comps.len() == 1 { comps[0].clone() } else { format!("{ty}({})", comps.join(", ")) });
+                    }
+                    body.push_str(" stream.Append(o); tb_emit++; }");
+                    self.line(&body);
+                }
+                if op & 1 != 0 {
+                    self.line("if (exec_lo & 1u) stream.RestartStrip();");
+                }
+                Ok(())
+            }
+            other => Err(format!("s_sendmsg message {other} unsupported")),
+        }
     }
 
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
@@ -1632,13 +1787,46 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let cut = h.rfind("struct SOut {").unwrap_or(h.len());
             h.truncate(cut);
             let _ = writeln!(h, "void main(SIn i) {{");
+        } else if self.is_gs {
+            let (nv, _, _, prim, stream) = self.gs_dims()?;
+            let _ = writeln!(
+                h,
+                "}};\n[maxvertexcount({})]\nvoid main({prim} SIn i[{nv}], inout {stream}<SOut> stream) {{",
+                self.gs_max_vertices()
+            );
         } else {
             let _ = writeln!(h, "}};\nSOut main(SIn i) {{\n    SOut o = (SOut)0;");
         }
         let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
         // Vertex attributes arrive in v[4 + 4*register + component] after the fetch call.
         let mut init = String::new();
-        if !is_ps {
+        if self.is_gs {
+            // GS entry ABI (from WriteToSliceMainGS): s3 carries the wave's primitive count in
+            // bits [15:8]; v0/v1 hold the vertex offsets (v0 = offset0 | offset1 << 16, v1 =
+            // offset2), in dwords. One invocation = one primitive.
+            let (nv, in_dw, out_dw, _, _) = self.gs_dims()?;
+            let _ = writeln!(init, "    uint tb_in[{nv}][{in_dw}]; uint tb_gs[{}]; uint tb_emit = 0u;", out_dw * self.gs_max_vertices());
+            let _ = writeln!(init, "    {{ for (uint a = 0u; a < {}u; a++) tb_gs[a] = 0u; }}", out_dw * self.gs_max_vertices());
+            let _ = writeln!(init, "    {{ for (uint k = 0u; k < {nv}u; k++) for (uint a = 0u; a < {in_dw}u; a++) tb_in[k][a] = 0u; }}");
+            for k in 0..nv {
+                for (ei, e) in ex.input_sig.iter().enumerate() {
+                    let mut n = 0;
+                    for c in 0..4usize {
+                        if (e.mask >> c) & 1 != 0 {
+                            let acc = format!("i[{k}].i{ei}.{}", XYZW[n]);
+                            let val = if e.comp_type == 3 { format!("asuint({acc})") } else { format!("(uint)({acc})") };
+                            let _ = writeln!(init, "    tb_in[{k}][{}] = {val};", e.register as usize * 4 + c);
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            for rname in ["s3", "v0", "v1"] {
+                self.regs.insert(rname.to_string());
+            }
+            let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
+        }
+        if !is_ps && !self.is_gs {
             for reg in distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0)) {
                 for c in 0..4usize {
                     let v = format!("v{}", 4 + 4 * reg as usize + c);
@@ -1678,7 +1866,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         }
         h.push_str(&init);
         h.push_str(&self.body);
-        h.push_str(if no_out { "}\n" } else { "    return o;\n}\n" });
+        h.push_str(if no_out || self.is_gs { "}\n" } else { "    return o;\n}\n" });
         Ok(h)
     }
 }

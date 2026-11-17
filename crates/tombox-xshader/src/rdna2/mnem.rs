@@ -83,7 +83,7 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x178 => "v_xor3_b32", 0x346 => "v_lshl_add_u32", 0x347 => "v_add_lshl_u32",
         0x36d => "v_add3_u32", 0x36f => "v_lshl_or_b32", 0x371 => "v_and_or_b32", 0x372 => "v_or3_b32",
         0x30f => "v_add_co_u32", 0x310 => "v_sub_co_u32", 0x319 => "v_subrev_co_u32",
-        0x362 => "v_ldexp_f32",
+        0x362 => "v_ldexp_f32", 0x365 => "v_mbcnt_lo_u32_b32", 0x366 => "v_mbcnt_hi_u32_b32",
         _ => return None,
     })
 }
@@ -151,7 +151,7 @@ pub fn sopp(op: u32) -> Option<&'static str> {
         0x00 => "s_nop", 0x01 => "s_endpgm", 0x02 => "s_branch", 0x04 => "s_cbranch_scc0",
         0x05 => "s_cbranch_scc1", 0x06 => "s_cbranch_vccz", 0x07 => "s_cbranch_vccnz",
         0x08 => "s_cbranch_execz", 0x09 => "s_cbranch_execnz", 0x0a => "s_barrier",
-        0x0c => "s_waitcnt", 0x1f => "s_code_end", 0x20 => "s_inst_prefetch", 0x21 => "s_clause",
+        0x0c => "s_waitcnt", 0x10 => "s_sendmsg", 0x1f => "s_code_end", 0x20 => "s_inst_prefetch", 0x21 => "s_clause",
         0x23 => "s_waitcnt_depctr", 0x24 => "s_round_mode", 0x25 => "s_denorm_mode",
         _ => return None,
     })
@@ -212,6 +212,10 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
         Enc::Exp => Some("exp"),
         Enc::Ds => match op {
             0x35 => Some("ds_swizzle_b32"),
+            0x0d => Some("ds_write_b32"),
+            0x0e => Some("ds_write2_b32"),
+            0x36 => Some("ds_read_b32"),
+            0x37 => Some("ds_read2_b32"),
             _ => None,
         },
         Enc::Vinterp => Some(match op {

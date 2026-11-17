@@ -62,6 +62,32 @@ pub struct PsvResource {
 }
 
 /// Parse the PSV0 chunk far enough to recover the resource-binding list.
+/// Geometry-shader facts from the PSV0 runtime info.
+#[derive(Debug, Clone, Copy)]
+pub struct GsInfo {
+    /// D3D input primitive: 1 point, 2 line, 3 triangle, 6 line-adj, 7 triangle-adj.
+    pub input_primitive: u32,
+    /// D3D output topology: 1 point list, 3 line strip, 5 triangle strip.
+    pub output_topology: u32,
+    pub max_vertex_count: u16,
+}
+
+/// Parse the GS part of PSV0's PSVRuntimeInfo: the stage union starts at +4
+/// ({InputPrimitive u32, OutputTopology u32, OutputStreamMask u32, ...}); PSVRuntimeInfo1
+/// adds ShaderStage u8 @+24, UsesViewID u8 @+25 and MaxVertexCount u16 @+26.
+pub fn parse_psv0_gs(body: &[u8]) -> Option<GsInfo> {
+    let info_size = u32_at(body, 0).ok()? as usize;
+    if info_size < 28 {
+        return None;
+    }
+    let info = body.get(4..4 + info_size)?;
+    Some(GsInfo {
+        input_primitive: u32_at(info, 0).ok()?,
+        output_topology: u32_at(info, 4).ok()?,
+        max_vertex_count: u16::from_le_bytes([*info.get(26)?, *info.get(27)?]),
+    })
+}
+
 pub fn parse_psv0(body: &[u8]) -> Result<Vec<PsvResource>, String> {
     let info_size = u32_at(body, 0)? as usize;
     let mut p = 4 + info_size;
