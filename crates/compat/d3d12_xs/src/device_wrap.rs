@@ -502,6 +502,36 @@ unsafe extern "system" fn dev_stub() -> i32 {
     0x8000_4001u32 as i32 // E_NOTIMPL
 }
 
+/// Xbox graphics-PSO create (device slot 60). The Fortnite RHI calls this to build
+/// graphics pipelines. Dump the desc + shader bytecode magic (to learn if shaders are
+/// DXIL/DXBC — PC-compatible — or native), then forward to PC CreateGraphicsPipelineState
+/// (slot 10) assuming a PC-compatible D3D12_GRAPHICS_PIPELINE_STATE_DESC.
+unsafe extern "system" fn create_gfx_pso_x(
+    this: *mut DeviceWrapper, pdesc: *const u8, riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 3 && !pdesc.is_null() {
+        // PC D3D12_GRAPHICS_PIPELINE_STATE_DESC: RootSig@0, VS{ptr@8,len@0x10}, PS{ptr@0x18,len@0x20}
+        let rd = |o: usize| unsafe { core::ptr::read_unaligned(pdesc.add(o) as *const u64) };
+        let (rootsig, vs_ptr, vs_len, ps_ptr) = (rd(0), rd(8), rd(0x10), rd(0x18));
+        let magic = if vs_ptr > 0x10000 { unsafe { core::ptr::read_unaligned(vs_ptr as *const u32) } } else { 0 };
+        let magic_s = magic.to_le_bytes();
+        record("d3d12_xs", "CreateGraphicsPSO_X",
+            &format!("rootSig={rootsig:#x} VS={vs_ptr:#x}(len={vs_len}) PS={ps_ptr:#x} shaderMagic={magic:#x} ({:?})",
+                core::str::from_utf8(&magic_s).unwrap_or("?")));
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
+    let hr = unsafe { f(real, pdesc, riid, ppv) };
+    if n < 3 {
+        let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+        record("d3d12_xs", "CreateGraphicsPSO_X", &format!("-> hr={hr:#010x} pso={out:p}"));
+    }
+    hr
+}
+
 // Per-slot logging stubs for the Xbox device extensions (44+): capture slot +
 // caller RVA and return S_OK (most are hints like SetFrameIntervalX that the RHI
 // only checks for success). This reveals which Xbox device methods the game needs.
@@ -562,6 +592,7 @@ fn vtable() -> *const usize {
             v.push(dev_stub as usize);
         }
         unsafe { install_dev_stubs(&mut v); } // 44..90: logging S_OK stubs (diagnostic)
+        v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
         v[25] = get_resource_alloc_info as usize; // GetResourceAllocationInfo (null-safe)
