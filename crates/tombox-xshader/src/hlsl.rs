@@ -93,6 +93,25 @@ fn f(o: &Opnd) -> Result<String, String> {
     Ok(format!("asfloat({})", r(o)?))
 }
 
+/// Scalar register number of an operand (SGPRs, plus vcc_lo/vcc_hi = 106/107, which SMEM
+/// loads can target directly: `s_buffer_load_dwordx2 vcc_lo, ...`).
+fn sreg_num(o: &Opnd) -> Option<u8> {
+    match o {
+        Opnd::Sgpr(n) => Some(*n),
+        Opnd::VccLo => Some(106),
+        Opnd::VccHi => Some(107),
+        _ => None,
+    }
+}
+
+fn sreg_opnd(n: u8) -> Opnd {
+    match n {
+        106 => Opnd::VccLo,
+        107 => Opnd::VccHi,
+        n => Opnd::Sgpr(n),
+    }
+}
+
 /// High half of a 64-bit scalar operand.
 fn hi(o: &Opnd) -> Opnd {
     match o {
@@ -253,6 +272,9 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
         ins.mnemonic = "s_mov_b32".into();
     }
     for ins in insns.iter() {
+        if ins.mnemonic == "v_nop" {
+            continue; // the two header words at the start of every program decode as v_nop
+        }
         for o in ins.dst.iter().chain(ins.src.iter()) {
             if let Opnd::Vgpr(v) = o {
                 if spill_vregs.contains(v) {
@@ -306,6 +328,9 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
     let mut hlsl = em.finish(is_ps)?;
     hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
 ", live_in.join(" ")));
+    // ps_5_0 forces UAV slots to start after the render-target outputs (FXC X4509);
+    // SM5.1 has no such rule, and D3D12 accepts SM5.1 bytecode.
+    let profile = if is_ps && !em.uav.is_empty() { "ps_5_1" } else { profile };
     Ok(Translated { hlsl, entry: "main", profile })
 }
 
@@ -472,6 +497,24 @@ impl<'a> Emitter<'a> {
                         written.insert(d);
                     }
                 }
+                Enc::Sop1 if ins.mnemonic == "s_mov_b64" => {
+                    // 64-bit moves copy descriptors two dwords at a time
+                    // (`s_mov_b64 s44, s84` + `s_mov_b64 s46, s86` moves a 4-dword descriptor).
+                    if let Some(d) = ins.dst.first().and_then(sg) {
+                        let s = ins.src.first().and_then(sg);
+                        for k in 0..2u8 {
+                            match s.and_then(|s| sym.get(&(s + k)).cloned()) {
+                                Some(v) => {
+                                    sym.insert(d + k, v);
+                                }
+                                None => {
+                                    sym.remove(&(d + k));
+                                }
+                            }
+                            written.insert(d + k);
+                        }
+                    }
+                }
                 Enc::Sop1 if ins.mnemonic == "s_getpc_b64" => {
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         sym.insert(d, Sym::Code);
@@ -531,7 +574,7 @@ impl<'a> Emitter<'a> {
                 Enc::Smem => {
                     let n = 1u32 << (ins.op - 8);
                     let b = ins.src.first().and_then(sg).ok_or("s_buffer_load: bad base")?;
-                    let d = ins.dst.first().and_then(sg).ok_or("s_buffer_load: bad dst")?;
+                    let d = ins.dst.first().and_then(sreg_num).ok_or("s_buffer_load: bad dst")?;
                     let slot = match sym.get(&b) {
                         // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table
                         // offset 0x20 in MainOnePassPointLightPS).
@@ -1282,10 +1325,7 @@ impl<'a> Emitter<'a> {
                         // Constant table embedded in the code section: byte address = pointer
                         // (relative to the start of the program) + immediate.
                         let n = 1u32 << ins.op;
-                        let base = match d.ok_or("no dst")? {
-                            Opnd::Sgpr(n) => n,
-                            _ => return Err("bad dst".into()),
-                        };
+                        let base = sreg_num(&d.ok_or("no dst")?).ok_or("bad dst")?;
                         let ndw = ((self.ex.isa_data.len().saturating_sub(self.ex.isa.len())) / 4).max(1);
                         let t = self.tmp;
                         self.tmp += 1;
@@ -1294,7 +1334,7 @@ impl<'a> Emitter<'a> {
                             self.line(&format!("uint t{t}_{k} = tb_code[(t{t} + {k}u - {}u) % {ndw}u];", self.ex.isa.len() / 4));
                         }
                         for k in 0..n {
-                            let dst = Opnd::Sgpr(base + k as u8);
+                            let dst = sreg_opnd(base + k as u8);
                             self.touch(&dst);
                             self.ws(&dst, &format!("t{t}_{k}"))?;
                         }
@@ -1308,10 +1348,7 @@ impl<'a> Emitter<'a> {
                     _ => return Err("unresolved constant buffer".into()),
                 };
                 let n = 1u32 << (ins.op - 8);
-                let base = match d.ok_or("no dst")? {
-                    Opnd::Sgpr(n) => n,
-                    _ => return Err("bad dst".into()),
-                };
+                let base = sreg_num(&d.ok_or("no dst")?).ok_or("bad dst")?;
                 let soff = ins.raw.get(1).copied().unwrap_or(0) >> 25;
                 if soff != 0x7d {
                     // Dynamic byte offset = imm + SGPR[soffset].
@@ -1324,7 +1361,7 @@ impl<'a> Emitter<'a> {
                         self.line(&format!("uint t{t}_{k} = cb{slot}[((t{t} + {k}u) >> 2) & 4095u][(t{t} + {k}u) & 3u];"));
                     }
                     for k in 0..n {
-                        let dst = Opnd::Sgpr(base + k as u8);
+                        let dst = sreg_opnd(base + k as u8);
                         self.touch(&dst);
                         self.ws(&dst, &format!("t{t}_{k}"))?;
                     }
@@ -1333,7 +1370,7 @@ impl<'a> Emitter<'a> {
                 let w0 = ins.aux.imm as u32 / 4;
                 for k in 0..n {
                     let w = w0 + k;
-                    let dst = Opnd::Sgpr(base + k as u8);
+                    let dst = sreg_opnd(base + k as u8);
                     self.touch(&dst);
                     self.ws(&dst, &format!("cb{slot}[{}].{}", w / 4, XYZW[(w % 4) as usize]))?;
                 }
@@ -1740,6 +1777,19 @@ impl<'a> Emitter<'a> {
             "v_and_or_b32" => format!("(({a} & {b}) | {c})"),
             "v_or3_b32" => format!("({a} | {b} | {c})"),
             "v_xor3_b32" => format!("({a} ^ {b} ^ {c})"),
+            "v_xad_u32" => format!("(({a} ^ {b}) + {c})"),
+            "v_min3_u32" => format!("min(min({a}, {b}), {c})"),
+            "v_max3_u32" => format!("max(max({a}, {b}), {c})"),
+            "v_med3_u32" => format!("max(min({a}, {b}), min(max({a}, {b}), {c}))"),
+            "v_min3_i32" => format!("asuint(min(min(asint({a}), asint({b})), asint({c})))"),
+            "v_max3_i32" => format!("asuint(max(max(asint({a}), asint({b})), asint({c})))"),
+            "v_med3_i32" => format!(
+                "asuint(max(min(asint({a}), asint({b})), min(max(asint({a}), asint({b})), asint({c}))))"
+            ),
+            // {S0:S1} >> S2[4:0], low 32 bits (S0 is the high word).
+            "v_alignbit_b32" => format!(
+                "((({c}) & 31u) == 0u ? {b} : (({b} >> (({c}) & 31u)) | ({a} << (32u - (({c}) & 31u)))))"
+            ),
             "v_cvt_u32_f32" => format!("(uint)max({}, 0.0)", fa()?),
             "v_cvt_i32_f32" => format!("asuint((int){})", fa()?),
             "v_cvt_flr_i32_f32" => format!("asuint((int)floor({}))", fa()?),
@@ -2422,8 +2472,16 @@ impl<'a> Emitter<'a> {
             if target != 12 {
                 return Err(format!("position export {target} unsupported"));
             }
-            let ei = osig.iter().position(|e| e.sysval == 1).ok_or("no SV_Position output")?;
-            assigns.push((ei, "xyzw".to_string()));
+            match osig.iter().position(|e| e.sysval == 1) {
+                Some(ei) => assigns.push((ei, "xyzw".to_string())),
+                None => {
+                    // A vertex shader feeding a geometry shader (entry "MainForGS") still
+                    // carries a position export, but its D3D output signature has no
+                    // SV_Position: the next stage consumes only the parameter exports.
+                    self.line("// (position export with no SV_Position output element: ignored)");
+                    return Ok(());
+                }
+            }
         } else if (32..64).contains(&target) {
             let reg = self.out_params[(target - 32) as usize];
             for (ei, e) in osig.iter().enumerate() {

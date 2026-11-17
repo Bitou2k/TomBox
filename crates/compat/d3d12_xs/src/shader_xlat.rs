@@ -104,7 +104,50 @@ fn dump_failure(hash: u64, blob: &[u8], hlsl: Option<&str>, err: &str) {
     }
 }
 
+/// On-disk cache of compiled shaders, valid for one build of this DLL (the directory name
+/// is derived from the deployed d3d12_xs.dll's size and modification time, so any rebuild
+/// of the translator starts a fresh cache).
+fn disk_cache_dir() -> Option<&'static std::path::PathBuf> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let md = std::fs::metadata(exe.parent()?.join("d3d12_xs.dll")).ok()?;
+        let stamp = md.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let dir = std::env::temp_dir().join("tombox_shader_cache").join(format!("{:x}_{:x}", md.len(), stamp));
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    })
+    .as_ref()
+}
+
 fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
+    if let Some(dir) = disk_cache_dir() {
+        if let Ok(v) = std::fs::read(dir.join(format!("{hash:016x}.cso"))) {
+            if !v.is_empty() {
+                return Ok(v);
+            }
+        }
+    }
+    // Leave the input on disk while it is being translated: if the translator or FXC
+    // hangs, the file that remains identifies the shader.
+    let inflight = std::env::temp_dir().join("tombox_shaders");
+    let _ = std::fs::create_dir_all(&inflight);
+    let inflight = inflight.join(format!("inflight_{hash:016x}.dxbc"));
+    let _ = std::fs::write(&inflight, blob);
+    let t0 = std::time::Instant::now();
+    let r = translate_and_compile(blob, hash);
+    let _ = std::fs::remove_file(&inflight);
+    let ms = t0.elapsed().as_millis();
+    if ms > 1500 {
+        record("d3d12_xs", "shader_xlat", &format!("SLOW: hash={hash:016x} took {ms} ms ({} bytes in)", blob.len()));
+    }
+    if let (Ok(v), Some(dir)) = (&r, disk_cache_dir()) {
+        let _ = std::fs::write(dir.join(format!("{hash:016x}.cso")), v);
+    }
+    r
+}
+
+fn translate_and_compile(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
     let ex = tombox_xshader::extract(blob).map_err(|e| {
         dump_failure(hash, blob, None, &e);
         format!("extract: {e}")
