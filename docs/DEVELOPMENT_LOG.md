@@ -638,3 +638,25 @@ request `State=[Succeeded]`.
 **Login still fails before any login request is sent:** the GDK layer reports no signed-in
 user (`LogGDKSaveGame: User -1 is not valid`, `no AuthToken stored for ControllerId -1`).
 Next: find what answers the XUser calls today and what a sign-in needs.
+
+## 2026-11-17 (late) — local Xbox user and store; login reaches the backend
+
+**Finding.** The title runs on Microsoft's PC `xgameruntime.dll` (System32, 10.0.26100.9656).
+That runtime has no user for this unregistered title, so login aborted at `ConsolePrivileges`.
+
+**`compat-common::gdk_user` / `gdk_store` (Fortnite-build-specific, PE timestamp checked).**
+The EXE's statically linked GDK wrappers (found by symbol table) are redirected: 28 `XUser*`
+functions to a single local offline user (gamertag/xuid/token from `tombox.cfg`, all
+privileges granted, placeholder token, no change events) and 22 `XStore*` functions to an
+empty store (no updates, no products, purchases cancelled — grants nothing). Async calls
+complete through the title's own XAsync wrappers.
+
+**Result (one run):** login passes ConsolePrivileges, CheckCrossPlayPrivilege,
+LoginWaitingRoom (served by the owner's backend) and LoginConsole, then
+`FOnlineIdentityMcp::Login Type=xbl_xtoken` POSTs to `/account` on the backend, which answers
+501 `errors.com.epicgames.authentication.grantNotImplemented`. That response is the
+backend's. Xbox Live hosts (`rta.xboxlive.com`, `userstats.xboxlive.com`) are also
+redirected to the backend.
+
+**Unverified / open:** the GDK "user not found" HRESULT; other user-taking GDK families
+(XGameSave, XGameUi) still reach the real runtime with the local handle and will fail there.
