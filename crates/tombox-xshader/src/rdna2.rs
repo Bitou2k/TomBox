@@ -431,7 +431,7 @@ fn instr_len(enc: Enc, w: u32, next: Option<u32>) -> (usize, bool) {
         Enc::Vop2 => {
             // v_madmk/v_madak/v_fmamk/v_fmaak always carry a trailing 32-bit K constant.
             let op = (w >> 25) & 0x3f;
-            (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(op, 0x20 | 0x21 | 0x2c | 0x2d))
+            (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(w & 0x1ff, 233 | 234 | 250) || matches!(op, 0x20 | 0x21 | 0x2c | 0x2d | 0x37 | 0x38))
         }
         // A trailing dword follows for an inline literal (255) or an SDWA modifier (249).
         Enc::Vop1 => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA),

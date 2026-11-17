@@ -211,7 +211,14 @@ struct Emitter<'a> {
     /// Interned candidate lists `(table, offset)` for `Sym::Multi`.
     multi_sets: Vec<Vec<(u8, u32)>>,
     /// Image ops whose texture and/or sampler is one of several descriptors.
+    /// UAV texture slots used with image atomics (declared `<uint>`).
+    uav_uint: BTreeSet<u32>,
+    /// The shader uses wave intrinsics (needs shader model 6: DXC only).
+    uses_wave: bool,
     msel: HashMap<usize, MSel>,
+    /// Buffer ops (MUBUF, s_buffer_load) whose descriptor register holds one of several
+    /// descriptors: (register key, candidates as (descriptor id, resource)).
+    bsel: HashMap<usize, (u16, Vec<(u32, Res)>)>,
     /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
     /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
     dsel_loads: HashMap<usize, (u16, u32)>,
@@ -241,6 +248,116 @@ struct Emitter<'a> {
 ///
 /// Refused (explicit error): a non-constant lane index, a read of a slot that was never
 /// written, or a spill VGPR that is also used as an ordinary vector.
+/// Synthetic opcode of the wave-reduction instruction produced by `lower_wave_reductions`.
+const OP_WAVE_REDUCE: u32 = 0x7ff0;
+
+/// Whole-wave reductions (HLSL `WaveActiveMin` / `WaveActiveMax`; observed in
+/// CocFlattenMainCS, 4f9670de0be37288). The compiled form is:
+///
+/// ```text
+///   s_nand_saveexec_b64 sX, 0        ; save exec, enable every lane
+///   v_mov_b32     vI, <identity>
+///   v_cndmask_b32 vR, vI, vIn, sX    ; inactive lanes contribute the identity
+///   v_min_f32     vR, <dpp>, vR      ; DPP row/quad permutes (src0 = 233 / 250)
+///   ...  vop3<0x378>, v_min_f32, v_readlane_b32 (lane 32), v_min_f32 ...
+///   v_readlane_b32 sRes, vR, 0       ; the result, a scalar
+///   s_mov_b64     exec_lo, sX        ; restore exec
+/// ```
+///
+/// A per-lane translation cannot express the cross-lane data movement, but the net effect
+/// is exactly a wave reduction, so the region is replaced by: `sX = exec` (exec itself is
+/// left alone), the identity move, and one synthetic instruction
+/// `sRes = WaveActive{Min,Max}(lane active ? vIn : identity)`. Needs shader model 6 (DXC).
+///
+/// Inferred, not documented: operand codes 233/250 as DPP with a trailing control dword and
+/// SOP1 0x29 as nand-saveexec are taken from the public GFX10 encoding and are consistent
+/// with this shader's instruction stream; the meaning of VOP3 0x378 is not needed.
+/// Anything in the region that does not fit this shape is refused.
+fn lower_wave_reductions(insns: &mut [Insn]) -> Result<(), String> {
+    let is_dpp = |i: &Insn| i.enc == Enc::Vop2 && matches!(i.src.first(), Some(Opnd::Raw(233 | 234 | 250)));
+    let mut at = 0;
+    while let Some(first) = (at..insns.len()).find(|&i| is_dpp(&insns[i])) {
+        let off = insns[first].offset;
+        let bad = |what: &str| format!("wave reduction at {off:#x}: {what}");
+        let red = insns[first].mnemonic.clone();
+        if !matches!(red.as_str(), "v_min_f32" | "v_max_f32") {
+            return Err(bad(&format!("unsupported reduction op {red}")));
+        }
+        let Some(Opnd::Vgpr(vr)) = insns[first].dst.first().copied() else { return Err(bad("no accumulator")) };
+        // Prologue: nand_saveexec, identity move, cndmask.
+        if first < 3 {
+            return Err(bad("no prologue"));
+        }
+        let (a, mv, cm) = (first - 3, first - 2, first - 1);
+        let saved = match (&insns[a].enc, insns[a].op, insns[a].dst.first(), insns[a].src.first()) {
+            (Enc::Sop1, 0x29, Some(Opnd::Sgpr(x)), Some(Opnd::ConstInt(0))) => *x,
+            _ => return Err(bad("prologue does not start with s_nand_saveexec_b64 sX, 0")),
+        };
+        let (ident_reg, ident) = match (insns[mv].mnemonic.as_str(), insns[mv].dst.first(), insns[mv].src.first()) {
+            ("v_mov_b32", Some(Opnd::Vgpr(v)), Some(Opnd::Literal(k))) => (*v, *k),
+            _ => return Err(bad("identity is not a literal move")),
+        };
+        let c = &insns[cm];
+        let vin = match (c.mnemonic.as_str(), c.dst.first(), c.src.first(), c.src.get(1), c.src.get(2)) {
+            ("v_cndmask_b32", Some(Opnd::Vgpr(d)), Some(Opnd::Vgpr(i)), Some(Opnd::Vgpr(x)), Some(Opnd::Sgpr(m)))
+                if *d == vr && *i == ident_reg && *m == saved =>
+            {
+                *x
+            }
+            _ => return Err(bad("unexpected select before the reduction")),
+        };
+        // Body up to the exec restore.
+        let mut end = None;
+        let mut last_read = None;
+        for i in first..insns.len() {
+            let x = &insns[i];
+            if x.mnemonic == "s_mov_b64" && x.dst.first() == Some(&Opnd::ExecLo) && x.src.first() == Some(&Opnd::Sgpr(saved)) {
+                end = Some(i);
+                break;
+            }
+            let ok = (x.enc == Enc::Vop2 && x.mnemonic == red && x.dst.first() == Some(&Opnd::Vgpr(vr)))
+                || (x.enc == Enc::Vop3 && x.op == 0x378 && x.src.first() == Some(&Opnd::Vgpr(vr)))
+                || (x.enc == Enc::Vop3 && x.op == 0x360 && x.src.first() == Some(&Opnd::Vgpr(vr)));
+            if !ok {
+                return Err(bad(&format!("unexpected {} at {:#x} inside the reduction", x.mnemonic, x.offset)));
+            }
+            if x.enc == Enc::Vop3 && x.op == 0x360 {
+                last_read = Some(i);
+            }
+        }
+        let (Some(end), Some(last)) = (end, last_read) else { return Err(bad("no exec restore / result read")) };
+        if insns[last].src.get(1) != Some(&Opnd::ConstInt(0)) {
+            return Err(bad("result is not read from lane 0"));
+        }
+        let res = match insns[last].dst.first() {
+            Some(Opnd::Vgpr(n)) | Some(Opnd::Sgpr(n)) => *n,
+            _ => return Err(bad("bad result register")),
+        };
+        // Rewrite.
+        insns[a].mnemonic = "s_mov_b64".into();
+        insns[a].op = 4;
+        insns[a].src = vec![Opnd::ExecLo];
+        for i in cm..end {
+            let x = &mut insns[i];
+            x.enc = Enc::Vop1;
+            x.op = 0;
+            x.mnemonic = "v_nop".into();
+            x.dst = vec![Opnd::Vgpr(vr)];
+            x.src = vec![];
+            x.aux = Default::default();
+        }
+        let x = &mut insns[last];
+        x.enc = Enc::Vop3;
+        x.op = OP_WAVE_REDUCE;
+        x.mnemonic = if red == "v_min_f32" { "tb_wave_min_f32".into() } else { "tb_wave_max_f32".into() };
+        x.dst = vec![Opnd::Sgpr(res)];
+        x.src = vec![Opnd::Vgpr(vin), Opnd::Sgpr(saved)];
+        x.aux.imm = ident as i64;
+        at = end + 1;
+    }
+    Ok(())
+}
+
 /// Translator temporaries from this index up are lane-spill slots (declared up front).
 const LANE_TEMP_BASE: u16 = 10_000;
 
@@ -322,6 +439,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
+    lower_wave_reductions(&mut insns)?;
     lower_lane_spills(&mut insns)?;
     let mut em = Emitter {
         loop_depth: 0,
@@ -342,7 +460,10 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         uses_code: false,
         vreg_array: false,
         multi_sets: Vec::new(),
+        uav_uint: BTreeSet::new(),
+        uses_wave: false,
         msel: HashMap::new(),
+        bsel: HashMap::new(),
         dsel_loads: HashMap::new(),
         dsel_moves: HashMap::new(),
         live: Vec::new(),
@@ -400,7 +521,8 @@ impl<'a> Emitter<'a> {
             Some(Opnd::Sgpr(n)) => Some(*n as usize + 7),
             _ => None,
         });
-        let base = if self.is_cs { 4 } else { chained.unwrap_or(8) };
+        // Geometry shaders: SRV table in s22, CBV table in s23 (6a6bdf123db8b5b0).
+        let base = if self.is_cs { 4 } else if self.ex.stage == Stage::Geometry { 22 } else { chained.unwrap_or(8) };
         let idx = (sgpr as usize).checked_sub(base)?;
         match &self.ex.root_sig.as_ref()?.params.get(idx)?.kind {
             crate::meta::RootParamKind::Table(r) if r.len() == 1 && r[0].base_register == 0 => Some(r[0].range_type),
@@ -514,9 +636,24 @@ impl<'a> Emitter<'a> {
                                         osym.remove(&k);
                                     }
                                 },
+                                // Known on one path only. A descriptor stays (see below);
+                                // anything else is dropped.
+                                None if matches!(a, Sym::Desc { .. } | Sym::Multi { .. } | Sym::Table(_)) => {}
                                 None => {
                                     osym.remove(&k);
                                 }
+                            }
+                        }
+                        // Optimistic join for descriptors: a register that holds a descriptor
+                        // on one incoming path and nothing known on the other is treated as
+                        // holding the descriptor. Compiled code loads descriptors inside
+                        // blocks that are skipped only when no lane is active
+                        // (`s_cbranch_execz`), then uses them after the join; on the skipped
+                        // path the result is unused. A later use as a descriptor would be
+                        // invalid anyway if the register held something else.
+                        for (k, v) in sym.iter() {
+                            if matches!(v, Sym::Desc { .. } | Sym::Multi { .. } | Sym::Table(_)) && !osym.contains_key(k) {
+                                osym.insert(*k, *v);
                             }
                         }
                         owr.extend(written.iter().copied());
@@ -539,6 +676,7 @@ impl<'a> Emitter<'a> {
             eprintln!("first analysis error: {first_err:?}");
         }
         self.msel.clear();
+        self.bsel.clear();
         self.dsel_loads.clear();
         self.dsel_moves.clear();
         // Recording pass with the converged entry states.
@@ -548,6 +686,48 @@ impl<'a> Emitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Resource a MUBUF instruction addresses when its descriptor is `slot` of `table`
+    /// (also records declaration requirements).
+    fn mubuf_res(&mut self, ins: &Insn, slot: u32, table: u8) -> Result<Res, String> {
+        let is_uav = match self.table_kind(table) {
+            Some(0) => false,
+            Some(1) => true,
+            Some(2) => {
+                // Per-lane indexed read of a constant buffer (e.g. cbuffer arrays indexed by
+                // a varying value): size the declaration to the maximum.
+                self.cb_size.insert(slot, 4096 * 4);
+                return Ok(Res::CbDyn(slot));
+            }
+            other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
+        };
+        if ins.mnemonic.contains("_atomic_") {
+            if !is_uav {
+                return Err(format!("mubuf at {:#x}: atomic on a non-UAV buffer", ins.offset));
+            }
+            // PSV0 tells typed (6) from structured (8) UAVs. Atomics need a uint element, so
+            // a typed UAV used atomically is declared RWBuffer<uint>.
+            let structured = self.ex.resources.iter().any(|p| p.res_type == 8 && p.lower <= slot && slot <= p.upper);
+            if structured {
+                let e = self.sbuf.entry((true, slot)).or_insert(0);
+                *e = (*e).max(ins.aux.imm as u32 / 4 + 1);
+                return Ok(Res::Buf(slot, true));
+            }
+            self.tbuf.insert((true, slot));
+            self.tbuf_uint.insert(slot);
+            return Ok(Res::TBuf(slot, true));
+        }
+        if ins.mnemonic.contains("_format_") {
+            // Typed buffer (Buffer<T> / RWBuffer<T>), addressed by element index.
+            self.tbuf.insert((is_uav, slot));
+            return Ok(Res::TBuf(slot, is_uav));
+        }
+        let ndw = Self::mubuf_dwords(&ins.mnemonic).ok_or_else(|| format!("mubuf op {} unsupported", ins.mnemonic))?;
+        let end = ins.aux.imm as u32 / 4 + ndw;
+        let e = self.sbuf.entry((is_uav, slot)).or_insert(0);
+        *e = (*e).max(end);
+        Ok(Res::Buf(slot, is_uav))
     }
 
     /// Candidate descriptors `(table, offset)` of a symbol that is dword 0 of a descriptor.
@@ -674,6 +854,29 @@ impl<'a> Emitter<'a> {
                 // s_setreg_* program a hardware mode register; the encoding's register
                 // field is not an SGPR destination.
                 Enc::Sopk if ins.mnemonic.starts_with("s_setreg") => {}
+                // A code pointer taken through a VGPR: `v = index*4 + sCode` followed by
+                // `v_readfirstlane sBase, v` and `s_load [sBase]` is a constant-table lookup
+                // with a run-time index (ColorDeficiencyMain, cc45bda725a0f774). VGPRs are
+                // tracked under keys 2000+ for exactly this.
+                Enc::Vop2 | Enc::Vop3
+                    if matches!(ins.mnemonic.as_str(), "v_add_co_u32" | "v_add_nc_u32")
+                        && ins.src.iter().any(|o| sg(o).map(|s| sym.get(&s) == Some(&Sym::Code)).unwrap_or(false)) =>
+                {
+                    if let Some(Opnd::Vgpr(v)) = ins.dst.first() {
+                        sym.insert(2000 + *v as u16, Sym::Code);
+                    }
+                }
+                Enc::Vop1 if ins.mnemonic == "v_readfirstlane_b32" => {
+                    let code = matches!(ins.src.first(), Some(Opnd::Vgpr(v)) if sym.get(&(2000 + *v as u16)) == Some(&Sym::Code));
+                    if let Some(d) = ins.dst.first().and_then(sg) {
+                        if code {
+                            sym.insert(d, Sym::Code);
+                        } else {
+                            sym.remove(&d);
+                        }
+                        written.insert(d);
+                    }
+                }
                 Enc::Sop1 if ins.mnemonic == "s_getpc_b64" => {
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         sym.insert(d, Sym::Code);
@@ -735,24 +938,26 @@ impl<'a> Emitter<'a> {
                     let n = 1u32 << (ins.op - 8);
                     let b = ins.src.first().and_then(sg).ok_or("s_buffer_load: bad base")?;
                     let d = ins.dst.first().and_then(sreg_num).map(u16::from).ok_or("s_buffer_load: bad dst")?;
-                    let slot = match sym.get(&b) {
-                        // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table
-                        // offset 0x20 in MainOnePassPointLightPS).
-                        Some(Sym::Desc { off, k: 0, .. }) => off / 32,
-                        other => {
-                            return Err(format!(
-                                "s_buffer_load at {:#x}: base s{b} is not a buffer descriptor ({other:?})",
-                                ins.offset
-                            ))
-                        }
-                    };
+                    // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table offset
+                    // 0x20 in MainOnePassPointLightPS).
+                    let cands = self.desc_candidates(sym.get(&b)).ok_or_else(|| {
+                        format!("s_buffer_load at {:#x}: base s{b} is not a buffer descriptor ({:?})", ins.offset, sym.get(&b))
+                    })?;
                     // A dynamic SOFFSET register indexes the buffer at run time: size the
                     // cbuffer declaration to the D3D12 maximum (64 KiB = 4096 vec4).
                     let dynamic = (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d;
                     let end = if dynamic { 4096 * 4 } else { ins.aux.imm as u32 / 4 + n };
-                    let e = self.cb_size.entry(slot).or_insert(0);
-                    *e = (*e).max(end);
-                    self.res.insert(idx, vec![Res::Cb(slot)]);
+                    let mut out: Vec<(u32, Res)> = Vec::new();
+                    for (table, off) in &cands {
+                        let slot = off / 32;
+                        let e = self.cb_size.entry(slot).or_insert(0);
+                        *e = (*e).max(end);
+                        out.push((((*table as u32) << 24) | off, Res::Cb(slot)));
+                    }
+                    self.res.insert(idx, vec![out[0].1]);
+                    if out.len() > 1 {
+                        self.bsel.insert(idx, (b, out));
+                    }
                     for k in 0..n {
                         sym.remove(&(d + k as u16));
                         written.insert(d + k as u16);
@@ -763,58 +968,17 @@ impl<'a> Emitter<'a> {
                 Enc::Mubuf if ins.op == 0x71 || ins.op == 0x72 => {}
                 Enc::Mubuf => {
                     let rs = ins.src.get(1).and_then(sg).ok_or("mubuf: bad srsrc")?;
-                    let (slot, table) = match sym.get(&rs) {
-                        Some(Sym::Desc { off, k: 0, table }) => (off / 32, *table),
-                        other => {
-                            return Err(format!("mubuf at {:#x}: s{rs} not a buffer descriptor ({other:?})", ins.offset))
-                        }
-                    };
-                    let is_uav = match self.table_kind(table) {
-                        Some(0) => false,
-                        Some(1) => true,
-                        Some(2) => {
-                            // Per-lane indexed read of a constant buffer (e.g. cbuffer arrays
-                            // indexed by a varying value): size the declaration to the maximum.
-                            self.cb_size.insert(slot, 4096 * 4);
-                            self.res.insert(idx, vec![Res::CbDyn(slot)]);
-                            continue;
-                        }
-                        other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
-                    };
-                    if ins.mnemonic.contains("_atomic_") {
-                        if !is_uav {
-                            return Err(format!("mubuf at {:#x}: atomic on a non-UAV buffer", ins.offset));
-                        }
-                        // PSV0 tells typed (6) from structured (8) UAVs. Atomics need a uint
-                        // element, so a typed UAV used atomically is declared RWBuffer<uint>.
-                        let structured = self
-                            .ex
-                            .resources
-                            .iter()
-                            .any(|p| p.res_type == 8 && p.lower <= slot && slot <= p.upper);
-                        if structured {
-                            let e = self.sbuf.entry((true, slot)).or_insert(0);
-                            *e = (*e).max(ins.aux.imm as u32 / 4 + 1);
-                            self.res.insert(idx, vec![Res::Buf(slot, true)]);
-                        } else {
-                            self.tbuf.insert((true, slot));
-                            self.tbuf_uint.insert(slot);
-                            self.res.insert(idx, vec![Res::TBuf(slot, true)]);
-                        }
-                        continue;
+                    let cands = self.desc_candidates(sym.get(&rs)).ok_or_else(|| {
+                        format!("mubuf at {:#x}: s{rs} not a buffer descriptor ({:?})", ins.offset, sym.get(&rs))
+                    })?;
+                    let mut out: Vec<(u32, Res)> = Vec::new();
+                    for (table, off) in &cands {
+                        out.push((((*table as u32) << 24) | off, self.mubuf_res(ins, off / 32, *table)?));
                     }
-                    if ins.mnemonic.contains("_format_") {
-                        // Typed buffer (Buffer<T> / RWBuffer<T>), addressed by element index.
-                        self.tbuf.insert((is_uav, slot));
-                        self.res.insert(idx, vec![Res::TBuf(slot, is_uav)]);
-                        continue;
+                    self.res.insert(idx, vec![out[0].1]);
+                    if out.len() > 1 {
+                        self.bsel.insert(idx, (rs, out));
                     }
-                    let ndw = Self::mubuf_dwords(&ins.mnemonic)
-                        .ok_or_else(|| format!("mubuf op {} unsupported", ins.mnemonic))?;
-                    let end = ins.aux.imm as u32 / 4 + ndw;
-                    let e = self.sbuf.entry((is_uav, slot)).or_insert(0);
-                    *e = (*e).max(end);
-                    self.res.insert(idx, vec![Res::Buf(slot, is_uav)]);
                 }
                 Enc::Mimg => {
                     let n = ins.src.len();
@@ -828,6 +992,9 @@ impl<'a> Emitter<'a> {
                     for (ttable, off) in &tex_c {
                         let tslot = off / 32;
                         let is_uav = self.table_kind(*ttable) == Some(1);
+                        if is_uav && ins.mnemonic.starts_with("image_atomic_") {
+                            self.uav_uint.insert(tslot);
+                        }
                         let map = if is_uav { &mut self.uav } else { &mut self.tex };
                         if let Some(prev) = map.insert(tslot, dim) {
                             if prev != dim {
@@ -864,6 +1031,9 @@ impl<'a> Emitter<'a> {
 
                 _ => {
                     for d in &ins.dst {
+                        if let Opnd::Vgpr(v) = d {
+                            sym.remove(&(2000 + *v as u16));
+                        }
                         if let Some(n) = sg(d) {
                             sym.remove(&n);
                             written.insert(n);
@@ -1262,7 +1432,21 @@ impl<'a> Emitter<'a> {
         let d = ins.dst.first().cloned();
         self.line(&format!("// {:#06x} {m}", ins.offset));
         // Run-time descriptor selectors (only for shaders with a "one of N" image op).
-        if !self.msel.is_empty() {
+        if let Some((reg, cands)) = self.bsel.remove(&idx) {
+            // One guarded copy of the op per candidate buffer.
+            self.regs.insert(format!("tb_dsel{reg}"));
+            let mut first = true;
+            for (id, res) in &cands {
+                self.line(&format!("{}if (tb_dsel{reg} == {id:#x}u) {{", if first { "" } else { "else " }));
+                first = false;
+                self.res.insert(idx, vec![*res]);
+                self.emit_insn(idx, ins, is_ps, br)?;
+                self.line("}");
+            }
+            self.bsel.insert(idx, (reg, cands));
+            return Ok(());
+        }
+        if !self.msel.is_empty() || !self.bsel.is_empty() {
             if let Some(&(d, id)) = self.dsel_loads.get(&idx) {
                 self.regs.insert(format!("tb_dsel{d}"));
                 self.line(&format!("tb_dsel{d} = {id:#x}u;"));
@@ -1527,6 +1711,12 @@ impl<'a> Emitter<'a> {
                         self.line(&format!("exec_lo = t{t}; scc = t{t};"));
                         Ok(())
                     }
+                    // Return from a vertex shader chained in front of a geometry shader: the
+                    // program ends here (it is followed directly by s_endpgm).
+                    "s_setpc_b64" if idx + 2 >= self.insns.len() => {
+                        self.line("// (return to the chained stage)");
+                        Ok(())
+                    }
                     _ => Err("unsupported SOP1".into()),
                 }
             }
@@ -1704,12 +1894,15 @@ impl<'a> Emitter<'a> {
                 let osig = self.ex.output_sig.clone();
                 for (byte, src) in writes {
                     let dw = (byte / 4) as usize;
-                    let reg = *self.out_params.get(dw / 4).ok_or_else(|| format!("LDS output dword {dw} is beyond the output signature"))?;
+                    // The record is indexed by output *register* (4 dwords each), system
+                    // values included: in 008bccdcf9dcecf9 register 1 is SV_Position and is
+                    // written at dwords 4..7.
+                    let reg = (dw / 4) as u32;
                     let comp = dw % 4;
                     self.touch(&src);
                     let mut hit = false;
                     for (ei, e) in osig.iter().enumerate() {
-                        if e.sysval == 0 && e.register == reg && (e.mask >> comp) & 1 != 0 {
+                        if e.register == reg && (e.mask >> comp) & 1 != 0 {
                             let idx = (0..comp).filter(|c| (e.mask >> c) & 1 != 0).count();
                             let (ty, n) = sig_type(e);
                             let field = if n == 1 { format!("o.o{ei}") } else { format!("o.o{ei}.{}", XYZW[idx]) };
@@ -1775,6 +1968,28 @@ impl<'a> Emitter<'a> {
                         Ok(())
                     }
                 }
+            }
+            Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8") => {
+                // Sub-word accesses to group-shared memory: tb_lds is addressed in dwords, so
+                // read-modify-write the containing dword.
+                self.uses_lds = true;
+                let off = ins.aux.imm as u32 & 0xffff;
+                let bits = if m.ends_with("16") { 16u32 } else { 8 };
+                let mask = (1u32 << bits) - 1;
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint t{t}a = ({}) + {off:#x}u; uint t{t}s = (t{t}a & 3u) * 8u;", r(&s[0])?));
+                let word = format!("tb_lds[(t{t}a >> 2) & 8191u]");
+                if m.starts_with("ds_write") {
+                    self.line(&format!(
+                        "if (exec_lo & 1u) {word} = ({word} & ~({mask:#x}u << t{t}s)) | ((({}) & {mask:#x}u) << t{t}s);",
+                        r(&s[1])?
+                    ));
+                    return Ok(());
+                }
+                let v = format!("(({word} >> t{t}s) & {mask:#x}u)");
+                let e = if m.contains("_i") { format!("asuint(asint({v} << {}) >> {})", 32 - bits, 32 - bits) } else { v };
+                return self.wv(&d.ok_or("no dst")?, &e);
             }
             Enc::Ds
                 if self.is_cs
@@ -1863,13 +2078,54 @@ impl<'a> Emitter<'a> {
         if m == "v_nop" {
             return Ok(());
         }
+        if ins.op == OP_WAVE_REDUCE && ins.enc == Enc::Vop3 {
+            // See `lower_wave_reductions`. Every invocation computes the same value; lanes
+            // that were inactive contribute the identity.
+            self.uses_wave = true;
+            let f = if m == "tb_wave_min_f32" { "WaveActiveMin" } else { "WaveActiveMax" };
+            let e = format!(
+                "asuint({f}((({} & 1u) != 0u) ? asfloat({}) : asfloat({:#x}u)))",
+                r(&s[1])?,
+                r(&s[0])?,
+                ins.aux.imm as u32
+            );
+            return self.ws(&d, &e);
+        }
         // ---- half-float arithmetic: operands are f16 in the low 16 bits (inline float
         // constants denote the half-float of that value); the result is written as f16.
+        // VOP3 forms carry per-source abs/neg modifiers and a result clamp/output modifier,
+        // exactly as for f32 (see `fm` / `fres`).
         let h16 = |o: &Opnd| -> Result<String, String> {
-            Ok(match o {
+            let mut e = match o {
                 Opnd::ConstF32(_) => f(o)?,
                 _ => format!("f16tof32(({}) & 0xffffu)", r(o)?),
-            })
+            };
+            if ins.enc == Enc::Vop3 {
+                if let Some(i) = s.iter().position(|x| std::ptr::eq(x, o)) {
+                    if (ins.aux.mask >> i) & 1 != 0 {
+                        e = format!("abs({e})");
+                    }
+                    if (ins.aux.mask >> (3 + i)) & 1 != 0 {
+                        e = format!("(-{e})");
+                    }
+                }
+            }
+            Ok(e)
+        };
+        let hres = |e: String| -> String {
+            let mut e = e;
+            if ins.enc == Enc::Vop3 {
+                e = match ins.aux.imm2 {
+                    1 => format!("(({e}) * 2.0)"),
+                    2 => format!("(({e}) * 4.0)"),
+                    3 => format!("(({e}) * 0.5)"),
+                    _ => e,
+                };
+                if ins.aux.imm != 0 {
+                    e = format!("saturate({e})");
+                }
+            }
+            format!("f32tof16({e})")
         };
         if matches!(m.as_str(), "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_max_f16" | "v_min_f16") {
             let (a, b) = (h16(&s[0])?, h16(&s[1])?);
@@ -1881,7 +2137,7 @@ impl<'a> Emitter<'a> {
                 "v_max_f16" => format!("max({a}, {b})"),
                 _ => format!("min({a}, {b})"),
             };
-            return self.wv(&d, &format!("f32tof16({e})"));
+            return self.wv(&d, &hres(e));
         }
         if matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
             let a = h16(&s[0])?;
@@ -1895,7 +2151,7 @@ impl<'a> Emitter<'a> {
                 "v_rndne_f16" => format!("round({a})"),
                 _ => format!("frac({a})"),
             };
-            return self.wv(&d, &format!("f32tof16({e})"));
+            return self.wv(&d, &hres(e));
         }
         if m == "v_cvt_f16_u16" {
             return self.wv(&d, &format!("f32tof16((float)(({}) & 0xffffu))", r(&s[0])?));
@@ -1909,14 +2165,21 @@ impl<'a> Emitter<'a> {
         if m == "v_cvt_i16_f16" {
             return self.wv(&d, &format!("(asuint((int)clamp({}, -32768.0, 32767.0)) & 0xffffu)", h16(&s[0])?));
         }
+        if matches!(m.as_str(), "v_madak_f16" | "v_madmk_f16") {
+            // The trailing literal dword carries the half-float constant K in its low bits.
+            let k = format!("f16tof32({:#x}u)", ins.raw.last().copied().unwrap_or(0) & 0xffff);
+            let (a, b) = (h16(&s[0])?, h16(&s[1])?);
+            let e = if m == "v_madak_f16" { format!("{a} * {b} + {k}") } else { format!("{a} * {k} + {b}") };
+            return self.wv(&d, &hres(e));
+        }
         if m == "v_mac_f16" {
             self.touch(&d);
             let e = format!("{} * {} + {}", h16(&s[0])?, h16(&s[1])?, h16(&d)?);
-            return self.wv(&d, &format!("f32tof16({e})"));
+            return self.wv(&d, &hres(e));
         }
         if m == "v_fma_f16" {
             let e = format!("{} * {} + {}", h16(&s[0])?, h16(&s[1])?, h16(&s[2])?);
-            return self.wv(&d, &format!("f32tof16({e})"));
+            return self.wv(&d, &hres(e));
         }
         if matches!(m.as_str(), "v_pk_fma_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_min_f16" | "v_pk_max_f16") {
             // Packed half-float ops (VOP3P): two f16 lanes per register. For the low result,
@@ -1958,7 +2221,7 @@ impl<'a> Emitter<'a> {
                 "v_max3_f16" => format!("max(max({a}, {b}), {c})"),
                 _ => format!("max(min({a}, {b}), min(max({a}, {b}), {c}))"),
             };
-            return self.wv(&d, &format!("f32tof16({e})"));
+            return self.wv(&d, &hres(e));
         }
         if m == "v_bcnt_u32_b32" {
             return self.wv(&d, &format!("(countbits({}) + {})", r(&s[0])?, r(&s[1])?));
@@ -2370,15 +2633,22 @@ impl<'a> Emitter<'a> {
             // Buffer atomics → HLSL Interlocked* on the UAV element. With GLC set the
             // pre-operation value is returned in vdata.
             let (offen, idxen, glc) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0, ins.aux.mask & 4 != 0);
-            if offen || !matches!(ins.src[2], Opnd::ConstInt(0)) {
+            if (offen && idxen) || !matches!(ins.src[2], Opnd::ConstInt(0)) {
                 return Err("atomic MUBUF addressing unsupported".into());
             }
             // Without IDXEN the address is just the immediate offset: element 0 (the usual
-            // wave-level counter allocation `InterlockedAdd(buf[0], n)`).
+            // wave-level counter allocation `InterlockedAdd(buf[0], n)`). With OFFEN alone the
+            // address register is a byte offset.
             let index = if idxen { r(&ins.src[0])? } else { "0u".to_string() };
-            let target = match self.res.get(&idx).and_then(|v| v.first()).copied() {
-                Some(Res::TBuf(slot, true)) if ins.aux.imm == 0 => format!("utb{slot}[{index}]"),
-                Some(Res::Buf(slot, true)) => format!("ubuf{slot}[{index}].w[{}]", ins.aux.imm as u32 / 4),
+            let target = match (self.res.get(&idx).and_then(|v| v.first()).copied(), offen) {
+                (Some(Res::TBuf(slot, true)), false) if ins.aux.imm == 0 => format!("utb{slot}[{index}]"),
+                (Some(Res::TBuf(slot, true)), true) => format!("utb{slot}[(({}) + {:#x}u) >> 2]", r(&ins.src[0])?, ins.aux.imm as u32),
+                (Some(Res::Buf(slot, true)), false) => format!("ubuf{slot}[{index}].w[{}]", ins.aux.imm as u32 / 4),
+                (Some(Res::Buf(slot, true)), true) => {
+                    let nwords = self.sbuf.get(&(true, slot)).copied().unwrap_or(1).max(1);
+                    let w = format!("((({}) + {:#x}u) >> 2)", r(&ins.src[0])?, ins.aux.imm as u32);
+                    format!("ubuf{slot}[{w} / {nwords}u].w[{w} % {nwords}u]")
+                }
                 _ => return Err("unresolved atomic target".into()),
             };
             let vdata = ins.dst[0];
@@ -2418,10 +2688,11 @@ impl<'a> Emitter<'a> {
                     Some("xyzw") => 4,
                     _ => 0,
                 };
-                if offen || !idxen || ins.aux.imm != 0 || comps == 0 {
+                if offen || ins.aux.imm != 0 || comps == 0 {
                     return Err("uint typed-buffer MUBUF form unsupported".into());
                 }
-                let index = r(&ins.src[0])?;
+                // Without IDXEN the access addresses element 0.
+                let index = if idxen { r(&ins.src[0])? } else { "0u".to_string() };
                 let vd = ins.dst[0];
                 if ins.mnemonic.starts_with("buffer_store") {
                     self.touch(&vd);
@@ -2490,21 +2761,46 @@ impl<'a> Emitter<'a> {
             Some(Res::Buf(s, u)) => (*s, *u),
             _ => return Err("unresolved buffer".into()),
         };
+        // Address = element index (IDXEN: first address register) * stride + byte offset
+        // (OFFEN: the next address register, or the first when there is no index) + imm.
         let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-        if offen || !idxen {
-            return Err(format!("MUBUF addressing offen={offen} idxen={idxen} unsupported"));
-        }
         if !matches!(ins.src[2], Opnd::ConstInt(0)) {
             return Err("MUBUF with a dynamic SOFFSET is unsupported".into());
         }
         let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
-        let index = r(&ins.src[0])?;
+        let a0 = ins.src[0];
+        let a1 = match a0 {
+            Opnd::Vgpr(v) => Opnd::Vgpr(v + 1),
+            other => other,
+        };
+        let index = if idxen { r(&a0)? } else { "0u".to_string() };
+        let voff = match (idxen, offen) {
+            (_, false) => None,
+            (false, true) => Some(r(&a0)?),
+            (true, true) => {
+                self.touch(&a1);
+                Some(r(&a1)?)
+            }
+        };
         let w0 = ins.aux.imm as u32 / 4;
         let vd = match ins.dst[0] {
             Opnd::Vgpr(v) => v,
             _ => return Err("bad vdata".into()),
         };
         let nm = if is_uav { format!("ubuf{slot}") } else { format!("sbuf{slot}") };
+        // Element `k` of this access. With a run-time byte offset the buffer is addressed
+        // flat over the declared element size (which assumes, like every structured-buffer
+        // access here, that the declared element matches the view's stride).
+        let nwords = self.sbuf.get(&(is_uav, slot)).copied().unwrap_or(1).max(1);
+        let t = self.tmp;
+        self.tmp += 1;
+        if let Some(vo) = &voff {
+            self.line(&format!("uint t{t}w = (({vo}) + {:#x}u) >> 2;", ins.aux.imm as u32));
+        }
+        let elem = |k: u32| match &voff {
+            None => format!("{nm}[{index}].w[{}]", w0 + k),
+            Some(_) => format!("{nm}[{index} + (t{t}w + {k}u) / {nwords}u].w[(t{t}w + {k}u) % {nwords}u]"),
+        };
         if ins.mnemonic.starts_with("buffer_store") {
             if !is_uav {
                 return Err("buffer_store to a non-UAV table".into());
@@ -2512,13 +2808,11 @@ impl<'a> Emitter<'a> {
             for k in 0..n {
                 let o = Opnd::Vgpr(vd + k as u8);
                 self.touch(&o);
-                self.line(&format!("if (exec_lo & 1u) {nm}[{index}].w[{}] = {};", w0 + k, r(&o)?));
+                self.line(&format!("if (exec_lo & 1u) {} = {};", elem(k), r(&o)?));
             }
         } else {
-            let t = self.tmp;
-            self.tmp += 1;
             for k in 0..n {
-                self.line(&format!("uint t{t}_{k} = {nm}[{index}].w[{}];", w0 + k));
+                self.line(&format!("uint t{t}_{k} = {};", elem(k)));
             }
             for k in 0..n {
                 self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}_{k}"))?;
@@ -2654,7 +2948,7 @@ impl<'a> Emitter<'a> {
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         let rs = self.res.get(&idx).cloned().ok_or("unresolved image")?;
         // Texel-addressed ops (no sampler): image_load / image_store, on SRVs or UAVs.
-        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store") {
+        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_atomic_add" | "image_atomic_umax") {
             let with_mip = ins.mnemonic == "image_load_mip";
             let (slot, dim, is_uav) = match rs.first() {
                 Some(Res::Tex(t, d)) => (*t, *d, false),
@@ -2684,6 +2978,41 @@ impl<'a> Emitter<'a> {
                 Opnd::Vgpr(n) => n,
                 _ => return Err("bad vdata".into()),
             };
+            let as_uint = is_uav && self.uav_uint.contains(&slot);
+            if ins.mnemonic.starts_with("image_atomic_") {
+                // Image atomics → Interlocked* on a RWTexture<uint> texel; vdata carries the
+                // operand in and the previous value out.
+                if !as_uint {
+                    return Err("image atomic on a non-UAV table".into());
+                }
+                let func = if ins.mnemonic == "image_atomic_add" { "InterlockedAdd" } else { "InterlockedMax" };
+                let o = Opnd::Vgpr(vd);
+                self.touch(&o);
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint t{t} = 0u;"));
+                self.line(&format!("if (exec_lo & 1u) {func}(uav{slot}[uint{ncoord}({})], {}, t{t});", c.join(", "), r(&o)?));
+                return self.wv(&o, &format!("t{t}"));
+            }
+            if ins.mnemonic == "image_store" && as_uint {
+                let o = Opnd::Vgpr(vd);
+                self.touch(&o);
+                self.line(&format!("if (exec_lo & 1u) uav{slot}[uint{ncoord}({})] = {};", c.join(", "), r(&o)?));
+                return Ok(());
+            }
+            if ins.mnemonic == "image_load" && as_uint {
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint4 t{t} = uint4(uav{slot}[uint{ncoord}({})], 0u, 0u, 0u);", c.join(", ")));
+                let mut n = 0u8;
+                for ch in 0..4 {
+                    if (ins.aux.mask >> ch) & 1 != 0 {
+                        self.wv(&Opnd::Vgpr(vd + n), &format!("t{t}.{}", XYZW[ch]))?;
+                        n += 1;
+                    }
+                }
+                return Ok(());
+            }
             if ins.mnemonic == "image_store" {
                 if !is_uav {
                     return Err("image_store to a non-UAV table".into());
@@ -3122,10 +3451,14 @@ impl<'a> Emitter<'a> {
             };
         }
         for (slot, dim) in &self.uav {
-            let ty = match dim {
-                1 => "RWTexture2D<float4>",
-                2 => "RWTexture3D<float4>",
-                5 => "RWTexture2DArray<float4>",
+            // Textures used with image atomics hold one uint per texel.
+            let ty = match (dim, self.uav_uint.contains(slot)) {
+                (1, false) => "RWTexture2D<float4>",
+                (2, false) => "RWTexture3D<float4>",
+                (5, false) => "RWTexture2DArray<float4>",
+                (1, true) => "RWTexture2D<uint>",
+                (2, true) => "RWTexture3D<uint>",
+                (5, true) => "RWTexture2DArray<uint>",
                 _ => return Err(format!("UAV dim {dim} unsupported")),
             };
             let _ = writeln!(h, "{ty} uav{slot} : register(u{slot});");

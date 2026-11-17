@@ -17,7 +17,7 @@ pub fn vop2(op: u32) -> Option<&'static str> {
         0x2b => "v_fmac_f32", 0x2c => "v_fmamk_f32", 0x2d => "v_fmaak_f32",
         0x2f => "v_pack_b32_f16",
         0x32 => "v_add_f16", 0x33 => "v_sub_f16", 0x34 => "v_subrev_f16", 0x35 => "v_mul_f16",
-        0x36 => "v_mac_f16", 0x39 => "v_max_f16", 0x3a => "v_min_f16",
+        0x36 => "v_mac_f16", 0x37 => "v_madmk_f16", 0x38 => "v_madak_f16", 0x39 => "v_max_f16", 0x3a => "v_min_f16",
         _ => return None,
     })
 }
@@ -81,7 +81,7 @@ pub fn vop3(op: u32) -> Option<&'static str> {
     if (0x100..0x140).contains(&op) {
         return vop2(op - 0x100);
     }
-    if (0x180..0x1c0).contains(&op) {
+    if (0x180..0x200).contains(&op) {
         return vop1(op - 0x180);
     }
     Some(match op {
@@ -136,7 +136,7 @@ pub fn sop1(op: u32) -> Option<&'static str> {
         0x1b => "s_bitset0_b32", 0x1d => "s_bitset1_b32",
         0x1f => "s_getpc_b64", 0x20 => "s_setpc_b64", 0x21 => "s_swappc_b64",
         0x24 => "s_and_saveexec_b64", 0x25 => "s_or_saveexec_b64", 0x26 => "s_xor_saveexec_b64",
-        0x27 => "s_andn2_saveexec_b64", 0x28 => "s_orn2_saveexec_b64",
+        0x27 => "s_andn2_saveexec_b64", 0x28 => "s_orn2_saveexec_b64", 0x29 => "s_nand_saveexec_b64",
         0x34 => "s_abs_i32", 0x37 => "s_andn1_saveexec_b64", 0x3c => "s_and_saveexec_b32",
         0x3d => "s_or_saveexec_b32", 0x3e => "s_xor_saveexec_b32", 0x3f => "s_andn2_saveexec_b32",
         _ => return None,
@@ -190,6 +190,9 @@ pub fn smem(op: u32) -> Option<&'static str> {
 
 pub fn mimg(op: u32) -> Option<&'static str> {
     Some(match op {
+        // 0x11 / 0x17: image atomics, named from the public GFX10 opcode table; consistent with
+        // their use in 0de8a1db88825b8e (counter add, packed-value max). Other atomics unmapped.
+        0x11 => "image_atomic_add", 0x17 => "image_atomic_umax",
         0x00 => "image_load", 0x01 => "image_load_mip", 0x08 => "image_store", 0x09 => "image_store_mip",
         0x0e => "image_get_resinfo", 0x20 => "image_sample", 0x21 => "image_sample_cl",
         0x22 => "image_sample_d", 0x23 => "image_sample_d_cl", 0x24 => "image_sample_l",
@@ -259,6 +262,8 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
             0x38 => Some("ds_read2st64_b32"),
             0x0f => Some("ds_write2st64_b32"),
             0x4d => Some("ds_write_b64"), 0x4e => Some("ds_write2_b64"),
+            0x1e => Some("ds_write_b8"), 0x1f => Some("ds_write_b16"),
+            0x39 => Some("ds_read_i8"), 0x3a => Some("ds_read_u8"), 0x3b => Some("ds_read_i16"), 0x3c => Some("ds_read_u16"),
             _ => None,
         },
         Enc::Vinterp => Some(match op {
