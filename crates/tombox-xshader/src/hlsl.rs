@@ -44,8 +44,8 @@ enum Sym {
 /// selector `tb_dsel<reg>` holds.
 #[derive(Clone, Debug)]
 struct MSel {
-    tex_reg: u8,
-    samp_reg: u8,
+    tex_reg: u16,
+    samp_reg: u16,
     tex: Vec<(u32, Res)>,
     samp: Vec<(u32, Res)>,
 }
@@ -210,8 +210,8 @@ struct Emitter<'a> {
     msel: HashMap<usize, MSel>,
     /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
     /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
-    dsel_loads: HashMap<usize, (u8, u32)>,
-    dsel_moves: HashMap<usize, (u8, u8)>,
+    dsel_loads: HashMap<usize, (u16, u32)>,
+    dsel_moves: HashMap<usize, (u16, u16)>,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
     /// Pixel shader needs its position within the 2x2 quad (ds_swizzle).
@@ -231,14 +231,9 @@ struct Emitter<'a> {
 /// texture/sampler descriptor dwords) in individual lanes of an otherwise unused VGPR with
 /// `v_writelane_b32 vN, sX, <lane>` and brings them back with `v_readlane_b32 sY, vN, <lane>`
 /// (VOP3 0x361 / 0x360; fixture `fortnite_lobby_desc.dxbc`). The translator models one lane
-/// per VGPR, so each (VGPR, constant lane) slot is lowered to a virtual scalar register
-/// s108.. and the two instructions become plain `s_mov_b32`, which the descriptor dataflow
-/// and the emitter already understand.
-///
-/// The first 148 slots (in order of first write) become virtual SGPRs s108..s255 and take part in
-/// descriptor tracking; further slots become plain translator temporaries, which carry
-/// values but not descriptor identity (a descriptor parked there later fails explicitly
-/// as "not a descriptor").
+/// per VGPR, so each (VGPR, constant lane) slot is lowered to a function-scope translator
+/// temporary and the two instructions become plain `s_mov_b32`. The descriptor dataflow
+/// tracks those temporaries like registers (keys 1000+), so descriptors survive a spill.
 ///
 /// Refused (explicit error): a non-constant lane index, a read of a slot that was never
 /// written, or a spill VGPR that is also used as an ordinary vector.
@@ -271,7 +266,7 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
             let slot = match slots.get(&(v, lane)) {
                 Some(s) => *s,
                 None => {
-                    let s = if next < 148 { Opnd::Sgpr(108 + next as u8) } else { Opnd::Temp(LANE_TEMP_BASE + next as u16) };
+                    let s = Opnd::Temp(LANE_TEMP_BASE + next as u16);
                     slots.insert((v, lane), s);
                     s
                 }
@@ -405,7 +400,7 @@ impl<'a> Emitter<'a> {
     /// keep only values every predecessor agrees on / union of written sets. A final pass
     /// then walks each block with its entry state and records the resources.
     fn resolve_resources(&mut self) -> Result<(), String> {
-        type State = (HashMap<u8, Sym>, BTreeSet<u8>);
+        type State = (HashMap<u16, Sym>, BTreeSet<u16>);
         let n = self.insns.len();
         if n == 0 {
             return Ok(());
@@ -480,7 +475,7 @@ impl<'a> Emitter<'a> {
                 // the first failure — it is the root cause if the recording pass fails too.
                 first_err.get_or_insert(e);
                 sym.clear();
-                written = (0u8..=105).collect();
+                written = (0u16..=105).collect();
             }
             for &s in &succs[b] {
                 let changed = match &mut states[s] {
@@ -490,7 +485,7 @@ impl<'a> Emitter<'a> {
                     }
                     Some((osym, owr)) => {
                         let before = (osym.clone(), owr.len());
-                        let keys: Vec<u8> = osym.keys().copied().collect();
+                        let keys: Vec<u16> = osym.keys().copied().collect();
                         for k in keys {
                             let a = osym[&k];
                             match sym.get(&k).copied() {
@@ -520,7 +515,7 @@ impl<'a> Emitter<'a> {
         (self.res, self.cb_size, self.tex, self.samp, self.samp_cmp, self.uav, self.sbuf, self.tbuf, self.tbuf_uint) = saved;
 
         // TB_DFDEBUG=<sgpr>: print that register's symbol at every block entry (diagnostics).
-        if let Some(reg) = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u8>().ok()) {
+        if let Some(reg) = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u16>().ok()) {
             for (b, r) in ranges.iter().enumerate() {
                 let s = states[b].as_ref().map(|(sym, wr)| (sym.get(&reg).copied(), wr.contains(&reg)));
                 eprintln!("block {b} @{:#x}..: s{reg} = {s:?} succs={:?}", self.insns[r.start].offset, succs[b]);
@@ -582,12 +577,12 @@ impl<'a> Emitter<'a> {
     /// Transfer function for one basic block (also records resources / reports errors).
     fn res_block(
         &mut self,
-        sym: &mut HashMap<u8, Sym>,
-        written: &mut BTreeSet<u8>,
+        sym: &mut HashMap<u16, Sym>,
+        written: &mut BTreeSet<u16>,
         range: std::ops::Range<usize>,
     ) -> Result<(), String> {
         let insns = self.insns.clone();
-        let dbg_reg = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u8>().ok());
+        let dbg_reg = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u16>().ok());
         let mut dbg_prev: Option<Sym> = dbg_reg.and_then(|r| sym.get(&r).copied());
         for idx in range {
             if let Some(r) = dbg_reg {
@@ -598,7 +593,12 @@ impl<'a> Emitter<'a> {
                 dbg_prev = cur;
             }
             let ins = &insns[idx];
-            let sg = |o: &Opnd| if let Opnd::Sgpr(n) = o { Some(*n) } else { None };
+            // Dataflow key of a scalar location: SGPR number, or 1000+ for a lane-spill slot.
+            let sg = |o: &Opnd| match o {
+                Opnd::Sgpr(n) => Some(*n as u16),
+                Opnd::Temp(n) if *n >= LANE_TEMP_BASE => Some(1000 + (*n - LANE_TEMP_BASE)),
+                _ => None,
+            };
             match ins.enc {
                 Enc::Sop1 if ins.mnemonic == "s_mov_b32" => {
                     if let Some(d) = ins.dst.first().and_then(sg) {
@@ -611,7 +611,7 @@ impl<'a> Emitter<'a> {
                                 let s = ins.src.first().and_then(sg);
                                 match s {
                                     Some(s) if !written.contains(&s) => {
-                                        sym.insert(d, Sym::Table(s));
+                                        sym.insert(d, Sym::Table(s as u8));
                                     }
                                     _ => {
                                         sym.remove(&d);
@@ -632,7 +632,7 @@ impl<'a> Emitter<'a> {
                     // (`s_mov_b64 s44, s84` + `s_mov_b64 s46, s86` moves a 4-dword descriptor).
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         let s = ins.src.first().and_then(sg);
-                        for k in 0..2u8 {
+                        for k in 0..2u16 {
                             match s.and_then(|s| sym.get(&(s + k)).cloned()) {
                                 Some(v) => {
                                     if k == 0 && matches!(v, Sym::Desc { k: 0, .. } | Sym::Multi { k: 0, .. }) {
@@ -644,7 +644,7 @@ impl<'a> Emitter<'a> {
                                     // A never-written user SGPR is a root table pointer (see
                                     // s_mov_b32); a 64-bit copy carries it in the low half.
                                     Some(s) if k == 0 && !written.contains(&s) => {
-                                        sym.insert(d, Sym::Table(s));
+                                        sym.insert(d, Sym::Table(s as u8));
                                     }
                                     _ => {
                                         sym.remove(&(d + k));
@@ -688,8 +688,8 @@ impl<'a> Emitter<'a> {
                     self.uses_code = true;
                     self.res.insert(idx, vec![Res::CodeTbl]);
                     for k in 0..n {
-                        sym.remove(&(d + k as u8));
-                        written.insert(d + k as u8);
+                        sym.remove(&(d + k as u16));
+                        written.insert(d + k as u16);
                     }
                 }
                 Enc::Smem if ins.op <= 4 => {
@@ -698,7 +698,7 @@ impl<'a> Emitter<'a> {
                     let d = ins.dst.first().and_then(sg).ok_or("s_load: bad dst")?;
                     let table = match sym.get(&b) {
                         Some(Sym::Table(t)) => *t,
-                        None if !written.contains(&b) => b,
+                        None if !written.contains(&b) => b as u8,
                         other => {
                             return Err(format!(
                                 "s_load at {:#x}: base s{b} is not a root table pointer ({other:?})",
@@ -710,15 +710,15 @@ impl<'a> Emitter<'a> {
                         return Err(format!("s_load at {:#x}: dynamic soffset unsupported", ins.offset));
                     }
                     for k in 0..n {
-                        sym.insert(d + k as u8, Sym::Desc { table, off: ins.aux.imm as u32, k });
+                        sym.insert(d + k as u16, Sym::Desc { table, off: ins.aux.imm as u32, k });
                         self.dsel_loads.insert(idx, (d, ((table as u32) << 24) | ins.aux.imm as u32));
-                        written.insert(d + k as u8);
+                        written.insert(d + k as u16);
                     }
                 }
                 Enc::Smem => {
                     let n = 1u32 << (ins.op - 8);
                     let b = ins.src.first().and_then(sg).ok_or("s_buffer_load: bad base")?;
-                    let d = ins.dst.first().and_then(sreg_num).ok_or("s_buffer_load: bad dst")?;
+                    let d = ins.dst.first().and_then(sreg_num).map(u16::from).ok_or("s_buffer_load: bad dst")?;
                     let slot = match sym.get(&b) {
                         // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table
                         // offset 0x20 in MainOnePassPointLightPS).
@@ -738,8 +738,8 @@ impl<'a> Emitter<'a> {
                     *e = (*e).max(end);
                     self.res.insert(idx, vec![Res::Cb(slot)]);
                     for k in 0..n {
-                        sym.remove(&(d + k as u8));
-                        written.insert(d + k as u8);
+                        sym.remove(&(d + k as u16));
+                        written.insert(d + k as u16);
                     }
                 }
                 // buffer_gl0_inv / buffer_gl1_inv (MUBUF 0x71 / 0x72) invalidate the GPU data caches: no
