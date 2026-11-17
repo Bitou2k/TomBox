@@ -105,13 +105,39 @@ fn ssrc_name(code: u32) -> Result<String, String> {
 }
 
 fn sig_type(e: &SigElement) -> (String, usize) {
-    let comps = (8 - e.mask.leading_zeros() as usize).max(1);
+    // Component count = number of mask bits (elements can be packed into a shared register,
+    // e.g. TEXCOORD4.xy + TEXCOORD5.zw, so the highest bit is not the count).
+    let comps = (e.mask.count_ones() as usize).max(1);
     let base = match e.comp_type {
         1 => "uint",
         2 => "int",
         _ => "float",
     };
     (if comps == 1 { base.to_string() } else { format!("{base}{comps}") }, comps)
+}
+
+/// Map a hardware (register, component) to (signature element index, component within
+/// that element). RDNA2 attributes / parameter exports are whole registers; a register may
+/// hold several packed signature elements.
+fn sig_lookup(sig: &[SigElement], register: u32, chan: usize) -> Option<(usize, usize)> {
+    sig.iter().enumerate().find_map(|(idx, e)| {
+        if e.sysval == 0 && e.register == register && (e.mask >> chan) & 1 != 0 {
+            Some((idx, (e.mask & ((1u8 << chan) - 1)).count_ones() as usize))
+        } else {
+            None
+        }
+    })
+}
+
+/// Distinct registers of the given elements, in signature order.
+fn distinct_regs<'s>(it: impl Iterator<Item = &'s SigElement>) -> Vec<u32> {
+    let mut v: Vec<u32> = Vec::new();
+    for e in it {
+        if !v.contains(&e.register) {
+            v.push(e.register);
+        }
+    }
+    v
 }
 
 fn semantic(e: &SigElement) -> String {
@@ -134,8 +160,10 @@ struct Emitter<'a> {
     regs: BTreeSet<String>,
     body: String,
     tmp: usize,
-    ps_attrs: Vec<&'a SigElement>,
-    out_params: Vec<&'a SigElement>,
+    /// PS attribute index -> input register (registers the shader actually reads).
+    ps_attrs: Vec<u32>,
+    /// VS parameter-export index -> output register.
+    out_params: Vec<u32>,
 }
 
 pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
@@ -161,8 +189,8 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         regs: BTreeSet::new(),
         body: String::new(),
         tmp: 0,
-        ps_attrs: ex.input_sig.iter().filter(|e| e.sysval == 0 && e.rw_mask != 0).collect(),
-        out_params: ex.output_sig.iter().filter(|e| e.sysval == 0).collect(),
+        ps_attrs: distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0 && e.rw_mask != 0)),
+        out_params: distinct_regs(ex.output_sig.iter().filter(|e| e.sysval == 0)),
     };
     em.resolve_resources()?;
     let live_in = em.live_in();
@@ -857,11 +885,10 @@ impl<'a> Emitter<'a> {
                 }
                 let attr = ins.aux.imm as usize;
                 let chan = ins.aux.imm2 as usize;
-                let e = *self.ps_attrs.get(attr).ok_or_else(|| format!("PS attr{attr} has no signature element"))?;
-                let (_, comps) = sig_type(e);
-                let val = if chan < comps {
-                    let acc = format!("i.i{}.{}", e.register, XYZW[chan]);
-                    if e.comp_type == 3 { format!("asuint({acc})") } else { format!("(uint)({acc})") }
+                let reg = *self.ps_attrs.get(attr).ok_or_else(|| format!("PS attr{attr} has no signature register"))?;
+                let val = if let Some((ei, k)) = sig_lookup(&self.ex.input_sig, reg, chan) {
+                    let acc = format!("i.i{ei}.{}", XYZW[k]);
+                    if self.ex.input_sig[ei].comp_type == 3 { format!("asuint({acc})") } else { format!("(uint)({acc})") }
                 } else if chan == 3 {
                     "0x3f800000u".to_string()
                 } else {
@@ -1302,35 +1329,39 @@ impl<'a> Emitter<'a> {
             self.line("// (parameter export with no output-signature element: ignored)");
             return Ok(());
         }
-        let (field, comps) = if is_ps {
+        // (element index, swizzle of the exported register that feeds it)
+        let osig = &self.ex.output_sig;
+        let mut assigns: Vec<(usize, String)> = Vec::new();
+        if is_ps {
             if target > 7 {
                 return Err(format!("PS export target {target} unsupported"));
             }
-            let e = self
-                .ex
-                .output_sig
+            let ei = osig
                 .iter()
-                .find(|e| e.sysval == 64 && e.index == target)
+                .position(|e| e.sysval == 64 && e.index == target)
                 .ok_or_else(|| format!("no SV_Target{target} in output signature"))?;
-            (format!("o.o{}", e.register), sig_type(e))
+            assigns.push((ei, "xyzw"[..sig_type(&osig[ei]).1].to_string()));
         } else if (12..=15).contains(&target) {
             if target != 12 {
                 return Err(format!("position export {target} unsupported"));
             }
-            let e = self.ex.output_sig.iter().find(|e| e.sysval == 1).ok_or("no SV_Position output")?;
-            (format!("o.o{}", e.register), sig_type(e))
+            let ei = osig.iter().position(|e| e.sysval == 1).ok_or("no SV_Position output")?;
+            assigns.push((ei, "xyzw".to_string()));
         } else if (32..64).contains(&target) {
-            let e = *self
-                .out_params
-                .get((target - 32) as usize)
-                .ok_or_else(|| format!("param export {} has no output signature element", target - 32))?;
-            (format!("o.o{}", e.register), sig_type(e))
+            let reg = self.out_params[(target - 32) as usize];
+            for (ei, e) in osig.iter().enumerate() {
+                if e.sysval == 0 && e.register == reg {
+                    let sw: String = (0..4).filter(|c| (e.mask >> c) & 1 != 0).map(|c| XYZW[c]).collect();
+                    assigns.push((ei, sw));
+                }
+            }
         } else {
             return Err(format!("export target {target} unsupported"));
-        };
-        let (ty, n) = comps;
-        let sw = &"xyzw"[..n];
-        self.line(&format!("if (exec_lo & 1u) {field} = ({ty})({v4}.{sw});"));
+        }
+        for (ei, sw) in assigns {
+            let (ty, _) = sig_type(&osig[ei]);
+            self.line(&format!("if (exec_lo & 1u) o.o{ei} = ({ty})({v4}.{sw});"));
+        }
         Ok(())
     }
 
@@ -1403,18 +1434,35 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             return Ok(h);
         }
         let _ = writeln!(h, "struct SIn {{");
-        for e in &ex.input_sig {
-            let (ty, _) = sig_type(e);
-            let interp = if is_ps && e.comp_type != 3 { "nointerpolation " } else { "" };
-            let _ = writeln!(h, "    {interp}{ty} i{} : {};", e.register, semantic(e));
+        // HLSL requires system-generated inputs (SV_IsFrontFace, SV_SampleIndex,
+        // SV_PrimitiveID, ...) to follow all ordinary parameters, so emit them last.
+        // Field names stay tied to the signature element index.
+        let sysgen = |e: &SigElement| is_ps && !matches!(e.sysval, 0 | 1);
+        for pass in 0..2 {
+            for (ei, e) in ex.input_sig.iter().enumerate() {
+                if sysgen(e) != (pass == 1) {
+                    continue;
+                }
+                let (ty, _) = sig_type(e);
+                let interp = if !is_ps {
+                    ""
+                } else if e.comp_type != 3 {
+                    "nointerpolation "
+                } else if e.name.contains("_centroid") {
+                    "centroid "
+                } else {
+                    ""
+                };
+                let _ = writeln!(h, "    {interp}{ty} i{ei} : {};", semantic(e));
+            }
         }
         let _ = writeln!(h, "}};\nstruct SOut {{");
-        for e in &ex.output_sig {
+        for (ei, e) in ex.output_sig.iter().enumerate() {
             let (ty, _) = sig_type(e);
             if matches!(e.sysval, 65 | 67 | 68) {
                 let _ = writeln!(h, "    float od : {};", semantic(e).trim_end_matches('0'));
             } else {
-                let _ = writeln!(h, "    {ty} o{} : {};", e.register, semantic(e));
+                let _ = writeln!(h, "    {ty} o{ei} : {};", semantic(e));
             }
         }
         let no_out = ex.output_sig.is_empty();
@@ -1430,20 +1478,19 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         // Vertex attributes arrive in v[4 + 4*register + component] after the fetch call.
         let mut init = String::new();
         if !is_ps {
-            for e in &ex.input_sig {
-                let (_, comps) = sig_type(e);
-                for c in 0..comps {
-                    let v = format!("v{}", 4 + 4 * e.register as usize + c);
-                    let acc = format!("i.i{}.{}", e.register, XYZW[c]);
-                    let val = if e.comp_type == 3 { format!("asuint({acc})") } else { format!("(uint)({acc})") };
+            for reg in distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0)) {
+                for c in 0..4usize {
+                    let v = format!("v{}", 4 + 4 * reg as usize + c);
                     self.regs.insert(v.clone());
+                    let val = match sig_lookup(&ex.input_sig, reg, c) {
+                        Some((ei, k)) => {
+                            let acc = format!("i.i{ei}.{}", XYZW[k]);
+                            if ex.input_sig[ei].comp_type == 3 { format!("asuint({acc})") } else { format!("(uint)({acc})") }
+                        }
+                        // Unsupplied components default to (0,0,0,1) like the hardware fetch.
+                        None => (if c == 3 { "0x3f800000u" } else { "0u" }).to_string(),
+                    };
                     let _ = writeln!(init, "    {v} = {val};");
-                }
-                // Unsupplied components default to (0,0,0,1) like the hardware fetch.
-                for c in comps..4 {
-                    let v = format!("v{}", 4 + 4 * e.register as usize + c);
-                    self.regs.insert(v.clone());
-                    let _ = writeln!(init, "    {v} = {};", if c == 3 { "0x3f800000u" } else { "0u" });
                 }
             }
         }
@@ -1454,8 +1501,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         if is_ps {
             // PS entry ABI (observed): v0/v1 = perspective-centre barycentrics, then the
             // fragment position x, y, z, 1/w in v2..v5 when the shader reads it.
-            if let Some(e) = ex.input_sig.iter().find(|e| e.sysval == 1) {
-                let p = format!("i.i{}", e.register);
+            if let Some(ei) = ex.input_sig.iter().position(|e| e.sysval == 1) {
+                let p = format!("i.i{ei}");
                 let exprs = [format!("{p}.x"), format!("{p}.y"), format!("{p}.z"), format!("1.0 / {p}.w")];
                 for (k, expr) in exprs.iter().enumerate() {
                     let v = format!("v{}", 2 + k);
