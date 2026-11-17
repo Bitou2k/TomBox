@@ -19,7 +19,23 @@ extern "system" {
     fn HeapAlloc(heap: *mut c_void, flags: u32, bytes: usize) -> *mut c_void;
     fn HeapFree(heap: *mut c_void, flags: u32, mem: *mut c_void) -> i32;
     fn VirtualAlloc(addr: *mut c_void, size: usize, alloc_type: u32, protect: u32) -> *mut c_void;
+    fn GetLastError() -> u32;
 }
+
+// Windows VirtualAlloc allocation-type bits. The Xbox `XMemVirtualAlloc`
+// allocation-type parameter is NOT bit-compatible with Windows: it carries
+// console-specific bits (e.g. 0x20000000) that Windows would misread as
+// MEM_LARGE_PAGES (privileged) and reject. We pass through only the bits Windows
+// actually defines and drop the rest.
+const MEM_COMMIT: u32 = 0x0000_1000;
+const MEM_RESERVE: u32 = 0x0000_2000;
+const MEM_RESET: u32 = 0x0008_0000;
+const MEM_TOP_DOWN: u32 = 0x0010_0000;
+const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+const MEM_RESET_UNDO: u32 = 0x0100_0000;
+const WIN_ALLOC_TYPE_MASK: u32 =
+    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET_UNDO;
+const PAGE_READWRITE: u32 = 0x04;
 
 // ---- Heap-backed (real) implementations ----
 
@@ -61,11 +77,25 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
     attributes: u64,
 ) -> *mut c_void {
-    let p = unsafe { VirtualAlloc(address, size, alloc_type, protect) };
+    // Keep only Windows-defined allocation-type bits; drop Xbox-only bits.
+    let mut win_type = alloc_type & WIN_ALLOC_TYPE_MASK;
+    if win_type == 0 {
+        // No recognizable intent: default to a reserve+commit.
+        win_type = MEM_RESERVE | MEM_COMMIT;
+    }
+    // A zero protection is invalid for Windows; default to RW. (On Xbox, 0 can
+    // mean "default".) Non-zero protections (NOACCESS=1, RW=4, etc.) match.
+    let win_protect = if protect == 0 { PAGE_READWRITE } else { protect };
+
+    let p = unsafe { VirtualAlloc(address, size, win_type, win_protect) };
+    let err = if p.is_null() { unsafe { GetLastError() } } else { 0 };
     record(
         M,
         "XMemVirtualAlloc",
-        &format!("addr={address:p} size={size} type={alloc_type:#x} prot={protect:#x} attrs={attributes:#x} -> {p:p}"),
+        &format!(
+            "addr={address:p} size={size} xbox_type={alloc_type:#x}->win_type={win_type:#x} prot={protect:#x}->{win_protect:#x} attrs={attributes:#x} -> {p:p}{}",
+            if p.is_null() { format!(" (GetLastError={err})") } else { String::new() }
+        ),
     );
     p
 }
