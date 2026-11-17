@@ -39,3 +39,24 @@ All times UTC. This log is append-only and records what was actually done, run, 
 ### Next priorities
 - While download runs: build + test the PE/COFF parser against known Windows PEs (does not need the real binary).
 - On completion: verify SHA-256, extract safely, inventory, identify main executable + modules, parse it, enumerate imports to find Xbox/GDK dependencies.
+
+### Progress during the download (same session)
+- **Built `tombox-pe` + `pe-inspect`** (zero-dep PE32+ parser). 8 tests pass incl.
+  real `kernel32.dll` (1671 exports, `CreateFileW` present, AMD64/PE32+), a no-panic
+  sweep over random / PE-shaped / truncated inputs, and a DIR64-relocation assertion.
+  Verified `pe-inspect` on a real binary: full header/section/import/dir/TLS/reloc report + valid JSON.
+- **Studied AnyPS5** (delegated Explore agent; `docs/ANYPS5_STUDY.md`). Confirmed a
+  static-relink + reimplemented-syslib design. Drove **ADR-0002**: native x64 execution
+  with import redirection, not emulation. Noted AnyPS5 avoids MSVC only due to SysV-ABI
+  catch handlers — not a constraint for Xbox, so Rust/MSVC is the right fit.
+- **Verified public Xbox facts** (web): GDK D3D12.x, MicrosoftGame.config/MSIXVC
+  flat-file layout, DXIL+offline-precompiled shaders — specifics NDA-gated → will come
+  from binary evidence. Wrote `docs/XBOX_RESEARCH.md` with confidence tags.
+- **Built `tombox-archive` + `zip-inspect`** (zero-dep, ZIP64-aware central-directory
+  reader + extraction safety validator). 9 tests pass: ZIP64 64-bit size resolution,
+  path-traversal / absolute / drive-letter / UNC / symlink blocking, bomb-ratio warning.
+  Verified on a real `Compress-Archive` zip. **This gates the 25 GB extraction.**
+- **Wrote docs**: README, ARCHITECTURE, COMPATIBILITY, TECHNICAL_DEBT, FORTNITE_ANALYSIS,
+  DECISIONS (ADR-0001/0002), ANYPS5_STUDY. Initialized local git (game data/refs/target excluded).
+- **17 tests total, all passing.** Toolchain: full Rust build/link/run confirmed; MSVC
+  toolset located (VS 2026, 14.16).

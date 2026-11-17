@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/tombox-pe",
     "crates/tombox-cli",
+    "crates/tombox-archive",
 ]
 
 [profile.release]

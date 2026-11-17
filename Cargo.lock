@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "tombox-archive"
+version = "0.1.0"
+
+[[package]]
 name = "tombox-cli"
 version = "0.1.0"
 dependencies = [
