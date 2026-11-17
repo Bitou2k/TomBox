@@ -22,8 +22,27 @@ extern "system" {
     fn LoadLibraryW(p: *const u16) -> HMODULE;
     fn GetProcAddress(h: HMODULE, n: *const u8) -> *mut c_void;
     fn VirtualProtect(addr: *mut c_void, size: usize, new_protect: u32, old_protect: *mut u32) -> i32;
+    fn CreateFileW(name: *const u16, access: u32, share: u32, sa: *mut c_void, disp: u32, flags: u32, tmpl: *mut c_void) -> isize;
+    fn ReadFile(h: isize, buf: *mut u8, n: u32, read: *mut u32, ov: *mut u8) -> i32;
+    fn GetLastError() -> u32;
 }
 const PAGE_READWRITE: u32 = 0x04;
+const GENERIC_READ: u32 = 0x8000_0000;
+const FILE_SHARE_READ: u32 = 0x1;
+const OPEN_EXISTING: u32 = 3;
+const INVALID_HANDLE: isize = -1;
+
+/// Map our returned IDStorageFile* -> an OS file handle we open alongside it, so we
+/// can service DirectStorage reads ourselves (DStorageCore's own file read path
+/// faults on the Xbox-origin requests even once correctly translated).
+static FILE_MAP: std::sync::Mutex<Vec<(usize, isize)>> = std::sync::Mutex::new(Vec::new());
+
+fn map_file(file_ptr: usize, os: isize) {
+    if let Ok(mut m) = FILE_MAP.lock() { m.push((file_ptr, os)); }
+}
+fn lookup_file(file_ptr: usize) -> Option<isize> {
+    FILE_MAP.lock().ok()?.iter().find(|(p, _)| *p == file_ptr).map(|(_, h)| *h)
+}
 
 /// PC `IID_IDStorageFactory` = {6924ea0c-c3cd-4826-b10a-f64f4ed927c1}, LE layout.
 static PC_IID_IDSTORAGEFACTORY: [u8; 16] = [
@@ -53,6 +72,7 @@ static ORIG_OPENFILE: AtomicUsize = AtomicUsize::new(0);
 static ORIG_CREATEQUEUE: AtomicUsize = AtomicUsize::new(0);
 static ENQUEUE_DUMPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static ORIG_ENQUEUE: AtomicUsize = AtomicUsize::new(0);
+static LAST_OPENED_FILE: AtomicUsize = AtomicUsize::new(0);
 
 /// Queue slot 3 = EnqueueRequest(this, const DSTORAGE_REQUEST*).
 ///
@@ -70,26 +90,35 @@ unsafe extern "system" fn enqueue_shim(this: *mut c_void, preq: *const u8) {
     }
     let x = unsafe { core::slice::from_raw_parts(preq, 0x40) };
     let rd = |o: usize| u64::from_le_bytes(x[o..o + 8].try_into().unwrap());
-    let (options, dst_buf, dst_size, src_file, src_off, src_size) =
-        (rd(0x00), rd(0x08), rd(0x18), rd(0x20), rd(0x28), rd(0x30));
+    let (dst_buf, _dst_size, src_file, src_off, src_size) =
+        (rd(0x08), rd(0x18), rd(0x20), rd(0x28), rd(0x30));
+    let _ = this;
 
-    let mut pc = [0u8; 0x60];
-    pc[0x00..0x08].copy_from_slice(&options.to_le_bytes());        // Options (File->Memory, no comp)
-    pc[0x08..0x10].copy_from_slice(&src_file.to_le_bytes());       // Source.File
-    pc[0x10..0x18].copy_from_slice(&src_off.to_le_bytes());        // Source.Offset
-    pc[0x18..0x1c].copy_from_slice(&(src_size as u32).to_le_bytes()); // Source.Size
-    pc[0x20..0x28].copy_from_slice(&dst_buf.to_le_bytes());        // Destination.Memory.Buffer
-    pc[0x28..0x2c].copy_from_slice(&(dst_size as u32).to_le_bytes()); // Destination.Memory.Size
-    pc[0x48..0x4c].copy_from_slice(&(dst_size as u32).to_le_bytes()); // UncompressedSize
-
+    // Service the read directly from the OS file we opened in OpenFile. (The real
+    // DStorageCore read path faults on these requests; the game's Submit still
+    // fires its status/fence on the real queue, so completion signals normally with
+    // the data already written here.)
+    let os = lookup_file(src_file as usize);
     let n = ENQUEUE_DUMPS.fetch_add(1, Ordering::Relaxed);
-    if n < 4 {
-        record(M, "EnqueueRequest",
-            &format!("file={src_file:#x} off={src_off:#x} size={src_size:#x} -> dst={dst_buf:#x} (translated)"));
+    match os {
+        Some(h) if dst_buf > 0x10000 && src_size > 0 => {
+            let mut ov = [0u8; 32];
+            ov[16..20].copy_from_slice(&(src_off as u32).to_le_bytes());       // Offset
+            ov[20..24].copy_from_slice(&(((src_off >> 32) as u32)).to_le_bytes()); // OffsetHigh
+            let mut got: u32 = 0;
+            let ok = unsafe { ReadFile(h, dst_buf as *mut u8, src_size as u32, &mut got, ov.as_mut_ptr()) };
+            if n < 3 {
+                record(M, "EnqueueRequest",
+                    &format!("read file={src_file:#x} off={src_off:#x} size={src_size:#x} -> dst={dst_buf:#x} ok={} got={got:#x}", ok != 0));
+            }
+        }
+        _ => {
+            if n < 8 {
+                record(M, "EnqueueRequest", &format!("UNSERVICED file={src_file:#x} off={src_off:#x} size={src_size:#x} dst={dst_buf:#x} (no os handle)"));
+            }
+        }
     }
-    let orig: unsafe extern "system" fn(*mut c_void, *const u8) =
-        unsafe { core::mem::transmute(ORIG_ENQUEUE.load(Ordering::Relaxed)) };
-    unsafe { orig(this, pc.as_ptr()) };
+    // no forward: we serviced the read ourselves.
 }
 
 /// Factory slot 3 = CreateQueue(this, const DSTORAGE_QUEUE_DESC*, REFIID, void** ppv).
@@ -133,6 +162,18 @@ unsafe extern "system" fn open_file_shim(
         unsafe { core::mem::transmute(ORIG_OPENFILE.load(Ordering::Relaxed)) };
     let hr = unsafe { orig(this, path, PC_IID_IDSTORAGEFILE.as_ptr() as *const c_void, ppv) };
     let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+    if hr == 0 && !out.is_null() {
+        LAST_OPENED_FILE.store(out as usize, Ordering::Relaxed);
+        // Open the same file via Win32 so we can service reads ourselves.
+        if !path.is_null() {
+            let os = unsafe { CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, core::ptr::null_mut(), OPEN_EXISTING, 0, core::ptr::null_mut()) };
+            if os != INVALID_HANDLE {
+                map_file(out as usize, os);
+            } else {
+                record(M, "OpenFile", &format!("CreateFileW failed err={}", unsafe { GetLastError() }));
+            }
+        }
+    }
     record(M, "OpenFile", &format!("(PC file IID) -> hr={hr:#010x} file={out:p}"));
     hr
 }
