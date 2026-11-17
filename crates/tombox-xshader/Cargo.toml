@@ -13,5 +13,9 @@ path = "src/lib.rs"
 name = "xshader"
 path = "src/bin/xshader.rs"
 
+[[bin]]
+name = "xscan"
+path = "src/bin/xscan.rs"
+
 [dependencies]
 miniz_oxide = "0.8"
