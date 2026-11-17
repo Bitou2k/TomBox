@@ -584,6 +584,9 @@ unsafe extern "system" fn create_gfx_pso_x(
                     u32at(0x23c), u32at(0x240), u32at(0x244), u32at(0x264), u32at(0x268), u32at(0x230)));
             }
         }
+        if hr == 0 && !ppv.is_null() {
+            unsafe { register_pso(*ppv, desc.clone(), keep.clone()) };
+        }
         hr
     };
     drop(keep);
@@ -597,13 +600,109 @@ unsafe extern "system" fn create_gfx_pso_x(
     hr
 }
 
+/// A created PSO's PC desc plus everything it points at, so slot 55 can derive variants.
+struct PsoRecord {
+    desc: Vec<u8>,
+    _shaders: Vec<std::sync::Arc<Vec<u8>>>,
+    _layout: Vec<u8>,
+}
+// SAFETY: the raw pointers inside `desc` only reference `_shaders`/`_layout` (owned here)
+// and static title data (root signature object, semantic-name strings).
+unsafe impl Send for PsoRecord {}
+unsafe impl Sync for PsoRecord {}
+
+fn pso_registry() -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<PsoRecord>>> {
+    static R: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<PsoRecord>>>> = OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Snapshot a (translated) desc so it stays valid after the title frees its copy:
+/// deep-copies the input-element array and repoints the desc at the copy.
+unsafe fn register_pso(pso: *mut c_void, mut desc: Vec<u8>, shaders: Vec<std::sync::Arc<Vec<u8>>>) {
+    let ptr = u64::from_le_bytes(desc[0x228..0x230].try_into().unwrap()) as *const u8;
+    let n = u32::from_le_bytes(desc[0x230..0x234].try_into().unwrap()) as usize;
+    let layout = if ptr.is_null() || n == 0 || n > 64 {
+        Vec::new()
+    } else {
+        unsafe { core::slice::from_raw_parts(ptr, n * 32).to_vec() }
+    };
+    if !layout.is_empty() {
+        desc[0x228..0x230].copy_from_slice(&(layout.as_ptr() as u64).to_le_bytes());
+    }
+    let rec = std::sync::Arc::new(PsoRecord { desc, _shaders: shaders, _layout: layout });
+    pso_registry().lock().unwrap().insert(pso as usize, rec);
+}
+
+/// Xbox "derived pipeline" create (device slot 55), from the RHI call site at EXE+0xd56979:
+/// `(this, pBasePSO, numPatches, pPatches, riid, ppv)`. Each patch is a 0x14C-byte tagged
+/// struct (u32 tag, payload at +4) overriding one block of the base pipeline's state:
+///   0 = D3D12_DEPTH_STENCIL_DESC (0x34)   1 = D3D12_RASTERIZER_DESC (0x2C)
+///   2 = D3D12_BLEND_DESC (0x148)          3 = SampleMask (u32)
+///   5 = Xbox misc (stencil masks / flags) — no PC desc field; ignored.
+/// Tags/payload sizes are read off the code that fills them (FD3D12 CreatePipelineState).
+unsafe extern "system" fn create_derived_pso_x(
+    this: *mut DeviceWrapper, base: *mut c_void, num: u32, patches: *const u8,
+    riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+    const STRIDE: usize = 0x14C;
+    static OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static FAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let real = unsafe { (*this).real };
+    let rec = pso_registry().lock().unwrap().get(&(base as usize)).cloned();
+    let Some(rec) = rec else {
+        if FAIL.fetch_add(1, Ordering::Relaxed) < 6 {
+            record("d3d12_xs", "CreateDerivedPSO_X", &format!("base PSO {base:p} unknown (its creation failed?) -> E_FAIL"));
+        }
+        return E_FAIL;
+    };
+    let mut desc = rec.desc.clone();
+    let mut tags = String::new();
+    if !patches.is_null() {
+        for i in 0..(num as usize).min(16) {
+            let p = unsafe { patches.add(i * STRIDE) };
+            let tag = unsafe { core::ptr::read_unaligned(p as *const u32) };
+            let payload = |n: usize| unsafe { core::slice::from_raw_parts(p.add(4), n) };
+            tags.push_str(&format!("{tag} "));
+            match tag {
+                0 => desc[0x1f0..0x1f0 + 0x34].copy_from_slice(payload(0x34)),
+                1 => desc[0x1c4..0x1c4 + 0x2c].copy_from_slice(payload(0x2c)),
+                2 => desc[0x78..0x78 + 0x148].copy_from_slice(payload(0x148)),
+                3 => desc[0x1c0..0x1c4].copy_from_slice(payload(4)),
+                5 => {}
+                other => {
+                    if FAIL.fetch_add(1, Ordering::Relaxed) < 6 {
+                        record("d3d12_xs", "CreateDerivedPSO_X", &format!("unknown patch tag {other} -> E_FAIL"));
+                    }
+                    return E_FAIL;
+                }
+            }
+        }
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
+    let hr = unsafe { f(real, desc.as_ptr(), riid, ppv) };
+    if hr == 0 && !ppv.is_null() {
+        let n = OK.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n % 100 == 0 {
+            record("d3d12_xs", "CreateDerivedPSO_X", &format!("derived PSO #{n} created (patch tags: {tags})"));
+        }
+        unsafe { register_pso(*ppv, desc, rec._shaders.clone()) };
+    } else if FAIL.fetch_add(1, Ordering::Relaxed) < 10 {
+        record("d3d12_xs", "CreateDerivedPSO_X", &format!("real CreateGraphicsPipelineState FAILED hr={hr:#010x} (tags: {tags})"));
+    }
+    hr
+}
+
 // Per-slot logging stubs for the Xbox device extensions (44+): capture slot +
 // caller RVA and return S_OK (most are hints like SetFrameIntervalX that the RHI
 // only checks for success). This reveals which Xbox device methods the game needs.
 static DEVSTUB_EXE_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static DEVSTUB_HITS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 unsafe extern "system" fn dev_stub_impl(_this: *mut c_void, _a: u64, caller: usize, slot: u64) -> i32 {
-    if DEVSTUB_HITS.fetch_add(1, Ordering::Relaxed) < 60 {
+    static PER_SLOT: [core::sync::atomic::AtomicUsize; 160] = [const { core::sync::atomic::AtomicUsize::new(0) }; 160];
+    DEVSTUB_HITS.fetch_add(1, Ordering::Relaxed);
+    if PER_SLOT[(slot as usize).min(159)].fetch_add(1, Ordering::Relaxed) < 3 {
         if DEVSTUB_EXE_BASE.load(Ordering::Relaxed) == 0 {
             extern "system" { fn GetModuleHandleW(n: *const u16) -> *mut c_void; }
             DEVSTUB_EXE_BASE.store(unsafe { GetModuleHandleW(core::ptr::null()) } as usize, Ordering::Relaxed);
@@ -658,6 +757,7 @@ fn vtable() -> *const usize {
         }
         unsafe { install_dev_stubs(&mut v); } // 44..90: logging S_OK stubs (diagnostic)
         v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
+        v[55] = create_derived_pso_x as usize; // Xbox derived-PSO create (base PSO + state patches)
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
         v[25] = get_resource_alloc_info as usize; // GetResourceAllocationInfo (null-safe)
