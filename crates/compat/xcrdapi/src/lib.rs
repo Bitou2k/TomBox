@@ -51,6 +51,46 @@ static PC_IID_IDSTORAGEQUEUE: [u8; 16] = [
 
 static ORIG_OPENFILE: AtomicUsize = AtomicUsize::new(0);
 static ORIG_CREATEQUEUE: AtomicUsize = AtomicUsize::new(0);
+static ENQUEUE_DUMPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ORIG_ENQUEUE: AtomicUsize = AtomicUsize::new(0);
+
+/// Queue slot 3 = EnqueueRequest(this, const DSTORAGE_REQUEST*).
+///
+/// The Xbox DSTORAGE_REQUEST orders Destination before Source (reverse of PC), so
+/// forwarding it verbatim fail-fasts E_INVALIDARG. Reconstructed Xbox layout:
+///   @0x00 Options(=0: File src, Memory dst, no compression)
+///   @0x08 Dest.Buffer   @0x18 Dest.Size
+///   @0x20 Src.File      @0x28 Src.Offset   @0x30 Src.Size
+/// PC layout (dstorage.h):
+///   @0x00 Options  @0x08 Src.File @0x10 Src.Offset @0x18 Src.Size(u32)
+///   @0x20 Dst.Buffer @0x28 Dst.Size(u32)  @0x48 UncompressedSize  @0x50 Tag  @0x58 Name
+unsafe extern "system" fn enqueue_shim(this: *mut c_void, preq: *const u8) {
+    if preq.is_null() {
+        return;
+    }
+    let x = unsafe { core::slice::from_raw_parts(preq, 0x40) };
+    let rd = |o: usize| u64::from_le_bytes(x[o..o + 8].try_into().unwrap());
+    let (options, dst_buf, dst_size, src_file, src_off, src_size) =
+        (rd(0x00), rd(0x08), rd(0x18), rd(0x20), rd(0x28), rd(0x30));
+
+    let mut pc = [0u8; 0x60];
+    pc[0x00..0x08].copy_from_slice(&options.to_le_bytes());        // Options (File->Memory, no comp)
+    pc[0x08..0x10].copy_from_slice(&src_file.to_le_bytes());       // Source.File
+    pc[0x10..0x18].copy_from_slice(&src_off.to_le_bytes());        // Source.Offset
+    pc[0x18..0x1c].copy_from_slice(&(src_size as u32).to_le_bytes()); // Source.Size
+    pc[0x20..0x28].copy_from_slice(&dst_buf.to_le_bytes());        // Destination.Memory.Buffer
+    pc[0x28..0x2c].copy_from_slice(&(dst_size as u32).to_le_bytes()); // Destination.Memory.Size
+    pc[0x48..0x4c].copy_from_slice(&(dst_size as u32).to_le_bytes()); // UncompressedSize
+
+    let n = ENQUEUE_DUMPS.fetch_add(1, Ordering::Relaxed);
+    if n < 4 {
+        record(M, "EnqueueRequest",
+            &format!("file={src_file:#x} off={src_off:#x} size={src_size:#x} -> dst={dst_buf:#x} (translated)"));
+    }
+    let orig: unsafe extern "system" fn(*mut c_void, *const u8) =
+        unsafe { core::mem::transmute(ORIG_ENQUEUE.load(Ordering::Relaxed)) };
+    unsafe { orig(this, pc.as_ptr()) };
+}
 
 /// Factory slot 3 = CreateQueue(this, const DSTORAGE_QUEUE_DESC*, REFIID, void** ppv).
 /// Substitute the PC IDStorageQueue IID so the async IoStore read queue isn't null.
@@ -61,6 +101,24 @@ unsafe extern "system" fn create_queue_shim(
         unsafe { core::mem::transmute(ORIG_CREATEQUEUE.load(Ordering::Relaxed)) };
     let hr = unsafe { orig(this, pdesc, PC_IID_IDSTORAGEQUEUE.as_ptr() as *const c_void, ppv) };
     let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+    // Patch the new queue's vtable slot 3 (EnqueueRequest) once to dump requests.
+    if hr == 0 && !out.is_null() {
+        static Q_PATCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !Q_PATCHED.swap(true, Ordering::Relaxed) {
+            unsafe {
+                let qvt = *(out as *const *mut usize);
+                let slot = qvt.add(3);
+                ORIG_ENQUEUE.store(*slot, Ordering::Relaxed);
+                let mut old: u32 = 0;
+                if VirtualProtect(slot as *mut c_void, 8, PAGE_READWRITE, &mut old) != 0 {
+                    *slot = enqueue_shim as usize;
+                    let mut tmp: u32 = 0;
+                    VirtualProtect(slot as *mut c_void, 8, old, &mut tmp);
+                    record(M, "patch_queue", &format!("queue vtable {qvt:p} slot 3 EnqueueRequest -> Xbox->PC translation shim"));
+                }
+            }
+        }
+    }
     record(M, "CreateQueue", &format!("(PC queue IID) -> hr={hr:#010x} queue={out:p}"));
     hr
 }
