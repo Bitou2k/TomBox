@@ -160,11 +160,9 @@ unsafe extern "system" fn create_descriptor_heap(
         unsafe { core::mem::transmute(*real_vtbl(real).add(14)) };
     let hr = unsafe { f(real, pdesc, riid, ppv) };
     if hr == S_OK && !ppv.is_null() {
-        let real_heap = unsafe { *ppv };
-        if !real_heap.is_null() {
-            let wrapped = crate::heap_wrap::wrap(real_heap);
-            unsafe { *ppv = wrapped };
-        }
+        // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
+        // patch the shared heap vtable once to fix the handle-getter ABI.
+        crate::heap_wrap::ensure_patched(unsafe { *ppv });
     }
     hr
 }
@@ -190,17 +188,42 @@ unsafe extern "system" fn create_command_queue_x(
     hr
 }
 
-/// Xbox slot 73 = `CreateCommandList` (standard signature, relocated in the Xbox
-/// vtable) -> PC `CreateCommandList` (slot 12).
+/// Xbox slot 73 = command-list create. Xbox signature (read from the call site):
+///   HRESULT (this, const Params* [rdx], ID3D12CommandAllocator* [r8],
+///            ID3D12PipelineState* [r9], REFIID, void** ppList)
+/// where Params is `{ u32 NodeMask@0; u32 _@4; D3D12_COMMAND_LIST_TYPE Type@8; u32 _@0xC }`.
+/// PC `CreateCommandList` (slot 12) takes (NodeMask, Type, alloc, initState, riid, ppList).
 unsafe extern "system" fn create_command_list_x(
-    this: *mut DeviceWrapper, node_mask: u32, list_type: u32, alloc: *mut c_void,
+    this: *mut DeviceWrapper, params: *const u32, alloc: *mut c_void,
     init_state: *mut c_void, riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
+    // Struct is { Type@0, _@4, NodeMask@8, _@0xC } (confirmed: type=0 DIRECT,
+    // nodeMask=1). PC requires a non-zero node mask.
+    let (list_type, mut node_mask) = if params.is_null() {
+        (0u32, 1u32)
+    } else {
+        unsafe { (*params.add(0), *params.add(2)) }
+    };
+    if node_mask == 0 {
+        node_mask = 1;
+    }
     let real = unsafe { (*this).real };
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
     let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, riid, ppv) };
-    record("d3d12_xs", "CreateCommandList", &format!("type={list_type} -> hr={hr:#010x}"));
+    // PC CreateCommandList returns an OPEN (recording) list; the Xbox RHI expects
+    // it CLOSED and calls Reset() to begin. Close it now so Reset() is valid.
+    if hr == S_OK && !ppv.is_null() {
+        let list = unsafe { *ppv };
+        if !list.is_null() {
+            let lvt = unsafe { *(list as *const *const usize) };
+            // ID3D12GraphicsCommandList::Close = slot 9
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 =
+                unsafe { core::mem::transmute(*lvt.add(9)) };
+            unsafe { close(list) };
+        }
+    }
+    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} -> hr={hr:#010x} (closed)"));
     hr
 }
 
@@ -256,11 +279,8 @@ fn vtable() -> *const usize {
         while v.len() < 160 {
             v.push(dev_stub as usize);
         }
-        v[48] = create_command_queue_x as usize; // CreateCommandQueueX (verified)
-        // Slot 73 is an Xbox command-list create whose exact signature differs from
-        // PC CreateCommandList (needs the GDK d3d12_x headers); left as fail-loud
-        // stub until its ABI is reversed. (create_command_list_x kept for reference.)
-        let _ = create_command_list_x;
+        v[48] = create_command_queue_x as usize; // CreateCommandQueueX
+        v[73] = create_command_list_x as usize;  // Xbox command-list create
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     }) as *const usize
 }

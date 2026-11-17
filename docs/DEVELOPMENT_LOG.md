@@ -279,3 +279,38 @@ is large.
 - [x] 12 meaningful initialization — done (full UE init + GPU device + queues).
 - [~] 11 graphics device + required features — device/caps/heaps/queues done;
   command lists onward pending D3D12.x ABI reversing.
+
+## 2026-11-16 — Session 2 cont.: real GPU command infrastructure up
+
+### The game drives the real RTX 5060 Ti through D3D12 command setup
+Continued the D3D12.x translation by reversing each Xbox method's ABI from its
+call site (no headers needed):
+- CreateCommandQueueX (slot 48): Xbox queue desc -> PC CreateCommandQueue. Real
+  compute queue created (hr=S_OK).
+- Command-list create (slot 73): reversed the Xbox signature from the call site —
+  takes a params struct {Type@0, NodeMask@8} by pointer, not inline args. Translated
+  to PC CreateCommandList (nodeMask must be non-zero). Real DIRECT list created.
+- Close-on-create: PC CreateCommandList returns an OPEN list; the Xbox RHI expects
+  it CLOSED then calls Reset() — closing it on create fixed an nvwgf2umx (driver)
+  crash in FD3D12CommandListData::Reset.
+- Descriptor-heap handle ABI: switched from wrapping the heap (which leaked our
+  wrapper into real SetDescriptorHeaps -> driver crash) to patching the shared
+  ID3D12DescriptorHeap vtable slots 9/10 in place (VirtualProtect) — heaps stay
+  real, handle getters bridged (Xbox RAX vs PC `fn(this, Handle* retval)`).
+- Robust 160-slot device vtable: standard methods forward, Xbox extensions default
+  to fail-loud E_NOTIMPL stubs (no crashes), specific ones intercepted.
+
+### Current frontier: command-list recording method slots
+The game now Reset()s and records on the real command list, then its own Close()
+fails -> the command-list recording methods (barriers, descriptor binds, draws —
+~50) are at Xbox vtable slots that differ from PC, corrupting the recording. Fix
+is a command-list wrapper that remaps Xbox slots -> PC methods AND unwraps on
+ExecuteCommandLists. That object-graph wrapping (command lists, resources, PSOs)
++ swapchain/present + shader handling is the remaining rendering-pipeline work —
+proven approach, large volume.
+
+### Milestones
+- [x] 12 meaningful initialization.
+- [~] 11 graphics device + features: device, caps, descriptor heaps, command
+  queues AND command-list creation/reset all driving the real GPU; command
+  recording -> present is the next phase.
