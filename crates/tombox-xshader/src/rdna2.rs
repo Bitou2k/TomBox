@@ -59,6 +59,8 @@ pub enum Opnd {
     Literal(u32),
     /// An operand code we don't model yet (preserved, not guessed).
     Raw(u16),
+    /// Translator-introduced temporary (never produced by the decoder).
+    Temp(u16),
 }
 
 /// One decoded instruction: length-accurate, with structured destination + source operands
@@ -93,7 +95,15 @@ pub struct InsnAux {
     pub mask: u8,
     /// Secondary immediate (e.g. VINTRP attr#, SMEM soffset code).
     pub imm2: i64,
+    /// SDWA (sub-dword addressing) modifier dword, when src0 of a VOP1/VOP2/VOPC is 249:
+    /// src0[7:0], dst_sel[10:8] (VOPC: sdst[14:8], sd[15]), src0_sel[18:16], src0_sext[19],
+    /// src0_neg[20], src0_abs[21], s0[23], src1_sel[26:24], src1_sext[27], src1_neg[28],
+    /// src1_abs[29], s1[31]. Selects: 0..3 = BYTE_n, 4..5 = WORD_n, 6 = DWORD.
+    pub sdwa: Option<u32>,
 }
+
+/// SRC0 code meaning "an SDWA modifier dword follows".
+const SRC_SDWA: u32 = 249;
 
 /// Classify the encoding from the first dword. Order matters (most-specific first).
 fn classify(w: u32) -> Enc {
@@ -189,6 +199,7 @@ pub fn opnd_str(o: &Opnd) -> String {
         Opnd::ConstF32(v) => format!("{v:?}"),
         Opnd::Literal(v) => format!("0x{v:x}"),
         Opnd::Raw(c) => format!("<op{c}>"),
+        Opnd::Temp(n) => format!("tb_s{n}"),
     }
 }
 
@@ -276,6 +287,13 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             let vdst = (w >> 17) & 0xff;
             let vsrc1 = (w >> 9) & 0xff;
             let src0 = w & 0x1ff;
+            if src0 == SRC_SDWA {
+                let sd = raw.get(1).copied().unwrap_or(0);
+                aux.sdwa = Some(sd);
+                let s0 = if (sd >> 23) & 1 != 0 { ssrc8((sd & 0xff) as u16, None) } else { Opnd::Vgpr((sd & 0xff) as u8) };
+                let s1 = if (sd >> 31) & 1 != 0 { ssrc8(vsrc1 as u16, None) } else { Opnd::Vgpr(vsrc1 as u8) };
+                return (vec![Opnd::Vgpr(vdst as u8)], vec![s0, s1], aux);
+            }
             (vec![Opnd::Vgpr(vdst as u8)],
              vec![src9(src0 as u16, lit), Opnd::Vgpr(vsrc1 as u8)], aux)
         }
@@ -284,11 +302,26 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             let src0 = w & 0x1ff;
             // v_readfirstlane_b32 (op 2) writes a scalar register.
             let dst = if (w >> 9) & 0xff == 0x02 { ssrc8(vdst as u16, None) } else { Opnd::Vgpr(vdst as u8) };
+            if src0 == SRC_SDWA {
+                let sd = raw.get(1).copied().unwrap_or(0);
+                aux.sdwa = Some(sd);
+                let s0 = if (sd >> 23) & 1 != 0 { ssrc8((sd & 0xff) as u16, None) } else { Opnd::Vgpr((sd & 0xff) as u8) };
+                return (vec![dst], vec![s0], aux);
+            }
             (vec![dst], vec![src9(src0 as u16, lit)], aux)
         }
         Enc::Vopc => {
             let vsrc1 = (w >> 9) & 0xff;
             let src0 = w & 0x1ff;
+            if src0 == SRC_SDWA {
+                let sd = raw.get(1).copied().unwrap_or(0);
+                aux.sdwa = Some(sd);
+                let s0 = if (sd >> 23) & 1 != 0 { ssrc8((sd & 0xff) as u16, None) } else { Opnd::Vgpr((sd & 0xff) as u8) };
+                let s1 = if (sd >> 31) & 1 != 0 { ssrc8(vsrc1 as u16, None) } else { Opnd::Vgpr(vsrc1 as u8) };
+                // VOPC-SDWA: explicit scalar destination when SD (bit 15) is set, else VCC.
+                let dst = if (sd >> 15) & 1 != 0 { ssrc8(((sd >> 8) & 0x7f) as u16, None) } else { Opnd::VccLo };
+                return (vec![dst], vec![s0, s1], aux);
+            }
             (vec![Opnd::VccLo], vec![src9(src0 as u16, lit), Opnd::Vgpr(vsrc1 as u8)], aux)
         }
         Enc::Vop3 => {
@@ -374,7 +407,8 @@ fn instr_len(enc: Enc, w: u32, next: Option<u32>) -> (usize, bool) {
         Enc::Sop2 => (1, ssrc_is_lit(w & 0xff) || ssrc_is_lit((w >> 8) & 0xff)),
         Enc::Sopc => (1, ssrc_is_lit(w & 0xff) || ssrc_is_lit((w >> 8) & 0xff)),
         Enc::Sop1 => (1, ssrc_is_lit(w & 0xff)),
-        Enc::Sopk => (1, false), // SIMM16 is inline in the instruction word
+        // SIMM16 is inline; s_setreg_imm32_b32 (op 0x15) carries a trailing 32-bit immediate.
+        Enc::Sopk => (1, (w >> 23) & 0x1f == 0x15),
         Enc::Sopp => (1, false),
         // SMEM is 2 dwords on GFX10.
         Enc::Smem => (2, false),
@@ -382,10 +416,11 @@ fn instr_len(enc: Enc, w: u32, next: Option<u32>) -> (usize, bool) {
         Enc::Vop2 => {
             // v_madmk/v_madak/v_fmamk/v_fmaak always carry a trailing 32-bit K constant.
             let op = (w >> 25) & 0x3f;
-            (1, (w & 0x1ff) == 255 || matches!(op, 0x20 | 0x21 | 0x2c | 0x2d))
+            (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(op, 0x20 | 0x21 | 0x2c | 0x2d))
         }
-        Enc::Vop1 => (1, (w & 0x1ff) == 255),
-        Enc::Vopc => (1, (w & 0x1ff) == 255),
+        // A trailing dword follows for an inline literal (255) or an SDWA modifier (249).
+        Enc::Vop1 => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA),
+        Enc::Vopc => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA),
         // VOP3/VOP3P: 2 dwords.
         Enc::Vop3 => {
             // GFX10 allows a trailing 32-bit literal on VOP3 when any source == 255.

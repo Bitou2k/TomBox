@@ -129,6 +129,9 @@ pub fn sopk(op: u32) -> Option<&'static str> {
         0x07 => "s_cmpk_lt_i32", 0x08 => "s_cmpk_le_i32", 0x09 => "s_cmpk_eq_u32",
         0x0a => "s_cmpk_lg_u32", 0x0b => "s_cmpk_gt_u32", 0x0c => "s_cmpk_ge_u32",
         0x0d => "s_cmpk_lt_u32", 0x0e => "s_cmpk_le_u32", 0x0f => "s_addk_i32", 0x10 => "s_mulk_i32",
+        0x12 => "s_getreg_b32", 0x13 => "s_setreg_b32", 0x15 => "s_setreg_imm32_b32",
+        0x17 => "s_waitcnt_vscnt", 0x18 => "s_waitcnt_vmcnt", 0x19 => "s_waitcnt_expcnt",
+        0x1a => "s_waitcnt_lgkmcnt",
         _ => return None,
     })
 }

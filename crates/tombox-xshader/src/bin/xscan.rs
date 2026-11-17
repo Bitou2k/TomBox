@@ -24,7 +24,18 @@ fn fnv1a(b: &[u8]) -> u64 {
 fn normalise(e: &str) -> String {
     let mut out = String::new();
     let mut chars = e.chars().peekable();
+    let mut in_angle = false;
     while let Some(c) = chars.next() {
+        // Keep opcode numbers inside <...> (e.g. vop3<0x2ff>) — they identify the gap.
+        if c == '<' {
+            in_angle = true;
+        } else if c == '>' {
+            in_angle = false;
+        }
+        if in_angle {
+            out.push(c);
+            continue;
+        }
         if c == '0' && chars.peek() == Some(&'x') {
             chars.next();
             while chars.peek().map(|c| c.is_ascii_hexdigit()).unwrap_or(false) {

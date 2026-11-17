@@ -40,6 +40,7 @@ enum Res {
     Uav(u32, u32), // slot, dim
     Buf(u32, bool), // slot, is_uav (structured buffer)
     TBuf(u32, bool), // slot, is_uav (typed buffer)
+    CbDyn(u32),      // constant buffer read through MUBUF (per-lane offset)
 }
 
 const XYZW: [&str; 4] = ["x", "y", "z", "w"];
@@ -68,6 +69,7 @@ fn name(o: &Opnd) -> Result<String, String> {
         Opnd::M0 => "m0".into(),
         Opnd::Scc => "scc".into(),
         Opnd::Null => "nul".into(),
+        Opnd::Temp(n) => format!("tb_s{n}"),
         other => return Err(format!("operand {other:?} is not assignable")),
     })
 }
@@ -277,7 +279,9 @@ impl<'a> Emitter<'a> {
                     let b = ins.src.first().and_then(sg).ok_or("s_buffer_load: bad base")?;
                     let d = ins.dst.first().and_then(sg).ok_or("s_buffer_load: bad dst")?;
                     let slot = match sym.get(&b) {
-                        Some(Sym::Desc { off, k: 0, .. }) => off / 16,
+                        // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table
+                        // offset 0x20 in MainOnePassPointLightPS).
+                        Some(Sym::Desc { off, k: 0, .. }) => off / 32,
                         other => {
                             return Err(format!(
                                 "s_buffer_load at {:#x}: base s{b} is not a buffer descriptor ({other:?})",
@@ -308,6 +312,13 @@ impl<'a> Emitter<'a> {
                     let is_uav = match self.table_kind(table) {
                         Some(0) => false,
                         Some(1) => true,
+                        Some(2) => {
+                            // Per-lane indexed read of a constant buffer (e.g. cbuffer arrays
+                            // indexed by a varying value): size the declaration to the maximum.
+                            self.cb_size.insert(slot, 4096 * 4);
+                            self.res.insert(idx, vec![Res::CbDyn(slot)]);
+                            continue;
+                        }
                         other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
                     };
                     if ins.mnemonic.contains("_format_") {
@@ -500,11 +511,10 @@ impl<'a> Emitter<'a> {
                     return Err("irreducible/overlapping loops".into());
                 }
             }
-            for (&fb, &ft) in &target {
-                if fb < l1 && ft > l1 && ft <= b1 {
-                    return Err(format!("branch into the middle of a loop at {:#x}", self.insns[fb].offset));
-                }
-            }
+            // A forward branch from before the header into the body (the usual rotated
+            // `while`: jump straight to the condition) is handled by the skip flags: the
+            // flag stays set on the first iteration, so everything before the label is
+            // skipped, and in-body flags are cleared at the bottom of each iteration.
         }
         let labels: BTreeSet<usize> = target.values().copied().collect();
         for l in &labels {
@@ -529,9 +539,6 @@ impl<'a> Emitter<'a> {
                 cur.clear();
                 self.line("do {");
                 self.line(&format!("tb_c{b} = false;"));
-                for t in labels.iter().filter(|&&t| t > i && t <= b) {
-                    self.line(&format!("j{t} = false;"));
-                }
             }
             let active: Vec<usize> =
                 labels.iter().copied().filter(|&t| t > i && target.iter().any(|(&b, &bt)| bt == t && b < i)).collect();
@@ -561,6 +568,11 @@ impl<'a> Emitter<'a> {
                     open = false;
                 }
                 cur.clear();
+                // Clear the flags of labels inside this loop body for the next iteration.
+                let head = back[&i];
+                for t in labels.iter().filter(|&&t| t > head && t <= i) {
+                    self.line(&format!("j{t} = false;"));
+                }
                 let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
                 let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(" || ")) };
                 self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < 65536u);"));
@@ -805,6 +817,10 @@ impl<'a> Emitter<'a> {
                 let imm = format!("{:#x}u", ins.aux.imm as i32 as u32);
                 match m {
                     "s_movk_i32" => self.ws(&d, &imm),
+                    // Hardware mode-register writes (rounding / denormal control) and the
+                    // counter waits have no HLSL-visible effect.
+                    "s_setreg_imm32_b32" | "s_setreg_b32" | "s_waitcnt_vscnt" | "s_waitcnt_vmcnt"
+                    | "s_waitcnt_expcnt" | "s_waitcnt_lgkmcnt" => Ok(()),
                     "s_addk_i32" => self.ws(&d, &format!("({} + {imm})", name(&d)?)),
                     "s_mulk_i32" => self.ws(&d, &format!("({} * {imm})", name(&d)?)),
                     _ if m.starts_with("s_cmpk_") => {
@@ -952,6 +968,85 @@ impl<'a> Emitter<'a> {
             }
             return Ok(());
         }
+        if matches!(
+            m.as_str(),
+            "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
+        ) {
+            // Add/subtract with carry. VOP3B: carry-out register in bits [14:8] of dword0 and
+            // carry-in is src2; VOP2: both are VCC. Lane model: carry = this lane's bit.
+            let vop3f = ins.enc == Enc::Vop3;
+            let cout = if vop3f {
+                match (ins.raw[0] >> 8) & 0x7f {
+                    c @ 0..=105 => Opnd::Sgpr(c as u8),
+                    106 => Opnd::VccLo,
+                    c => return Err(format!("carry-out register code {c} unsupported")),
+                }
+            } else {
+                Opnd::VccLo
+            };
+            let cin = if m.contains("_ci_") { if vop3f { r(&s[2])? } else { "vcc_lo".to_string() } } else { "0u".to_string() };
+            let (mut a, mut b) = (r(&s[0])?, r(&s[1])?);
+            if m.starts_with("v_subrev") {
+                core::mem::swap(&mut a, &mut b);
+            }
+            let t = self.tmp;
+            self.tmp += 1;
+            if m.starts_with("v_add") {
+                self.line(&format!(
+                    "uint t{t}c = ({cin}) & 1u; uint t{t}a = {a} + {b}; uint t{t} = t{t}a + t{t}c; uint t{t}o = ((t{t}a < {a}) || (t{t} < t{t}a)) ? 1u : 0u;"
+                ));
+            } else {
+                self.line(&format!(
+                    "uint t{t}c = ({cin}) & 1u; uint t{t}a = {a} - {b}; uint t{t} = t{t}a - t{t}c; uint t{t}o = (({b} > {a}) || (t{t}c > t{t}a)) ? 1u : 0u;"
+                ));
+            }
+            self.wv(&d, &format!("t{t}"))?;
+            self.touch(&cout);
+            self.ws(&cout, &format!("((exec_lo & 1u) != 0u) ? t{t}o : 0u"))?;
+            let ch = hi(&cout);
+            self.touch(&ch);
+            self.ws(&ch, "0u")?;
+            return Ok(());
+        }
+        if let Some(sd) = ins.aux.sdwa {
+            // SDWA: operate on a selected byte/word of each source. Materialise the selected
+            // values into temporaries, then translate the instruction as usual.
+            let is_cmp = ins.enc == Enc::Vopc;
+            if !is_cmp && (sd >> 8) & 7 != 6 {
+                return Err("SDWA with a partial destination select is unsupported".into());
+            }
+            if sd & 0x3030_0000 != 0 {
+                return Err("SDWA float neg/abs modifiers are unsupported".into());
+            }
+            let mut c = ins.clone();
+            c.aux.sdwa = None;
+            for (i, shift) in [(0usize, 16u32), (1usize, 24u32)] {
+                if i >= c.src.len() {
+                    continue;
+                }
+                let sel = (sd >> shift) & 7;
+                let sext = (sd >> (shift + 3)) & 1 != 0;
+                if sel == 6 {
+                    continue;
+                }
+                let x = r(&c.src[i])?;
+                let (bits, lsb) = match sel {
+                    0..=3 => (8u32, sel * 8),
+                    4 | 5 => (16, (sel - 4) * 16),
+                    _ => return Err(format!("SDWA select {sel} is reserved")),
+                };
+                let e = if sext {
+                    format!("asuint(asint({x} << {}) >> {})", 32 - bits - lsb, 32 - bits)
+                } else {
+                    format!("(({x} >> {lsb}) & {:#x}u)", (1u32 << bits) - 1)
+                };
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint tb_s{t} = {e};"));
+                c.src[i] = Opnd::Temp(t as u16);
+            }
+            return self.emit_vec(&c);
+        }
         if m == "v_swap_b32" {
             let (x, y) = (name(&d)?, name(&s[0])?);
             let t = self.tmp;
@@ -1032,6 +1127,10 @@ impl<'a> Emitter<'a> {
             "v_xor_b32" => format!("({a} ^ {b})"),
             "v_xnor_b32" => format!("(~({a} ^ {b}))"),
             "v_not_b32" => format!("(~{a})"),
+            "v_bfrev_b32" => format!("reversebits({a})"),
+            // Find-first-bit: -1 when no bit is set (HLSL intrinsics agree for zero input).
+            "v_ffbl_b32" => format!("firstbitlow({a})"),
+            "v_ffbh_u32" => format!("(({a}) == 0u ? 0xffffffffu : (31u - firstbithigh({a})))"),
             "v_lshrrev_b32" => format!("({b} >> ({a} & 31u))"),
             "v_lshlrev_b32" => format!("({b} << ({a} & 31u))"),
             "v_ashrrev_i32" => format!("asuint(asint({b}) >> ({a} & 31u))"),
@@ -1084,6 +1183,28 @@ impl<'a> Emitter<'a> {
     /// immediate the byte offset inside the element. Dynamic offsets (OFFEN / SOFFSET
     /// register) are not handled yet and fail explicitly.
     fn emit_mubuf(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        if let Some(Res::CbDyn(slot)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
+            let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
+            if idxen || !matches!(ins.src[2], Opnd::ConstInt(0)) || !ins.mnemonic.starts_with("buffer_load_dword") {
+                return Err("constant-buffer MUBUF form unsupported".into());
+            }
+            let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
+            let vd = match ins.dst[0] {
+                Opnd::Vgpr(v) => v,
+                _ => return Err("bad vdata".into()),
+            };
+            let base = if offen { format!("({:#x}u + {})", ins.aux.imm as u32, r(&ins.src[0])?) } else { format!("{:#x}u", ins.aux.imm as u32) };
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t} = {base} >> 2;"));
+            for k in 0..n {
+                self.line(&format!("uint t{t}_{k} = cb{slot}[((t{t} + {k}u) >> 2) & 4095u][(t{t} + {k}u) & 3u];"));
+            }
+            for k in 0..n {
+                self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}_{k}"))?;
+            }
+            return Ok(());
+        }
         if let Some(Res::TBuf(slot, is_uav)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
             // Typed buffer. The element type is declared float4: the view format is not
             // visible in the shader, so integer-format buffers are a known gap (TECHNICAL_DEBT).
