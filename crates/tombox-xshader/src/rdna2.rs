@@ -12,6 +12,8 @@
 //! field decoding (register names, mnemonics) is filled in incrementally; unknown opcodes
 //! are preserved as raw words rather than guessed, per the project's no-fabrication rule.
 
+pub mod mnem;
+
 /// RDNA2 instruction encoding family, from the high bits of the first dword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Enc {
@@ -156,7 +158,7 @@ pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
         let w = words[i];
         let enc = classify(w);
         // Determine instruction length (in dwords) and whether a trailing literal follows.
-        let (base_len, lit) = instr_len(enc, w);
+        let (base_len, lit) = instr_len(enc, w, words.get(i + 1).copied());
         let total = (base_len + if lit { 1 } else { 0 }).min(words.len() - i).max(1);
         let raw: Vec<u32> = words[i..i + total].to_vec();
         let op = opcode_field(enc, w);
@@ -291,12 +293,43 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
         }
         Enc::Vop3 => {
             let vdst = w & 0xff;
+            let op = (w >> 16) & 0x3ff;
             let d1 = raw.get(1).copied().unwrap_or(0);
+            let l3 = raw.get(2).copied();
             let s0 = d1 & 0x1ff;
             let s1 = (d1 >> 9) & 0x1ff;
             let s2 = (d1 >> 18) & 0x1ff;
-            (vec![Opnd::Vgpr(vdst as u8)],
-             vec![src9(s0 as u16, None), src9(s1 as u16, None), src9(s2 as u16, None)], aux)
+            // abs[10:8] in dword0, neg[31:29] + omod[28:27] in dword1, clamp bit 15.
+            aux.mask = (((w >> 8) & 7) | (((d1 >> 29) & 7) << 3)) as u8;
+            aux.imm2 = ((d1 >> 27) & 3) as i64;
+            aux.imm = ((w >> 15) & 1) as i64;
+            // Compare forms (op < 0x100) write a scalar mask register, not a VGPR.
+            let dst = if op < 0x100 { ssrc8(vdst as u16, None) } else { Opnd::Vgpr(vdst as u8) };
+            (vec![dst],
+             vec![src9(s0 as u16, l3), src9(s1 as u16, l3), src9(s2 as u16, l3)], aux)
+        }
+        Enc::Mimg => {
+            let d1 = raw.get(1).copied().unwrap_or(0);
+            let nsa = ((w >> 1) & 3) as usize;
+            aux.mask = ((w >> 8) & 0xf) as u8; // dmask
+            aux.imm = ((w >> 3) & 7) as i64;   // dim
+            aux.imm2 = nsa as i64;
+            let mut s = vec![Opnd::Vgpr((d1 & 0xff) as u8)];
+            for k in 0..nsa {
+                let x = raw.get(2 + k).copied().unwrap_or(0);
+                for b in 0..4 { s.push(Opnd::Vgpr(((x >> (8 * b)) & 0xff) as u8)); }
+            }
+            s.push(Opnd::Sgpr((((d1 >> 16) & 0x1f) * 4) as u8));
+            s.push(Opnd::Sgpr((((d1 >> 21) & 0x1f) * 4) as u8));
+            (vec![Opnd::Vgpr(((d1 >> 8) & 0xff) as u8)], s, aux)
+        }
+        Enc::Mubuf => {
+            let d1 = raw.get(1).copied().unwrap_or(0);
+            aux.imm = (w & 0xfff) as i64;
+            aux.mask = (((w >> 12) & 1) | (((w >> 13) & 1) << 1)) as u8; // offen | idxen<<1
+            (vec![Opnd::Vgpr(((d1 >> 8) & 0xff) as u8)],
+             vec![Opnd::Vgpr((d1 & 0xff) as u8), Opnd::Sgpr((((d1 >> 16) & 0x1f) * 4) as u8),
+                  ssrc8(((d1 >> 24) & 0xff) as u16, None)], aux)
         }
         Enc::Vinterp => {
             let vdst = (w >> 18) & 0xff;
@@ -312,6 +345,7 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             let target = (w >> 4) & 0x3f;
             aux.imm = target as i64;
             aux.mask = en;
+            aux.imm2 = ((w >> 10) & 7) as i64; // bit0 compr, bit1 done, bit2 vm
             let d1 = raw.get(1).copied().unwrap_or(0);
             let s = vec![
                 Opnd::Vgpr((d1 & 0xff) as u8),
@@ -326,7 +360,7 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
 }
 
 /// Base length (dwords) for an encoding, plus whether an inline literal source is present.
-fn instr_len(enc: Enc, w: u32) -> (usize, bool) {
+fn instr_len(enc: Enc, w: u32, next: Option<u32>) -> (usize, bool) {
     match enc {
         // Scalar: 1 dword base. Literal when a source field == 255.
         Enc::Sop2 => (1, ssrc_is_lit(w & 0xff) || ssrc_is_lit((w >> 8) & 0xff)),
@@ -337,14 +371,25 @@ fn instr_len(enc: Enc, w: u32) -> (usize, bool) {
         // SMEM is 2 dwords on GFX10.
         Enc::Smem => (2, false),
         // Vector ALU: VOP2/VOP1/VOPC are 1 dword; literal when src0==255.
-        Enc::Vop2 => (1, ssrc_is_lit(w & 0x1ff & 0xff) && (w & 0x1ff) == 255),
+        Enc::Vop2 => {
+            // v_madmk/v_madak/v_fmamk/v_fmaak always carry a trailing 32-bit K constant.
+            let op = (w >> 25) & 0x3f;
+            (1, (w & 0x1ff) == 255 || matches!(op, 0x20 | 0x21 | 0x2c | 0x2d))
+        }
         Enc::Vop1 => (1, (w & 0x1ff) == 255),
         Enc::Vopc => (1, (w & 0x1ff) == 255),
         // VOP3/VOP3P: 2 dwords.
-        Enc::Vop3 => (2, false),
+        Enc::Vop3 => {
+            // GFX10 allows a trailing 32-bit literal on VOP3 when any source == 255.
+            let d1 = next.unwrap_or(0);
+            let any_lit = (d1 & 0x1ff) == 255 || ((d1 >> 9) & 0x1ff) == 255 || ((d1 >> 18) & 0x1ff) == 255;
+            (2, any_lit)
+        }
         Enc::Vinterp => (1, false),
         // Memory / DS / FLAT / MIMG / MUBUF / MTBUF: 2 dwords.
-        Enc::Ds | Enc::Mubuf | Enc::Mtbuf | Enc::Mimg | Enc::Flat => (2, false),
+        Enc::Ds | Enc::Mubuf | Enc::Mtbuf | Enc::Flat => (2, false),
+        // MIMG: 2 dwords + NSA extra address dwords (bits [2:1]).
+        Enc::Mimg => (2 + ((w >> 1) & 3) as usize, false),
         // Export: 2 dwords.
         Enc::Exp => (2, false),
         Enc::Unknown => (1, false),
@@ -363,7 +408,9 @@ fn opcode_field(enc: Enc, w: u32) -> u32 {
         Enc::Vop2 => (w >> 25) & 0x3f,
         Enc::Vop1 => (w >> 9) & 0xff,
         Enc::Vopc => (w >> 17) & 0xff,
-        Enc::Vop3 => w & 0x3ff,
+        Enc::Vop3 => (w >> 16) & 0x3ff,
+        Enc::Mimg => ((w >> 18) & 0x7f) | ((w & 1) << 7),
+        Enc::Mubuf => (w >> 18) & 0xff,
         Enc::Vinterp => (w >> 16) & 0x3,
         _ => (w >> 18) & 0xff,
     }
@@ -372,37 +419,7 @@ fn opcode_field(enc: Enc, w: u32) -> u32 {
 /// Known mnemonics for the opcodes we rely on (control flow + common scalar). The rest are
 /// tagged by family+opcode so the output is honest about what is and isn't yet named.
 fn mnemonic_for(enc: Enc, op: u32) -> String {
-    let named = match enc {
-        Enc::Sopp => match op {
-            0x00 => Some("s_nop"),
-            0x01 => Some("s_endpgm"),
-            0x02 => Some("s_branch"),
-            0x04 => Some("s_cbranch_scc0"),
-            0x05 => Some("s_cbranch_scc1"),
-            0x06 => Some("s_cbranch_vccz"),
-            0x07 => Some("s_cbranch_vccnz"),
-            0x08 => Some("s_cbranch_execz"),
-            0x09 => Some("s_cbranch_execnz"),
-            0x0c => Some("s_waitcnt"),
-            0x1f => Some("s_code_end"),
-            _ => None,
-        },
-        Enc::Sop1 => match op {
-            0x03 => Some("s_mov_b32"),
-            0x04 => Some("s_mov_b64"),
-            _ => None,
-        },
-        Enc::Smem => match op {
-            0x00 => Some("s_load_dword"),
-            0x01 => Some("s_load_dwordx2"),
-            0x02 => Some("s_load_dwordx4"),
-            0x03 => Some("s_load_dwordx8"),
-            _ => None,
-        },
-        Enc::Exp => Some("exp"),
-        _ => None,
-    };
-    match named {
+    match mnem::lookup(enc, op) {
         Some(s) => s.to_string(),
         None => format!("{:?}<{:#x}>", enc, op).to_lowercase(),
     }

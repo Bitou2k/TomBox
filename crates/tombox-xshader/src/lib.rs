@@ -13,6 +13,8 @@
 //! `docs/FORTNITE_ANALYSIS.md`. Field offsets inferred empirically are validated against
 //! RDNA2 markers before use, so a wrong guess fails loudly rather than yielding garbage.
 
+pub mod hlsl;
+pub mod meta;
 pub mod rdna2;
 
 /// Little-endian readers with explicit bounds checks.
@@ -123,6 +125,11 @@ pub struct ShaderExtract {
     pub has_output_sig: bool,
     pub has_psv0: bool,
     pub has_root_sig: bool,
+    /// Parsed D3D-side metadata (empty/None when the chunk is absent or malformed).
+    pub input_sig: Vec<meta::SigElement>,
+    pub output_sig: Vec<meta::SigElement>,
+    pub resources: Vec<meta::PsvResource>,
+    pub root_sig: Option<meta::RootSig>,
 }
 
 /// RDNA2 SOPP opcodes we key on to locate/validate the ISA.
@@ -164,6 +171,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     let fssm = find_and_inflate_fssm(xdat)?;
 
     let (isa, isa_off) = locate_isa(&fssm)?;
+    let chunk_body = |cc: &[u8; 4]| container.chunk(cc).map(|c| &dxbc[c.offset..c.offset + c.size]);
     let entry = find_entry_name(&fssm);
 
     Ok(ShaderExtract {
@@ -178,6 +186,10 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
         has_psv0: container.chunk(b"PSV0").is_some(),
         has_root_sig: container.chunk(b"RTS0").is_some(),
+        input_sig: chunk_body(b"ISG1").and_then(|b| meta::parse_signature(b).ok()).unwrap_or_default(),
+        output_sig: chunk_body(b"OSG1").and_then(|b| meta::parse_signature(b).ok()).unwrap_or_default(),
+        resources: chunk_body(b"PSV0").and_then(|b| meta::parse_psv0(b).ok()).unwrap_or_default(),
+        root_sig: chunk_body(b"RTS0").and_then(|b| meta::parse_rts0(b).ok()),
     })
 }
 

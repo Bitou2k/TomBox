@@ -502,38 +502,97 @@ unsafe extern "system" fn dev_stub() -> i32 {
     0x8000_4001u32 as i32 // E_NOTIMPL
 }
 
-/// Xbox graphics-PSO create (device slot 60). The Fortnite RHI calls this to build
-/// graphics pipelines. Dump the desc + shader bytecode magic (to learn if shaders are
-/// DXIL/DXBC — PC-compatible — or native), then forward to PC CreateGraphicsPipelineState
-/// (slot 10) assuming a PC-compatible D3D12_GRAPHICS_PIPELINE_STATE_DESC.
+/// Xbox graphics-PSO create (device slot 60).
+///
+/// The desc is layout-compatible with PC `D3D12_GRAPHICS_PIPELINE_STATE_DESC`, but the
+/// shaders are Xbox-native RDNA2 (XDAT/FSSM, DXIL stripped). Translate VS/PS to PC
+/// bytecode (see `shader_xlat`), patch a copy of the desc, and create a real PC PSO.
+/// If any stage cannot be translated the PSO honestly fails (no placeholder shaders).
+/// Signature (from the RHI call site at EXE+0xd5564c): `(this, pDesc, numExt, pExtDesc, riid, ppv)`
+/// — the Xbox variant carries an extra extension-struct array, which has no PC equivalent
+/// and is currently ignored (logged once).
 unsafe extern "system" fn create_gfx_pso_x(
-    this: *mut DeviceWrapper, pdesc: *const u8, riid: *const Guid, ppv: *mut *mut c_void,
+    this: *mut DeviceWrapper, pdesc: *const u8, _num_ext: u32, _pext: *const u8,
+    riid: *const Guid, ppv: *mut *mut c_void,
 ) -> i32 {
-    let real = unsafe { (*this).real };
+    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+    const DESC_SIZE: usize = 0x290;
     static OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     static FAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
-        unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
-    let hr = unsafe { f(real, pdesc, riid, ppv) };
-    if hr == 0 {
-        OK.fetch_add(1, Ordering::Relaxed);
-    } else {
-        let fc = FAIL.fetch_add(1, Ordering::Relaxed);
-        // The Fortnite XSX shaders ship as Xbox-native "XDAT" blobs inside the DXIL
-        // container with the portable LLVM bitcode stripped ("NOBC") — see
-        // docs/FORTNITE_ANALYSIS.md. The PC runtime cannot build a PSO from them, so
-        // every forward returns E_OUTOFMEMORY. Rendering the real game needs an
-        // XDAT -> DXIL/SPIR-V shader translator (not yet built); until then PSO
-        // creation legitimately fails. Log the first couple for visibility.
-        if fc < 2 {
-            record("d3d12_xs", "CreateGraphicsPSO_X",
-                &format!("FAIL hr={hr:#010x} (Xbox-native XDAT shader, portable bytecode stripped — translator pending)"));
+    static XFAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let real = unsafe { (*this).real };
+    if pdesc.is_null() {
+        return E_FAIL;
+    }
+    let mut desc = unsafe { core::slice::from_raw_parts(pdesc, DESC_SIZE).to_vec() };
+    let rd = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    // Keep translated bytecode alive until the PSO is created.
+    let mut keep: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
+    let mut failure: Option<String> = None;
+    for (stage, off) in [("VS", 0x08usize), ("PS", 0x18), ("DS", 0x28), ("HS", 0x38), ("GS", 0x48)] {
+        let (p, n) = (rd(&desc, off) as *const u8, rd(&desc, off + 8) as usize);
+        if p.is_null() || n == 0 {
+            continue;
+        }
+        match unsafe { crate::shader_xlat::translate(p, n) } {
+            Ok(code) => {
+                desc[off..off + 8].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+                desc[off + 8..off + 16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+                keep.push(code);
+            }
+            Err(e) => {
+                failure = Some(format!("{stage}: {}", e.lines().next().unwrap_or("")));
+                break;
+            }
         }
     }
+    let hr = if let Some(why) = failure {
+        let n = XFAIL.fetch_add(1, Ordering::Relaxed);
+        if n < 6 {
+            record("d3d12_xs", "CreateGraphicsPSO_X", &format!("untranslatable shader -> E_FAIL ({why})"));
+        }
+        E_FAIL
+    } else {
+        static DUMP1: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if DUMP1.fetch_add(1, Ordering::Relaxed) < 2 {
+            let ptr = rd(&desc, 0x228) as *const u8;
+            let n = (u32::from_le_bytes(desc[0x230..0x234].try_into().unwrap()) as usize).min(8);
+            let mut s = format!("inputLayout ptr={ptr:p} n={n} rootSig={:#x} riid={:p}", rd(&desc, 0), riid);
+            if !ptr.is_null() {
+                let raw = unsafe { core::slice::from_raw_parts(ptr, n * 40) };
+                for (i, c) in raw.chunks(8).enumerate() {
+                    if i % 5 == 0 { s.push_str("\n   "); }
+                    s.push_str(&format!(" {:016x}", u64::from_le_bytes(c.try_into().unwrap())));
+                }
+            }
+            record("d3d12_xs", "CreateGraphicsPSO_X", &s);
+        }
+        let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
+            unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
+        let hr = unsafe { f(real, desc.as_ptr(), riid, ppv) };
+        if hr == 0 {
+            let n = OK.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 5 {
+                record("d3d12_xs", "CreateGraphicsPSO_X", &format!("PSO #{n} created from translated shaders"));
+            }
+        } else {
+            let n = FAIL.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                let u32at = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+                record("d3d12_xs", "CreateGraphicsPSO_X", &format!(
+                    "real CreateGraphicsPipelineState FAILED hr={hr:#010x} (translated shaders ok) topo={} numRT={} rtv0={} dsv={} samples={} inputElems={}",
+                    u32at(0x23c), u32at(0x240), u32at(0x244), u32at(0x264), u32at(0x268), u32at(0x230)));
+            }
+        }
+        hr
+    };
+    drop(keep);
     static LOGN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    if LOGN.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
-        record("d3d12_xs", "CreateGraphicsPSO_X",
-            &format!("counts: ok={} fail={}", OK.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)));
+    if LOGN.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
+        let (sok, sfail) = crate::shader_xlat::counts();
+        record("d3d12_xs", "CreateGraphicsPSO_X", &format!(
+            "counts: pso_ok={} pso_fail={} untranslatable={} | shaders ok={sok} fail={sfail}",
+            OK.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed), XFAIL.load(Ordering::Relaxed)));
     }
     hr
 }

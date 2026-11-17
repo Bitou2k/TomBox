@@ -16,11 +16,13 @@ fn main() -> ExitCode {
     let path = &args[1];
     let mut isa_out = None;
     let mut fssm_out = None;
+    let mut hlsl_out: Option<String> = None;
     let mut i = 2;
     while i + 1 < args.len() {
         match args[i].as_str() {
             "--isa-out" => isa_out = Some(args[i + 1].clone()),
             "--fssm-out" => fssm_out = Some(args[i + 1].clone()),
+            "--hlsl-out" => hlsl_out = Some(args[i + 1].clone()),
             other => eprintln!("warning: ignoring unknown arg {other}"),
         }
         i += 2;
@@ -72,6 +74,20 @@ fn main() -> ExitCode {
     );
 
     // Structured RDNA2 decode (length-accurate), self-validated by landing on s_endpgm.
+    for (tag, sig) in [("in ", &ex.input_sig), ("out", &ex.output_sig)] {
+        for e in sig.iter() {
+            println!("  sig {tag}: {}{} reg={} mask={:#06b} sysval={} type={}", e.name, e.index, e.register, e.mask, e.sysval, e.comp_type);
+        }
+    }
+    for r in &ex.resources {
+        println!("  psv0 resource: type={} space={} reg={}..{}", r.res_type, r.space, r.lower, r.upper);
+    }
+    if let Some(rs) = &ex.root_sig {
+        println!("  rootsig v{} flags={:#x} staticSamplers={}", rs.version, rs.flags, rs.num_static_samplers);
+        for (i, p) in rs.params.iter().enumerate() {
+            println!("    param[{i}] vis={} {:?}", p.visibility, p.kind);
+        }
+    }
     println!("--- RDNA2 disassembly ---");
     let insns = tombox_xshader::rdna2::disassemble(&ex.isa);
     let mut consumed = 0usize;
@@ -133,6 +149,21 @@ fn main() -> ExitCode {
             eprintln!("cannot write {f}: {e}");
         } else {
             println!("wrote FSSM -> {f}");
+        }
+    }
+    if let Some(f) = hlsl_out {
+        match tombox_xshader::hlsl::translate(&ex) {
+            Ok(t) => {
+                if let Err(e) = std::fs::write(&f, &t.hlsl) {
+                    eprintln!("cannot write {f}: {e}");
+                    return ExitCode::FAILURE;
+                }
+                println!("wrote HLSL ({}) -> {f}", t.profile);
+            }
+            Err(e) => {
+                eprintln!("translate failed: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
     ExitCode::SUCCESS
