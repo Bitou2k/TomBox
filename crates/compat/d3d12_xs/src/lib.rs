@@ -16,6 +16,7 @@ mod dxgi_device;
 mod heap_wrap;
 mod cmdlist_wrap;
 mod shader_xlat;
+mod present;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};

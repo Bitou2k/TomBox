@@ -204,6 +204,10 @@ unsafe extern "system" fn create_command_queue_x(
     let hr = unsafe { f(real, pc_desc.as_ptr() as *const c_void, riid, ppv) };
     let qtype = u32::from_le_bytes([pc_desc[0], pc_desc[1], pc_desc[2], pc_desc[3]]);
     let qflags = u32::from_le_bytes([pc_desc[8], pc_desc[9], pc_desc[10], pc_desc[11]]);
+    if hr == 0 && !ppv.is_null() {
+        // Give the queue an Xbox-sized vtable (PresentX at slot 30, other extensions no-op).
+        crate::present::apply_queue_vtable(unsafe { *ppv });
+    }
     record("d3d12_xs", "CreateCommandQueueX", &format!("type={qtype} flags={qflags} -> hr={hr:#010x}"));
     hr
 }
@@ -759,6 +763,7 @@ fn vtable() -> *const usize {
         v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
         v[55] = create_derived_pso_x as usize; // Xbox derived-PSO create (base PSO + state patches)
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
+        v[8] = create_command_queue_x as usize; // PC-slot CreateCommandQueue: same desc; needs the Xbox-sized queue vtable too
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
         v[25] = get_resource_alloc_info as usize; // GetResourceAllocationInfo (null-safe)
         v[17] = create_cbv as usize; // CreateConstantBufferView (256-align size)
