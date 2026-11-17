@@ -156,6 +156,7 @@ struct Emitter<'a> {
     uav: BTreeMap<u32, u32>,       // slot -> dim
     sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
+    tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     is_cs: bool,
     is_gs: bool,
     /// Registers read before written (entry ABI), from `live_in`.
@@ -190,6 +191,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         uav: BTreeMap::new(),
         sbuf: BTreeMap::new(),
         tbuf: BTreeSet::new(),
+        tbuf_uint: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
         is_gs: ex.stage == Stage::Geometry,
         live: Vec::new(),
@@ -324,6 +326,28 @@ impl<'a> Emitter<'a> {
                         }
                         other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
                     };
+                    if ins.mnemonic.contains("_atomic_") {
+                        if !is_uav {
+                            return Err(format!("mubuf at {:#x}: atomic on a non-UAV buffer", ins.offset));
+                        }
+                        // PSV0 tells typed (6) from structured (8) UAVs. Atomics need a uint
+                        // element, so a typed UAV used atomically is declared RWBuffer<uint>.
+                        let structured = self
+                            .ex
+                            .resources
+                            .iter()
+                            .any(|p| p.res_type == 8 && p.lower <= slot && slot <= p.upper);
+                        if structured {
+                            let e = self.sbuf.entry((true, slot)).or_insert(0);
+                            *e = (*e).max(ins.aux.imm as u32 / 4 + 1);
+                            self.res.insert(idx, vec![Res::Buf(slot, true)]);
+                        } else {
+                            self.tbuf.insert((true, slot));
+                            self.tbuf_uint.insert(slot);
+                            self.res.insert(idx, vec![Res::TBuf(slot, true)]);
+                        }
+                        continue;
+                    }
                     if ins.mnemonic.contains("_format_") {
                         // Typed buffer (Buffer<T> / RWBuffer<T>), addressed by element index.
                         self.tbuf.insert((is_uav, slot));
@@ -1236,6 +1260,63 @@ impl<'a> Emitter<'a> {
             }
             return Ok(());
         }
+        if ins.mnemonic.contains("_atomic_") {
+            // Buffer atomics → HLSL Interlocked* on the UAV element. With GLC set the
+            // pre-operation value is returned in vdata.
+            let (offen, idxen, glc) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0, ins.aux.mask & 4 != 0);
+            if offen || !idxen || !matches!(ins.src[2], Opnd::ConstInt(0)) {
+                return Err("atomic MUBUF addressing unsupported".into());
+            }
+            let index = r(&ins.src[0])?;
+            let target = match self.res.get(&idx).and_then(|v| v.first()).copied() {
+                Some(Res::TBuf(slot, true)) if ins.aux.imm == 0 => format!("utb{slot}[{index}]"),
+                Some(Res::Buf(slot, true)) => format!("ubuf{slot}[{index}].w[{}]", ins.aux.imm as u32 / 4),
+                _ => return Err("unresolved atomic target".into()),
+            };
+            let vdata = ins.dst[0];
+            let val = r(&vdata)?;
+            let (func, arg) = match ins.mnemonic.as_str() {
+                "buffer_atomic_add" => ("InterlockedAdd", val),
+                "buffer_atomic_sub" => ("InterlockedAdd", format!("(0u - {val})")),
+                "buffer_atomic_inc" => ("InterlockedAdd", "1u".to_string()),
+                "buffer_atomic_dec" => ("InterlockedAdd", "0xffffffffu".to_string()),
+                "buffer_atomic_umin" => ("InterlockedMin", val),
+                "buffer_atomic_umax" => ("InterlockedMax", val),
+                "buffer_atomic_and" => ("InterlockedAnd", val),
+                "buffer_atomic_or" => ("InterlockedOr", val),
+                "buffer_atomic_xor" => ("InterlockedXor", val),
+                "buffer_atomic_swap" => ("InterlockedExchange", val),
+                other => return Err(format!("{other} unsupported")),
+            };
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ {func}({target}, {arg}, t{t}); }}"));
+            if glc {
+                self.wv(&vdata, &format!("t{t}"))?;
+            }
+            return Ok(());
+        }
+        if let Some(Res::TBuf(slot, true)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
+            if self.tbuf_uint.contains(&slot) {
+                // uint-typed UAV (see atomics): single-component raw loads/stores.
+                let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
+                if offen || !idxen || ins.aux.imm != 0 || !ins.mnemonic.ends_with("_format_x") {
+                    return Err("uint typed-buffer MUBUF form unsupported".into());
+                }
+                let index = r(&ins.src[0])?;
+                let vd = ins.dst[0];
+                if ins.mnemonic.starts_with("buffer_store") {
+                    self.touch(&vd);
+                    self.line(&format!("if (exec_lo & 1u) utb{slot}[{index}] = {};", r(&vd)?));
+                } else {
+                    let t = self.tmp;
+                    self.tmp += 1;
+                    self.line(&format!("uint t{t} = utb{slot}[{index}];"));
+                    self.wv(&vd, &format!("t{t}"))?;
+                }
+                return Ok(());
+            }
+        }
         if let Some(Res::TBuf(slot, is_uav)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
             // Typed buffer. The element type is declared float4: the view format is not
             // visible in the shader, so integer-format buffers are a known gap (TECHNICAL_DEBT).
@@ -1701,7 +1782,9 @@ impl<'a> Emitter<'a> {
 {ty}<TbElem_{nm}{slot}> {nm}{slot} : register({reg}{slot});", (*dwords).max(1));
         }
         for (is_uav, slot) in &self.tbuf {
-            let _ = if *is_uav {
+            let _ = if *is_uav && self.tbuf_uint.contains(slot) {
+                writeln!(h, "RWBuffer<uint> utb{slot} : register(u{slot});")
+            } else if *is_uav {
                 writeln!(h, "RWBuffer<float4> utb{slot} : register(u{slot});")
             } else {
                 writeln!(h, "Buffer<float4> stb{slot} : register(t{slot});")
