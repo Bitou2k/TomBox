@@ -1910,7 +1910,7 @@ impl<'a> Emitter<'a> {
             // Typed buffer. The element type is declared float4: the view format is not
             // visible in the shader, so integer-format buffers are a known gap (TECHNICAL_DEBT).
             let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-            if offen || !idxen || ins.aux.imm != 0 || !matches!(ins.src[2], Opnd::ConstInt(0)) {
+            if offen || ins.aux.imm != 0 || !matches!(ins.src[2], Opnd::ConstInt(0)) {
                 return Err("typed-buffer MUBUF with offset addressing unsupported".into());
             }
             let n = match ins.mnemonic.rsplit('_').next() {
@@ -1920,7 +1920,8 @@ impl<'a> Emitter<'a> {
                 Some("xyzw") => 4,
                 _ => return Err("unsupported typed-buffer op".into()),
             };
-            let index = r(&ins.src[0])?;
+            // Without IDXEN (and with no offset) the access addresses element 0.
+            let index = if idxen { r(&ins.src[0])? } else { "0u".to_string() };
             let vd = match ins.dst[0] {
                 Opnd::Vgpr(v) => v,
                 _ => return Err("bad vdata".into()),
