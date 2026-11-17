@@ -169,6 +169,41 @@ unsafe extern "system" fn create_descriptor_heap(
     hr
 }
 
+/// Intercept the Xbox extension `CreateCommandQueueX` (slot 48) and translate to
+/// the real PC `CreateCommandQueue` (slot 8). The Xbox
+/// `D3D12XBOX_COMMAND_QUEUE_DESC` extends the PC `D3D12_COMMAND_QUEUE_DESC`; the
+/// first 16 bytes ({Type, Priority, Flags, NodeMask}) are layout-compatible.
+unsafe extern "system" fn create_command_queue_x(
+    this: *mut DeviceWrapper, pdescx: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    let mut pc_desc = [0u8; 16];
+    if !pdescx.is_null() {
+        unsafe { core::ptr::copy_nonoverlapping(pdescx as *const u8, pc_desc.as_mut_ptr(), 16) };
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(8)) }; // PC CreateCommandQueue
+    let hr = unsafe { f(real, pc_desc.as_ptr() as *const c_void, riid, ppv) };
+    let qtype = u32::from_le_bytes([pc_desc[0], pc_desc[1], pc_desc[2], pc_desc[3]]);
+    let qflags = u32::from_le_bytes([pc_desc[8], pc_desc[9], pc_desc[10], pc_desc[11]]);
+    record("d3d12_xs", "CreateCommandQueueX", &format!("type={qtype} flags={qflags} -> hr={hr:#010x}"));
+    hr
+}
+
+/// Xbox slot 73 = `CreateCommandList` (standard signature, relocated in the Xbox
+/// vtable) -> PC `CreateCommandList` (slot 12).
+unsafe extern "system" fn create_command_list_x(
+    this: *mut DeviceWrapper, node_mask: u32, list_type: u32, alloc: *mut c_void,
+    init_state: *mut c_void, riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
+    let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, riid, ppv) };
+    record("d3d12_xs", "CreateCommandList", &format!("type={list_type} -> hr={hr:#010x}"));
+    hr
+}
+
 // Forwarding thunk: this(rcx) -> this->real; jmp real->vtbl[slot].
 macro_rules! fwd {
     ($name:ident, $slot:expr) => {
@@ -193,16 +228,19 @@ fwd!(f21, 21); fwd!(f22, 22); fwd!(f23, 23); fwd!(f24, 24); fwd!(f25, 25); fwd!(
 fwd!(f27, 27); fwd!(f28, 28); fwd!(f29, 29); fwd!(f30, 30); fwd!(f31, 31); fwd!(f32, 32);
 fwd!(f33, 33); fwd!(f34, 34); fwd!(f35, 35); fwd!(f36, 36); fwd!(f37, 37); fwd!(f38, 38);
 fwd!(f39, 39); fwd!(f40, 40); fwd!(f41, 41); fwd!(f42, 42); fwd!(f43, 43);
-fwd!(f44, 44); fwd!(f45, 45); fwd!(f46, 46); fwd!(f47, 47); fwd!(f48, 48); fwd!(f49, 49);
-fwd!(f50, 50); fwd!(f51, 51); fwd!(f52, 52); fwd!(f53, 53); fwd!(f54, 54); fwd!(f55, 55);
-fwd!(f56, 56); fwd!(f57, 57); fwd!(f58, 58); fwd!(f59, 59); fwd!(f60, 60); fwd!(f61, 61);
-fwd!(f62, 62); fwd!(f63, 63); fwd!(f64, 64); fwd!(f65, 65); fwd!(f66, 66); fwd!(f67, 67);
-fwd!(f68, 68); fwd!(f69, 69);
+// Slots 44+ are Xbox-specific device extensions (NOT PC ID3D12Device1-8), so they
+// are NOT forwarded by slot number. Unrecognized ones get this fail-loud stub
+// (returns E_NOTIMPL) so the game fails that call cleanly and names it in its log,
+// instead of reading past the vtable and crashing. Recognized Xbox methods are
+// intercepted individually (e.g. slot 48 = CreateCommandQueueX).
+unsafe extern "system" fn dev_stub() -> i32 {
+    0x8000_4001u32 as i32 // E_NOTIMPL
+}
 
 fn vtable() -> *const usize {
     static VT: OnceLock<usize> = OnceLock::new();
     *VT.get_or_init(|| {
-        let v: Vec<usize> = vec![
+        let mut v: Vec<usize> = vec![
             qi as usize, addref as usize, release as usize,
             f3 as usize, f4 as usize, f5 as usize, f6 as usize, f7 as usize, f8 as usize,
             f9 as usize, f10 as usize, f11 as usize, f12 as usize,
@@ -213,12 +251,16 @@ fn vtable() -> *const usize {
             f27 as usize, f28 as usize, f29 as usize, f30 as usize, f31 as usize, f32 as usize,
             f33 as usize, f34 as usize, f35 as usize, f36 as usize, f37 as usize, f38 as usize,
             f39 as usize, f40 as usize, f41 as usize, f42 as usize, f43 as usize,
-            f44 as usize, f45 as usize, f46 as usize, f47 as usize, f48 as usize, f49 as usize,
-            f50 as usize, f51 as usize, f52 as usize, f53 as usize, f54 as usize, f55 as usize,
-            f56 as usize, f57 as usize, f58 as usize, f59 as usize, f60 as usize, f61 as usize,
-            f62 as usize, f63 as usize, f64 as usize, f65 as usize, f66 as usize, f67 as usize,
-            f68 as usize, f69 as usize,
         ];
+        // 44..160: Xbox-extension slots — fail-loud stub unless intercepted below.
+        while v.len() < 160 {
+            v.push(dev_stub as usize);
+        }
+        v[48] = create_command_queue_x as usize; // CreateCommandQueueX (verified)
+        // Slot 73 is an Xbox command-list create whose exact signature differs from
+        // PC CreateCommandList (needs the GDK d3d12_x headers); left as fail-loud
+        // stub until its ABI is reversed. (create_command_list_x kept for reference.)
+        let _ = create_command_list_x;
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     }) as *const usize
 }

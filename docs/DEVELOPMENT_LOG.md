@@ -250,3 +250,32 @@ hardware/semantics-divergent surface needs real translation.
 - [x] 12 Actual Fortnite reaches meaningful initialization — ACHIEVED (full UE init).
 - [~] 11 Graphics device initialized — device CREATED; post-device RHI setup pending
   the D3D12.x wrapper.
+
+## 2026-11-16 — Session 2 cont.: real GPU driven; D3D12.x translation layer underway
+
+### The real binary drives our RTX 5060 Ti through D3D12 setup
+FortniteClient-XSX runs its full engine and now performs real GPU work via a
+D3D12.x -> PC D3D12 translation layer (crates/compat/d3d12_xs):
+- Device wrapper (COM): QI returns self for ID3D12Device..Device8 and synthesizes
+  the Xbox "DXGIDevice" (GetAdapter -> real PC IDXGIAdapter -> game reads RTX 5060 Ti,
+  7891MB VRAM). 160-slot vtable: 0-43 forward via naked thunks; 44+ are Xbox
+  extensions -> fail-loud E_NOTIMPL stub unless intercepted.
+- Verified translations: CheckFeatureSupport (Xbox 64B vs PC 60B struct-size
+  negotiation), CreateDescriptorHeap (wraps heap), CreateCommandQueueX slot 48
+  (Xbox desc -> PC CreateCommandQueue, created a real compute queue hr=S_OK).
+- Heap wrapper: fixes the Xbox(RAX)-vs-PC(sret `fn(this,Handle* retval)`) return
+  convention for GetCPU/GPUDescriptorHandleForHeapStart.
+
+### Current frontier: Xbox D3D12.x method signatures
+Next blocker is the Xbox command-list create (device vtable slot 73): standard PC
+CreateCommandList signature does NOT match (args mismapped -> E_INVALIDARG), so the
+Xbox vtable relocates/extends methods and some take Xbox-specific signatures.
+Resolving each needs the GDK d3d12_x headers or per-method RE. The remaining
+graphics path (command lists, resource creation, PSOs/shaders, swapchain/present)
+is a methodical per-method translation grind — the technique is proven; the volume
+is large.
+
+### Milestones
+- [x] 12 meaningful initialization — done (full UE init + GPU device + queues).
+- [~] 11 graphics device + required features — device/caps/heaps/queues done;
+  command lists onward pending D3D12.x ABI reversing.
