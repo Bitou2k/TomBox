@@ -60,6 +60,33 @@ extern "system" {
     fn GetClientRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
     fn GetWindow(h: *mut c_void, cmd: u32) -> *mut c_void;
     fn GetClassNameW(h: *mut c_void, buf: *mut u16, n: i32) -> i32;
+    fn GetWindowLongW(h: *mut c_void, idx: i32) -> i32;
+    fn AdjustWindowRectEx(r: *mut [i32; 4], style: u32, menu: i32, ex: u32) -> i32;
+    fn SetWindowPos(h: *mut c_void, after: *mut c_void, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+    fn GetSystemMetrics(i: i32) -> i32;
+}
+
+/// Give the title's window a client area with the back buffer's aspect ratio (the swap
+/// chain stretches the back buffer to the client area, so any other shape distorts the
+/// image). Picks the largest standard size that fits on the primary screen.
+unsafe fn fit_window_to_aspect(hwnd: usize, bb_w: u64, bb_h: u32) -> (i32, i32) {
+    let (sw, sh) = (GetSystemMetrics(0), GetSystemMetrics(1));
+    let mut cw = 1280i32;
+    for w in [3840i32, 2560, 1920, 1600, 1280] {
+        let h = (w as u64 * bb_h as u64 / bb_w) as i32;
+        if w <= sw - 40 && h <= sh - 120 {
+            cw = w;
+            break;
+        }
+    }
+    let ch = (cw as u64 * bb_h as u64 / bb_w) as i32;
+    let (style, ex) = (GetWindowLongW(hwnd as *mut c_void, -16) as u32, GetWindowLongW(hwnd as *mut c_void, -20) as u32);
+    let mut r = [0, 0, cw, ch];
+    AdjustWindowRectEx(&mut r, style, 0, ex);
+    // SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS: the window belongs to another
+    // thread of the title; never block the presenting thread on it.
+    SetWindowPos(hwnd as *mut c_void, core::ptr::null_mut(), 40, 40, r[2] - r[0], r[3] - r[1], 0x0004 | 0x0010 | 0x4000);
+    (cw, ch)
 }
 extern "system" {
     fn GetCurrentProcessId() -> u32;
@@ -221,9 +248,7 @@ unsafe fn init(queue: *mut c_void, src: *mut c_void) -> Result<State, String> {
     let own = std::env::var("TOMBOX_OWN_WINDOW").map(|v| v == "1").unwrap_or(false);
     let mut hwnd = if own { 0 } else { find_title_window() };
     if hwnd != 0 {
-        let mut r = [0i32; 4];
-        GetClientRect(hwnd as *mut c_void, &mut r);
-        (cw, ch) = (r[2], r[3]);
+        (cw, ch) = fit_window_to_aspect(hwnd, width, height);
         let mut cls = [0u16; 128];
         let n = GetClassNameW(hwnd as *mut c_void, cls.as_mut_ptr(), 128).max(0) as usize;
         record("d3d12_xs", "PresentX", &format!(
