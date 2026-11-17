@@ -1345,10 +1345,12 @@ impl<'a> Emitter<'a> {
             // Buffer atomics → HLSL Interlocked* on the UAV element. With GLC set the
             // pre-operation value is returned in vdata.
             let (offen, idxen, glc) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0, ins.aux.mask & 4 != 0);
-            if offen || !idxen || !matches!(ins.src[2], Opnd::ConstInt(0)) {
+            if offen || !matches!(ins.src[2], Opnd::ConstInt(0)) {
                 return Err("atomic MUBUF addressing unsupported".into());
             }
-            let index = r(&ins.src[0])?;
+            // Without IDXEN the address is just the immediate offset: element 0 (the usual
+            // wave-level counter allocation `InterlockedAdd(buf[0], n)`).
+            let index = if idxen { r(&ins.src[0])? } else { "0u".to_string() };
             let target = match self.res.get(&idx).and_then(|v| v.first()).copied() {
                 Some(Res::TBuf(slot, true)) if ins.aux.imm == 0 => format!("utb{slot}[{index}]"),
                 Some(Res::Buf(slot, true)) => format!("ubuf{slot}[{index}].w[{}]", ins.aux.imm as u32 / 4),
