@@ -26,10 +26,13 @@ pub struct Translated {
     pub profile: &'static str,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Sym {
     Table(u8),
     Desc { table: u8, off: u32, k: u32 },
+    /// A PC-relative pointer into the shader's own code section (`s_getpc_b64` + offsets),
+    /// used to read constant tables embedded after the program.
+    Code,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +44,7 @@ enum Res {
     Buf(u32, bool), // slot, is_uav (structured buffer)
     TBuf(u32, bool), // slot, is_uav (typed buffer)
     CbDyn(u32),      // constant buffer read through MUBUF (per-lane offset)
+    CodeTbl,         // s_load from the code section (embedded constant table)
 }
 
 const XYZW: [&str; 4] = ["x", "y", "z", "w"];
@@ -49,7 +53,7 @@ const XYZW: [&str; 4] = ["x", "y", "z", "w"];
 /// face-local S/T, face index 0..5 = +X,-X,+Y,-Y,+Z,-Z). Hardware cube sampling takes
 /// (s, t, face) with s,t = sc/|ma| + 1.5 (so each is in [1, 2]); `tb_cube_dir` inverts that
 /// to the direction vector HLSL TextureCube sampling expects.
-const CUBE_HELPERS: &str = r#"uint tb_bfe_i32(uint a, uint b) { uint o = b & 31u, w = (b >> 16) & 127u; if (w == 0u) return 0u; if (w + o >= 32u) return asuint(asint(a) >> o); return asuint(asint(a << (32u - w - o)) >> (32u - w)); }uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
+const CUBE_HELPERS: &str = r#"bool tb_cmp_class(uint b, uint mask) { uint e = (b >> 23) & 0xffu; uint m = b & 0x7fffffu; bool neg = (b >> 31) != 0u; uint c; if (e == 0xffu) { c = (m != 0u) ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (neg ? 2u : 9u); } else if (e == 0u) { c = (m == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u); } else { c = neg ? 3u : 8u; } return ((mask >> c) & 1u) != 0u; }uint tb_bfe_i32(uint a, uint b) { uint o = b & 31u, w = (b >> 16) & 127u; if (w == 0u) return 0u; if (w + o >= 32u) return asuint(asint(a) >> o); return asuint(asint(a << (32u - w - o)) >> (32u - w)); }uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
 uint tb_mulhi_i32(uint a, uint b) { uint h = tb_mulhi_u32(a, b); if (asint(a) < 0) h -= b; if (asint(b) < 0) h -= a; return h; }
 float tb_cubema(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return 2.0 * z; if (ay >= ax) return 2.0 * y; return 2.0 * x; }
 float tb_cubesc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? -x : x; if (ay >= ax) return x; return x < 0.0 ? z : -z; }
@@ -162,6 +166,8 @@ struct Emitter<'a> {
     is_gs: bool,
     /// Compute shader uses LDS (groupshared memory).
     uses_lds: bool,
+    /// Shader reads constant tables embedded in its code section.
+    uses_code: bool,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
     /// Pixel shader needs its position within the 2x2 quad (ds_swizzle).
@@ -199,6 +205,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         is_cs: ex.stage == Stage::Compute,
         is_gs: ex.stage == Stage::Geometry,
         uses_lds: false,
+        uses_code: false,
         live: Vec::new(),
         uses_quad: false,
         regs: BTreeSet::new(),
@@ -232,12 +239,130 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Linear symbolic pass: classify descriptor loads and bind them to HLSL registers.
+    /// Classify descriptor loads and bind them to HLSL registers.
+    ///
+    /// Code is not laid out in execution order (blocks are reached through backward
+    /// branches), so the symbolic SGPR state is computed as a forward dataflow fixpoint over
+    /// the control-flow graph: state = (known symbolic values, set of written SGPRs), join =
+    /// keep only values every predecessor agrees on / union of written sets. A final pass
+    /// then walks each block with its entry state and records the resources.
     fn resolve_resources(&mut self) -> Result<(), String> {
-        let mut sym: HashMap<u8, Sym> = HashMap::new();
-        let mut written: BTreeSet<u8> = BTreeSet::new();
+        type State = (HashMap<u8, Sym>, BTreeSet<u8>);
+        let n = self.insns.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+        // Block leaders and per-instruction branch targets.
+        let mut leaders: BTreeSet<usize> = BTreeSet::new();
+        leaders.insert(0);
+        let mut tgt: HashMap<usize, usize> = HashMap::new();
+        for (i, ins) in self.insns.iter().enumerate() {
+            if ins.enc != Enc::Sopp {
+                continue;
+            }
+            if Self::branch_cond(ins.op).is_some() {
+                let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
+                if let Some(&ti) = off2idx.get(&(t as usize)) {
+                    tgt.insert(i, ti);
+                    leaders.insert(ti);
+                }
+                leaders.insert(i + 1);
+            } else if ins.op == 1 {
+                leaders.insert(i + 1);
+            }
+        }
+        let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
+        let block_of = |i: usize| starts.partition_point(|&s| s <= i) - 1;
+        let ranges: Vec<std::ops::Range<usize>> =
+            (0..starts.len()).map(|b| starts[b]..starts.get(b + 1).copied().unwrap_or(n)).collect();
+        let succs: Vec<Vec<usize>> = ranges
+            .iter()
+            .map(|r| {
+                let last = r.end - 1;
+                let ins = &self.insns[last];
+                let mut v = Vec::new();
+                let is_sopp = ins.enc == Enc::Sopp;
+                if let Some(&t) = tgt.get(&last) {
+                    v.push(block_of(t));
+                }
+                let falls = !(is_sopp && (ins.op == 1 || ins.op == 2));
+                if falls && r.end < n {
+                    v.push(block_of(r.end));
+                }
+                v
+            })
+            .collect();
+
+        // Fixpoint (analysis only: recordings are rolled back afterwards).
+        let saved = (
+            self.res.clone(),
+            self.cb_size.clone(),
+            self.tex.clone(),
+            self.samp.clone(),
+            self.samp_cmp.clone(),
+            self.uav.clone(),
+            self.sbuf.clone(),
+            self.tbuf.clone(),
+            self.tbuf_uint.clone(),
+        );
+        let mut first_err: Option<String> = None;
+        let mut states: Vec<Option<State>> = vec![None; ranges.len()];
+        states[0] = Some((HashMap::new(), BTreeSet::new()));
+        let mut work = vec![0usize];
+        let mut budget = 20_000usize;
+        while let Some(b) = work.pop() {
+            if budget == 0 {
+                return Err("descriptor dataflow did not converge".into());
+            }
+            budget -= 1;
+            let (mut sym, mut written) = states[b].clone().unwrap();
+            if let Err(e) = self.res_block(&mut sym, &mut written, ranges[b].clone()) {
+                // Unknown effect: forget everything and treat every SGPR as written. Keep
+                // the first failure — it is the root cause if the recording pass fails too.
+                first_err.get_or_insert(e);
+                sym.clear();
+                written = (0u8..=105).collect();
+            }
+            for &s in &succs[b] {
+                let changed = match &mut states[s] {
+                    slot @ None => {
+                        *slot = Some((sym.clone(), written.clone()));
+                        true
+                    }
+                    Some((osym, owr)) => {
+                        let before = (osym.len(), owr.len());
+                        osym.retain(|k, v| sym.get(k) == Some(v));
+                        owr.extend(written.iter().copied());
+                        before != (osym.len(), owr.len())
+                    }
+                };
+                if changed && !work.contains(&s) {
+                    work.push(s);
+                }
+            }
+        }
+        (self.res, self.cb_size, self.tex, self.samp, self.samp_cmp, self.uav, self.sbuf, self.tbuf, self.tbuf_uint) = saved;
+
+        // Recording pass with the converged entry states.
+        for (b, r) in ranges.iter().enumerate() {
+            if let Some((mut sym, mut written)) = states[b].clone() {
+                self.res_block(&mut sym, &mut written, r.clone()).map_err(|e| first_err.clone().unwrap_or(e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Transfer function for one basic block (also records resources / reports errors).
+    fn res_block(
+        &mut self,
+        sym: &mut HashMap<u8, Sym>,
+        written: &mut BTreeSet<u8>,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), String> {
         let insns = self.insns.clone();
-        for (idx, ins) in insns.iter().enumerate() {
+        for idx in range {
+            let ins = &insns[idx];
             let sg = |o: &Opnd| if let Opnd::Sgpr(n) = o { Some(*n) } else { None };
             match ins.enc {
                 Enc::Sop1 if ins.mnemonic == "s_mov_b32" => {
@@ -260,6 +385,40 @@ impl<'a> Emitter<'a> {
                             }
                         }
                         written.insert(d);
+                    }
+                }
+                Enc::Sop1 if ins.mnemonic == "s_getpc_b64" => {
+                    if let Some(d) = ins.dst.first().and_then(sg) {
+                        sym.insert(d, Sym::Code);
+                        sym.remove(&(d + 1));
+                        written.insert(d);
+                        written.insert(d + 1);
+                    }
+                }
+                Enc::Sop2 if matches!(ins.mnemonic.as_str(), "s_add_u32" | "s_add_i32") => {
+                    // Pointer arithmetic keeps a code pointer a code pointer.
+                    let is_code = ins.src.iter().any(|o| sg(o).map(|s| sym.get(&s) == Some(&Sym::Code)).unwrap_or(false));
+                    if let Some(d) = ins.dst.first().and_then(sg) {
+                        if is_code {
+                            sym.insert(d, Sym::Code);
+                        } else {
+                            sym.remove(&d);
+                        }
+                        written.insert(d);
+                    }
+                }
+                Enc::Smem if ins.op <= 4 && ins.src.first().and_then(sg).map(|b| sym.get(&b) == Some(&Sym::Code)).unwrap_or(false) => {
+                    // Read from an embedded constant table.
+                    let n = 1u32 << ins.op;
+                    let d = ins.dst.first().and_then(sg).ok_or("s_load: bad dst")?;
+                    if (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d {
+                        return Err(format!("s_load at {:#x}: code-table read with dynamic soffset unsupported", ins.offset));
+                    }
+                    self.uses_code = true;
+                    self.res.insert(idx, vec![Res::CodeTbl]);
+                    for k in 0..n {
+                        sym.remove(&(d + k as u8));
+                        written.insert(d + k as u8);
                     }
                 }
                 Enc::Smem if ins.op <= 4 => {
@@ -717,8 +876,16 @@ impl<'a> Emitter<'a> {
             Enc::Sop2 => {
                 let d = d.ok_or("no dst")?;
                 let (a, b) = (r(&s[0])?, r(&s[1])?);
-                if m == "s_bfm_b64" || m == "s_cselect_b64" {
-                    let (lo, hi_e) = if m == "s_bfm_b64" {
+                if m == "s_bfm_b64" || m == "s_cselect_b64" || m == "s_lshl_b64" {
+                    let (lo, hi_e) = if m == "s_lshl_b64" {
+                        let ah = r(&hi(&s[0]))?;
+                        (
+                            format!("((({b} & 63u) >= 32u) ? 0u : ({a} << ({b} & 31u)))"),
+                            format!(
+                                "((({b} & 63u) == 0u) ? {ah} : ((({b} & 63u) >= 32u) ? ({a} << (({b} & 63u) - 32u)) : (({ah} << ({b} & 31u)) | ({a} >> (32u - ({b} & 31u))))))"
+                            ),
+                        )
+                    } else if m == "s_bfm_b64" {
                         // Bitfield mask ((1 << a) - 1) << b. Lane model keeps the low word;
                         // counts >= 32 saturate it.
                         (format!("((({a} & 63u) >= 32u ? 0xffffffffu : ((1u << ({a} & 31u)) - 1u)) << ({b} & 31u))"), "0u".to_string())
@@ -772,6 +939,8 @@ impl<'a> Emitter<'a> {
                 let e = match m {
                     "s_add_u32" | "s_add_i32" => format!("({a} + {b})"),
                     "s_sub_u32" | "s_sub_i32" => format!("({a} - {b})"),
+                    "s_addc_u32" => format!("({a} + {b} + (scc & 1u))"),
+                    "s_subb_u32" => format!("({a} - {b} - (scc & 1u))"),
                     "s_mul_i32" => format!("({a} * {b})"),
                     "s_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
                     "s_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),
@@ -794,6 +963,8 @@ impl<'a> Emitter<'a> {
                 };
                 let scc = match m {
                     "s_add_u32" => Some(format!("(({a} + {b}) < {a}) ? 1u : 0u")),
+                    "s_addc_u32" => Some(format!("((({a} + {b}) < {a}) || (({a} + {b} + (scc & 1u)) < ({a} + {b}))) ? 1u : 0u")),
+                    "s_subb_u32" => Some(format!("(({b} > {a}) || ((scc & 1u) > ({a} - {b}))) ? 1u : 0u")),
                     "s_sub_u32" => Some(format!("({b} > {a}) ? 1u : 0u")),
                     "s_lshl_b32" | "s_lshr_b32" | "s_ashr_i32" | "s_bfe_u32" => Some("__NZ__".into()),
                     _ => None,
@@ -851,6 +1022,13 @@ impl<'a> Emitter<'a> {
                         self.ws(&d, &format!("asuint(abs(asint({a})))"))?;
                         self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                         Ok(())
+                    }
+                    "s_getpc_b64" => {
+                        // Address of the next instruction, relative to the program start.
+                        self.ws(&d, &format!("{:#x}u", ins.offset as u32 + 4))?;
+                        let dh = hi(&d);
+                        self.touch(&dh);
+                        self.ws(&dh, "0u")
                     }
                     "s_swappc_b64" => {
                         // Vertex-fetch shader call: inputs are materialised from the D3D input layout.
@@ -929,6 +1107,28 @@ impl<'a> Emitter<'a> {
             }
             Enc::Smem => {
                 if ins.op <= 4 {
+                    if let Some(Res::CodeTbl) = self.res.get(&idx).and_then(|v| v.first()) {
+                        // Constant table embedded in the code section: byte address = pointer
+                        // (relative to the start of the program) + immediate.
+                        let n = 1u32 << ins.op;
+                        let base = match d.ok_or("no dst")? {
+                            Opnd::Sgpr(n) => n,
+                            _ => return Err("bad dst".into()),
+                        };
+                        let ndw = (self.ex.isa_data.len() / 4).max(1);
+                        let t = self.tmp;
+                        self.tmp += 1;
+                        self.line(&format!("uint t{t} = ({} + {:#x}u) >> 2;", r(&s[0])?, ins.aux.imm as u32));
+                        for k in 0..n {
+                            self.line(&format!("uint t{t}_{k} = tb_code[(t{t} + {k}u) % {ndw}u];"));
+                        }
+                        for k in 0..n {
+                            let dst = Opnd::Sgpr(base + k as u8);
+                            self.touch(&dst);
+                            self.ws(&dst, &format!("t{t}_{k}"))?;
+                        }
+                        return Ok(());
+                    }
                     self.line("// (descriptor fetch from root table — resolved statically)");
                     return Ok(());
                 }
@@ -1096,10 +1296,12 @@ impl<'a> Emitter<'a> {
         }
         // Compares (VOPC, and VOP3 with a scalar mask destination).
         if m.starts_with("v_cmp_") {
-            if m == "v_cmp_class_f32" {
-                return Err("v_cmp_class unsupported".into());
-            }
-            let c = Self::cmp_expr(&m, &s[0], &s[1])?;
+            let c = if m == "v_cmp_class_f32" {
+                // Floating-point class test against a 10-bit class mask (see tb_cmp_class).
+                format!("tb_cmp_class({}, {})", r(&s[0])?, r(&s[1])?)
+            } else {
+                Self::cmp_expr(&m, &s[0], &s[1])?
+            };
             self.ws(&d, &format!("(((exec_lo & 1u) != 0u) && {c}) ? 1u : 0u"))?;
             let dh = hi(&d);
             if !matches!(dh, Opnd::Null | Opnd::ConstInt(_)) {
@@ -1288,7 +1490,7 @@ impl<'a> Emitter<'a> {
             // nothing below it, so the count term is zero.
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => b,
             "v_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
-            "v_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),| "v_mul_lo_i32" => format!("({a} * {b})"),
+            "v_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),
             "v_mad_u32_u24" => format!("(({a} & 0xffffffu) * ({b} & 0xffffffu) + {c})"),
             "v_mad_i32_i24" => format!("asuint((asint({a} << 8) >> 8) * (asint({b} << 8) >> 8) + asint({c}))"),
             "v_bfe_u32" => format!("(({a} >> ({b} & 31u)) & ((1u << ({c} & 31u)) - 1u))"),
@@ -2042,6 +2244,16 @@ impl<'a> Emitter<'a> {
                 _ => return Err(format!("UAV dim {dim} unsupported")),
             };
             let _ = writeln!(h, "{ty} uav{slot} : register(u{slot});");
+        }
+        if self.uses_code {
+            // The program's code section (instructions + embedded constant tables), indexed
+            // by byte offset / 4 from the program start.
+            let words: Vec<String> = ex
+                .isa_data
+                .chunks_exact(4)
+                .map(|c| format!("{:#x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect();
+            let _ = writeln!(h, "static const uint tb_code[{}] = {{ {} }};", words.len().max(1), if words.is_empty() { "0".to_string() } else { words.join(", ") });
         }
         if self.is_cs && self.uses_lds {
             let _ = writeln!(h, "groupshared uint tb_lds[8192];");

@@ -122,6 +122,8 @@ pub struct ShaderExtract {
     pub isa_offset_in_fssm: usize,
     /// The 16-byte ISA-section preamble (compute: dwords 1..3 = thread-group size X,Y,Z).
     pub isa_preamble: [u32; 4],
+    /// The program followed by any constant data embedded after it in the code section.
+    pub isa_data: Vec<u8>,
     /// Presence of the standard signature/validation/root-sig chunks in the outer DXBC.
     pub has_input_sig: bool,
     pub has_output_sig: bool,
@@ -191,6 +193,18 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         }
     }
     let (fssm, isa, isa_off) = chosen.ok_or(last_err)?;
+    // Program plus any constant tables embedded after it (up to the s_code_end padding or
+    // the end of the ISA section): PC-relative `s_load`s read from here.
+    let isa_data = {
+        let sect_end = (u32_at(&fssm, 0xc0).unwrap_or(0) as usize + u32_at(&fssm, 0xc8).unwrap_or(0) as usize)
+            .min(fssm.len())
+            .max(isa_off + isa.len());
+        let mut end = isa_off + isa.len();
+        while end + 4 <= sect_end && u32_at(&fssm, end).unwrap_or(S_CODE_END) != S_CODE_END {
+            end += 4;
+        }
+        fssm[isa_off..end.min(fssm.len())].to_vec()
+    };
     let isa_preamble = {
         let mut p = [0u32; 4];
         if isa_off >= 16 {
@@ -211,6 +225,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         isa,
         isa_offset_in_fssm: isa_off,
         isa_preamble,
+        isa_data,
         fssm,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
         has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
