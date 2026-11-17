@@ -23,3 +23,7 @@ miniz_oxide = "0.8"
 [[bin]]
 name = "xpso"
 path = "src/bin/xpso.rs"
+
+[[bin]]
+name = "xpair"
+path = "src/bin/xpair.rs"

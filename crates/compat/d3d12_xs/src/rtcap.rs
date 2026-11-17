@@ -44,7 +44,9 @@ macro_rules! vcall {
 
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("TOMBOX_RTCAP").map(|v| v == "1").unwrap_or(false))
+    *E.get_or_init(|| {
+        std::env::var("TOMBOX_RTCAP").map(|v| v == "1").unwrap_or(false) || compat_common::cfg("rtcap").as_deref() == Some("1")
+    })
 }
 
 struct Target {

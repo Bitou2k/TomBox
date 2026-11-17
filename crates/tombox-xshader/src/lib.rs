@@ -17,6 +17,7 @@ pub mod hlsl;
 #[cfg(windows)]
 pub mod dxc;
 pub mod meta;
+pub mod uearchive;
 pub mod rdna2;
 
 /// Little-endian readers with explicit bounds checks.

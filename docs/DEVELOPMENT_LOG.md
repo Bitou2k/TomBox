@@ -707,3 +707,23 @@ Inferred, not documented (see code comments): DPP operand codes 233/250, SOP1 0x
 cache): in progress. Failures found so far and fixed: high half of a 64-bit scalar move not
 declared (3 shaders), position input needs centroid interpolation with conservative depth
 (3 shaders).
+
+## 2026-11-17 — PC 14.40 shader archives as a reference
+
+The owner supplied extracted PC shader archives (14.40, `PCD3D_SM5`; kept outside the repo).
+Format is the same `FSerializedShaderArchive` as the Xbox one: LZ4 entries, each =
+engine resource-table header + container + engine trailer. PC containers are plain SM5 DXBC
+(`ISGN OSGN SHEX`), i.e. fully documented bytecode; a few are DXIL (ray tracing).
+
+`xpair` (exploratory) measures pairing keys that both platforms carry:
+
+| key | Xbox entries with a PC candidate | unique candidate |
+|---|---|---|
+| stage + uniform-buffer layout hashes (in order) | 88,726 / 113,849 (77.9%) | 1,416 |
+| + input/output semantic names | 53,668 (47.1%) | 11,743 |
+| same, hashes sorted | 59,608 (52.4%) | 11,890 |
+
+Observed: layout hashes are identical across platforms (e.g. `View`); the Xbox compiler
+writes centroid inputs as `TEXCOORD10_centroid` index 0. Versions differ (14.40 vs 14.50), so
+a key match is a *candidate*, not proof that two shaders come from the same source.
+Not done yet: disambiguation, and comparison by execution.
