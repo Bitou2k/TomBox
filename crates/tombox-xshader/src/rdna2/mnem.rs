@@ -32,7 +32,7 @@ pub fn vop1(op: u32) -> Option<&'static str> {
         0x24 => "v_floor_f32", 0x25 => "v_exp_f32", 0x27 => "v_log_f32", 0x2a => "v_rcp_f32",
         0x2b => "v_rcp_iflag_f32", 0x2e => "v_rsq_f32", 0x33 => "v_sqrt_f32", 0x35 => "v_sin_f32",
         0x36 => "v_cos_f32", 0x37 => "v_not_b32", 0x38 => "v_bfrev_b32", 0x39 => "v_ffbh_u32",
-        0x3a => "v_ffbl_b32", 0x3b => "v_ffbh_i32",
+        0x3a => "v_ffbl_b32", 0x3b => "v_ffbh_i32", 0x65 => "v_swap_b32",
         _ => return None,
     })
 }

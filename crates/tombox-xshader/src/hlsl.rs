@@ -38,6 +38,7 @@ enum Res {
     Tex(u32, u32), // slot, dim
     Samp(u32),
     Uav(u32, u32), // slot, dim
+    Buf(u32, bool), // slot, is_uav (structured buffer)
 }
 
 const XYZW: [&str; 4] = ["x", "y", "z", "w"];
@@ -46,7 +47,9 @@ const XYZW: [&str; 4] = ["x", "y", "z", "w"];
 /// face-local S/T, face index 0..5 = +X,-X,+Y,-Y,+Z,-Z). Hardware cube sampling takes
 /// (s, t, face) with s,t = sc/|ma| + 1.5 (so each is in [1, 2]); `tb_cube_dir` inverts that
 /// to the direction vector HLSL TextureCube sampling expects.
-const CUBE_HELPERS: &str = r#"float tb_cubema(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return 2.0 * z; if (ay >= ax) return 2.0 * y; return 2.0 * x; }
+const CUBE_HELPERS: &str = r#"uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
+uint tb_mulhi_i32(uint a, uint b) { uint h = tb_mulhi_u32(a, b); if (asint(a) < 0) h -= b; if (asint(b) < 0) h -= a; return h; }
+float tb_cubema(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return 2.0 * z; if (ay >= ax) return 2.0 * y; return 2.0 * x; }
 float tb_cubesc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? -x : x; if (ay >= ax) return x; return x < 0.0 ? z : -z; }
 float tb_cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return -y; if (ay >= ax) return y < 0.0 ? -z : z; return -y; }
 float tb_cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? 5.0 : 4.0; if (ay >= ax) return y < 0.0 ? 3.0 : 2.0; return x < 0.0 ? 1.0 : 0.0; }
@@ -95,6 +98,11 @@ fn hi(o: &Opnd) -> Opnd {
     }
 }
 
+/// Name of the SGPR used as an SMEM dynamic offset (SOFFSET field).
+fn ssrc_name(code: u32) -> Result<String, String> {
+    if code <= 105 { Ok(format!("s{code}")) } else { Err(format!("unsupported SOFFSET register code {code}")) }
+}
+
 fn sig_type(e: &SigElement) -> (String, usize) {
     let comps = (8 - e.mask.leading_zeros() as usize).max(1);
     let base = match e.comp_type {
@@ -117,6 +125,7 @@ struct Emitter<'a> {
     tex: BTreeMap<u32, u32>,       // slot -> dim
     samp: BTreeSet<u32>,
     uav: BTreeMap<u32, u32>,       // slot -> dim
+    sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
     is_cs: bool,
     regs: BTreeSet<String>,
     body: String,
@@ -141,6 +150,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         tex: BTreeMap::new(),
         samp: BTreeSet::new(),
         uav: BTreeMap::new(),
+        sbuf: BTreeMap::new(),
         is_cs: ex.stage == Stage::Compute,
         regs: BTreeSet::new(),
         body: String::new(),
@@ -237,10 +247,10 @@ impl<'a> Emitter<'a> {
                             ))
                         }
                     };
-                    if (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d {
-                        return Err(format!("s_buffer_load at {:#x}: dynamic soffset unsupported", ins.offset));
-                    }
-                    let end = ins.aux.imm as u32 / 4 + n;
+                    // A dynamic SOFFSET register indexes the buffer at run time: size the
+                    // cbuffer declaration to the D3D12 maximum (64 KiB = 4096 vec4).
+                    let dynamic = (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d;
+                    let end = if dynamic { 4096 * 4 } else { ins.aux.imm as u32 / 4 + n };
                     let e = self.cb_size.entry(slot).or_insert(0);
                     *e = (*e).max(end);
                     self.res.insert(idx, vec![Res::Cb(slot)]);
@@ -248,6 +258,26 @@ impl<'a> Emitter<'a> {
                         sym.remove(&(d + k as u8));
                         written.insert(d + k as u8);
                     }
+                }
+                Enc::Mubuf => {
+                    let rs = ins.src.get(1).and_then(sg).ok_or("mubuf: bad srsrc")?;
+                    let (slot, table) = match sym.get(&rs) {
+                        Some(Sym::Desc { off, k: 0, table }) => (off / 32, *table),
+                        other => {
+                            return Err(format!("mubuf at {:#x}: s{rs} not a buffer descriptor ({other:?})", ins.offset))
+                        }
+                    };
+                    let is_uav = match self.table_kind(table) {
+                        Some(0) => false,
+                        Some(1) => true,
+                        other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
+                    };
+                    let ndw = Self::mubuf_dwords(&ins.mnemonic)
+                        .ok_or_else(|| format!("mubuf op {} unsupported", ins.mnemonic))?;
+                    let end = ins.aux.imm as u32 / 4 + ndw;
+                    let e = self.sbuf.entry((is_uav, slot)).or_insert(0);
+                    *e = (*e).max(end);
+                    self.res.insert(idx, vec![Res::Buf(slot, is_uav)]);
                 }
                 Enc::Mimg => {
                     let n = ins.src.len();
@@ -619,6 +649,8 @@ impl<'a> Emitter<'a> {
                     "s_add_u32" | "s_add_i32" => format!("({a} + {b})"),
                     "s_sub_u32" | "s_sub_i32" => format!("({a} - {b})"),
                     "s_mul_i32" => format!("({a} * {b})"),
+                    "s_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
+                    "s_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),
                     "s_lshl_b32" => format!("({a} << ({b} & 31u))"),
                     "s_lshr_b32" => format!("({a} >> ({b} & 31u))"),
                     "s_ashr_i32" => format!("asuint(asint({a}) >> ({b} & 31u))"),
@@ -770,6 +802,24 @@ impl<'a> Emitter<'a> {
                     Opnd::Sgpr(n) => n,
                     _ => return Err("bad dst".into()),
                 };
+                let soff = ins.raw.get(1).copied().unwrap_or(0) >> 25;
+                if soff != 0x7d {
+                    // Dynamic byte offset = imm + SGPR[soffset].
+                    let so = ssrc_name(soff)?;
+                    let t = self.tmp;
+                    self.tmp += 1;
+                    self.line(&format!("uint t{t} = ({:#x}u + {so}) >> 2;", ins.aux.imm as u32));
+                    // Read all words before writing (the offset register may be a destination).
+                    for k in 0..n {
+                        self.line(&format!("uint t{t}_{k} = cb{slot}[((t{t} + {k}u) >> 2) & 4095u][(t{t} + {k}u) & 3u];"));
+                    }
+                    for k in 0..n {
+                        let dst = Opnd::Sgpr(base + k as u8);
+                        self.touch(&dst);
+                        self.ws(&dst, &format!("t{t}_{k}"))?;
+                    }
+                    return Ok(());
+                }
                 let w0 = ins.aux.imm as u32 / 4;
                 for k in 0..n {
                     let w = w0 + k;
@@ -780,6 +830,7 @@ impl<'a> Emitter<'a> {
                 Ok(())
             }
             Enc::Mimg => self.emit_mimg(idx, ins),
+            Enc::Mubuf => self.emit_mubuf(idx, ins),
             Enc::Vinterp => {
                 if !is_ps {
                     return Err("v_interp outside a pixel shader".into());
@@ -824,6 +875,13 @@ impl<'a> Emitter<'a> {
                 self.touch(&dh);
                 self.ws(&dh, "0u")?;
             }
+            return Ok(());
+        }
+        if m == "v_swap_b32" {
+            let (x, y) = (name(&d)?, name(&s[0])?);
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("if (exec_lo & 1u) {{ uint t{t} = {x}; {x} = {y}; {y} = t{t}; }}"));
             return Ok(());
         }
         if m == "v_readfirstlane_b32" {
@@ -912,6 +970,8 @@ impl<'a> Emitter<'a> {
             "v_mul_u32_u24" => format!("(({a} & 0xffffffu) * ({b} & 0xffffffu))"),
             "v_mul_i32_i24" => format!("asuint((asint({a} << 8) >> 8) * (asint({b} << 8) >> 8))"),
             "v_mul_lo_u32" | "v_mul_lo_i32" => format!("({a} * {b})"),
+            "v_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
+            "v_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),| "v_mul_lo_i32" => format!("({a} * {b})"),
             "v_mad_u32_u24" => format!("(({a} & 0xffffffu) * ({b} & 0xffffffu) + {c})"),
             "v_mad_i32_i24" => format!("asuint((asint({a} << 8) >> 8) * (asint({b} << 8) >> 8) + asint({c}))"),
             "v_bfe_u32" => format!("(({a} >> ({b} & 31u)) & ((1u << ({c} & 31u)) - 1u))"),
@@ -932,6 +992,62 @@ impl<'a> Emitter<'a> {
             _ => return Err("unsupported vector op".into()),
         };
         self.wv(&d, &e)
+    }
+
+    /// Number of dwords moved by a MUBUF dword load/store mnemonic.
+    fn mubuf_dwords(m: &str) -> Option<u32> {
+        Some(match m.rsplit('_').next()? {
+            "dword" => 1,
+            "dwordx2" => 2,
+            "dwordx3" => 3,
+            "dwordx4" => 4,
+            _ => return None,
+        })
+    }
+
+    /// MUBUF on a structured buffer: `vaddr` is the element index (IDXEN), the 12-bit
+    /// immediate the byte offset inside the element. Dynamic offsets (OFFEN / SOFFSET
+    /// register) are not handled yet and fail explicitly.
+    fn emit_mubuf(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        let (slot, is_uav) = match self.res.get(&idx).and_then(|v| v.first()) {
+            Some(Res::Buf(s, u)) => (*s, *u),
+            _ => return Err("unresolved buffer".into()),
+        };
+        let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
+        if offen || !idxen {
+            return Err(format!("MUBUF addressing offen={offen} idxen={idxen} unsupported"));
+        }
+        if !matches!(ins.src[2], Opnd::ConstInt(0)) {
+            return Err("MUBUF with a dynamic SOFFSET is unsupported".into());
+        }
+        let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
+        let index = r(&ins.src[0])?;
+        let w0 = ins.aux.imm as u32 / 4;
+        let vd = match ins.dst[0] {
+            Opnd::Vgpr(v) => v,
+            _ => return Err("bad vdata".into()),
+        };
+        let nm = if is_uav { format!("ubuf{slot}") } else { format!("sbuf{slot}") };
+        if ins.mnemonic.starts_with("buffer_store") {
+            if !is_uav {
+                return Err("buffer_store to a non-UAV table".into());
+            }
+            for k in 0..n {
+                let o = Opnd::Vgpr(vd + k as u8);
+                self.touch(&o);
+                self.line(&format!("if (exec_lo & 1u) {nm}[{index}].w[{}] = {};", w0 + k, r(&o)?));
+            }
+        } else {
+            let t = self.tmp;
+            self.tmp += 1;
+            for k in 0..n {
+                self.line(&format!("uint t{t}_{k} = {nm}[{index}].w[{}];", w0 + k));
+            }
+            for k in 0..n {
+                self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{t}_{k}"))?;
+            }
+        }
+        Ok(())
     }
 
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
@@ -1149,6 +1265,11 @@ impl<'a> Emitter<'a> {
         }
         for slot in &self.samp {
             let _ = writeln!(h, "SamplerState samp{slot} : register(s{slot});");
+        }
+        for ((is_uav, slot), dwords) in &self.sbuf {
+            let (ty, nm, reg) = if *is_uav { ("RWStructuredBuffer", "ubuf", "u") } else { ("StructuredBuffer", "sbuf", "t") };
+            let _ = writeln!(h, "struct TbElem_{nm}{slot} {{ uint w[{}]; }};
+{ty}<TbElem_{nm}{slot}> {nm}{slot} : register({reg}{slot});", (*dwords).max(1));
         }
         for (slot, dim) in &self.uav {
             let ty = match dim {
