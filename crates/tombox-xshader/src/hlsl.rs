@@ -692,11 +692,19 @@ impl<'a> Emitter<'a> {
             }
         }
         // Validate loop structure.
+        // Several back-edges to one header = `continue`s. The last one (highest address)
+        // closes the loop; each earlier one becomes a forward jump to that closing branch
+        // which also forces another iteration (see the `|| j{B}` at the loop bottom).
         let mut heads: HashMap<usize, usize> = HashMap::new(); // L -> B
         for (&b, &l) in &back {
-            if heads.insert(l, b).is_some() {
-                return Err(format!("loop header {:#x} has multiple back-edges", self.insns[l].offset));
-            }
+            let e = heads.entry(l).or_insert(b);
+            *e = (*e).max(b);
+        }
+        let continues: Vec<(usize, usize)> =
+            back.iter().filter(|(&b, &l)| heads[&l] != b).map(|(&b, &l)| (b, heads[&l])).collect();
+        for (b, closing) in continues {
+            back.remove(&b);
+            target.insert(b, closing);
         }
         let loops: Vec<(usize, usize)> = heads.iter().map(|(&l, &b)| (l, b)).collect();
         for &(l1, b1) in &loops {
@@ -759,6 +767,10 @@ impl<'a> Emitter<'a> {
                 // Evaluate the back-edge condition inside the guard (a skipped branch is not taken).
                 let cond = Self::branch_cond(ins.op).unwrap_or("false");
                 self.line(&format!("tb_c{i} = ({cond});"));
+                if labels.contains(&i) {
+                    // A `continue` jumped here: iterate again regardless of the condition.
+                    self.line(&format!("tb_c{i} = tb_c{i} || j{i};"));
+                }
                 if open {
                     self.line("}");
                     open = false;
