@@ -6,6 +6,13 @@ members = [
     "crates/tombox-pe",
     "crates/tombox-cli",
     "crates/tombox-archive",
+    "crates/compat/compat-common",
+    "crates/compat/xmem",
+    "crates/compat/d3d12_xs",
+    "crates/compat/xg_xs",
+    "crates/compat/xcrdapi",
+    "crates/compat/dxcompiler_xs",
+    "crates/compat/acphal",
 ]
 
 [profile.release]

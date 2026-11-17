@@ -394,6 +394,55 @@ impl<'a> PeFile<'a> {
     pub fn directory(&self, index: usize) -> Option<DataDirectory> {
         self.opt.data_directories.get(index).copied()
     }
+
+    /// Collect every base-relocation entry (rva + type). Unlike the summary in
+    /// `relocations`, this returns the individual fixups a loader must apply.
+    /// `ABSOLUTE` (type 0) padding entries are skipped.
+    pub fn relocation_entries(&self) -> Result<Vec<RelocEntry>> {
+        let mut out = Vec::new();
+        let Some(dir) = self.directory(constants::DIR_BASERELOC) else {
+            return Ok(out);
+        };
+        if dir.virtual_address == 0 || dir.size == 0 {
+            return Ok(out);
+        }
+        let r = self.reader();
+        let mut cur = dir.virtual_address;
+        let end = dir.virtual_address.saturating_add(dir.size);
+        while cur < end {
+            let off = self.rva_to_offset(cur)?;
+            let page_rva = r.u32_at(off, "RELOC.PageRVA")?;
+            let block_size = r.u32_at(off + 4, "RELOC.BlockSize")?;
+            if block_size < 8 {
+                return Err(ParseError::Invariant {
+                    what: "RELOC.BlockSize",
+                    detail: format!("block at rva {cur:#x} has size {block_size}"),
+                });
+            }
+            let n = ((block_size - 8) / 2) as usize;
+            for e in 0..n {
+                let entry = r.u16_at(off + 8 + e * 2, "RELOC entry")?;
+                let kind = entry >> 12;
+                let offset = (entry & 0x0FFF) as u32;
+                if kind == 0 {
+                    continue; // ABSOLUTE = padding
+                }
+                out.push(RelocEntry {
+                    rva: page_rva.saturating_add(offset),
+                    kind,
+                });
+            }
+            cur = cur.saturating_add(block_size);
+        }
+        Ok(out)
+    }
+}
+
+/// A single base-relocation fixup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelocEntry {
+    pub rva: u32,
+    pub kind: u16,
 }
 
 #[cfg(test)]

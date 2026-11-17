@@ -107,3 +107,26 @@ All times UTC. This log is append-only and records what was actually done, run, 
 2. Enumerate GDK `QueryApiImpl` surface via symbol-labelled call sites (REA/IDA).
 3. Begin the loader PoC: map + DIR64 reloc + import table build with redirection + fail-loud
    unsupported-feature table (now evidence-justified).
+
+## 2026-11-16 — Session 2: real binary + first compat DLLs
+
+### Archive (downloaded, exact size match 27,385,950,541 bytes)
+- `zip-inspect`: ZIP64, 834 entries, 0 symlinks/traversal → **safe**. SHA-256 in `input/original/sha256.txt`.
+- Structure: `Mount/` (game) + `EmbeddedXvd/` (Xbox GameOS System32 DLLs) + `era.vbi`. NOT an encrypted XVC — loose decrypted files (premise holds).
+- `MicrosoftGame.config`: main exe `FortniteClient-XSX-Shipping.exe`, `TargetDeviceFamily="Scarlett"`, `RequiresXboxLive=true`.
+- Selectively extracted ~375 MB of code (Binaries + System32 + manifests); skipped 24 GB of `.ucas/.pak/.mp4` assets.
+
+### Main EXE (`FortniteClient-XSX-Shipping.exe`, 157 MB)
+- PE32+ / AMD64, 8 sections, LARGE_ADDRESS_AWARE, ASLR/DEP/HIGH_ENTROPY_VA, subsystem WINDOWS_GUI, linker 14.24 (MSVC2019), entry 0x229a298, image base 0x140000000, 2,045,522 base relocs.
+- **67 import modules / 670 functions.** ~52 are standard Windows API-Sets/UCRT (bind to real Windows). Delay import: GameChat2.dll.
+- **Xbox-only modules (the reimplement list):** d3d12_xs (6), xmem (10), xg_xs (1 `XGCreateTextureComputer`), GameInput (ord #1), XAudio2_9 (ords #1-6), AcpHal (6), XCRDAPI (`DStorageGetFactory`), dxcompiler_xs (`DxcCreateInstance`).
+- `FD3D12DynamicRHI` present, `FScarlett`/`ScarlettRHI` absent → D3D12.x handled inside the normal D3D12 RHI → **D3D12.x is a dialect of PC D3D12**.
+- Symbols: `Mount/Symbols/*-Symbols.bin` = UE console symbol DB, `[magic 0x076b85ee][size][zlib]` → 118 MB of demangled C++ names (GuardedMain/FEngineLoop/RHIInit present). Record layout `[rva][size][?]`×1,245,949 + length-prefixed string table (full decode deferred; names confirmed present).
+
+### VALIDATED ON REAL HARDWARE (user)
+- User launched the EXE natively on Windows: it loads to import resolution and only fails on missing Xbox-only DLLs → **confirms ADR-0002 (native x64 + import redirection), no CPU emulation.**
+- Build 1 DLLs (xmem, d3d12_xs, xg_xs, xcrdapi): exports verified == imports via our own `pe-inspect`; static CRT; only import kernel32/ntdll/apisets. xmem heap-backed (real), rest fail-loud stubs, all call-logged to `%TEMP%\tombox_compat.log`.
+- After build 1, loader advanced and requested `dxcompiler_xs.dll` + `AcpHal.dll` → Build 2 shipped (both verified).
+
+### Next
+- Await user's next-missing-DLL + the compat log (call order) → implement earliest-called Xbox API for real; D3D12 device creation is the expected wall (needs the graphics backend).

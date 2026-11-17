@@ -1,0 +1,14 @@
+[package]
+name = "dxcompiler_xs"
+version = "0.1.0"
+edition = "2021"
+description = "Compat DLL for Xbox dxcompiler_xs.dll — DXC shader compiler factory (logging stub)."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "dxcompiler_xs"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+compat-common = { path = "../compat-common" }

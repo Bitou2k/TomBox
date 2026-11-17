@@ -144,6 +144,36 @@ fn relocations_are_dir64_on_x64() {
     );
 }
 
+/// relocation_entries() returns the detailed fixups and their count matches the
+/// summary's non-ABSOLUTE total.
+#[test]
+fn relocation_entries_match_summary() {
+    let Some(data) = sample_pe() else {
+        eprintln!("sample PE unavailable; skipping");
+        return;
+    };
+    let pe = PeFile::parse(&data).expect("parse");
+    if pe.coff.characteristics & constants::IMAGE_FILE_RELOCS_STRIPPED != 0 {
+        return;
+    }
+    let entries = pe.relocation_entries().expect("reloc entries");
+    let summary = pe.relocations.as_ref().unwrap();
+    let non_absolute: usize = summary
+        .by_type
+        .iter()
+        .filter(|(t, _)| *t != 0)
+        .map(|(_, n)| *n)
+        .sum();
+    assert_eq!(entries.len(), non_absolute);
+    // On x64 the detailed entries should be overwhelmingly DIR64 (10).
+    let dir64 = entries.iter().filter(|e| e.kind == 10).count();
+    assert!(dir64 > 0 && dir64 == non_absolute, "expected all DIR64");
+    // Every reloc RVA must be mappable to a file offset.
+    for e in entries.iter().take(1000) {
+        assert!(pe.rva_to_offset(e.rva).is_ok(), "reloc rva {:#x} unmappable", e.rva);
+    }
+}
+
 /// Load a known-good x64 PE for integration tests. Prefer kernel32 (stable
 /// exports), fall back to the test binary itself.
 fn sample_pe() -> Option<Vec<u8>> {

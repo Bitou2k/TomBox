@@ -1,0 +1,14 @@
+[package]
+name = "acphal"
+version = "0.1.0"
+edition = "2021"
+description = "Compat DLL for Xbox AcpHal.dll — audio-processor (ACP/APU) HAL (logging stubs)."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "acphal"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+compat-common = { path = "../compat-common" }
