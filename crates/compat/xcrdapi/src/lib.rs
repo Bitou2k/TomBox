@@ -187,7 +187,21 @@ unsafe extern "system" fn create_queue_shim(
 ) -> i32 {
     let orig: unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(ORIG_CREATEQUEUE.load(Ordering::Relaxed)) };
-    let hr = unsafe { orig(this, pdesc, PC_IID_IDSTORAGEQUEUE.as_ptr() as *const c_void, ppv) };
+    // The PC DSTORAGE_QUEUE_DESC is { SourceType u64; Capacity u16; Priority i8; Name char*;
+    // ID3D12Device* Device } (0x20 bytes). The title's Xbox desc carries only the first
+    // three members (observed: SourceType 0, Capacity 0x2000, Priority 0/2, Name null); the
+    // qword where PC expects `Device` is whatever follows on the title's stack. Passing the
+    // desc through made DirectStorage treat stack garbage as a device (queue creation then
+    // failed with a nonsense HRESULT whenever that garbage was non-zero). Build a PC desc
+    // from the first 0x18 bytes with no device: these are file-to-memory queues.
+    let mut pc_desc = [0u8; 0x20];
+    let desc_ptr = if pdesc.is_null() {
+        pdesc
+    } else {
+        unsafe { core::ptr::copy_nonoverlapping(pdesc as *const u8, pc_desc.as_mut_ptr(), 0x18) };
+        pc_desc.as_ptr() as *const c_void
+    };
+    let hr = unsafe { orig(this, desc_ptr, PC_IID_IDSTORAGEQUEUE.as_ptr() as *const c_void, ppv) };
     let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
     // Patch the new queue's vtable slot 3 (EnqueueRequest) once to dump requests.
     if hr == 0 && !out.is_null() {
