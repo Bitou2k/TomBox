@@ -223,6 +223,8 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
             0x0e => Some("ds_write2_b32"),
             0x36 => Some("ds_read_b32"),
             0x37 => Some("ds_read2_b32"),
+            0x38 => Some("ds_read2st64_b32"),
+            0x0f => Some("ds_write2st64_b32"),
             _ => None,
         },
         Enc::Vinterp => Some(match op {

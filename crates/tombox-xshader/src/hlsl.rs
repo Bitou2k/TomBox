@@ -153,6 +153,7 @@ struct Emitter<'a> {
     cb_size: BTreeMap<u32, u32>,   // slot -> dwords
     tex: BTreeMap<u32, u32>,       // slot -> dim
     samp: BTreeSet<u32>,
+    samp_cmp: BTreeSet<u32>,
     uav: BTreeMap<u32, u32>,       // slot -> dim
     sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
@@ -190,6 +191,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         cb_size: BTreeMap::new(),
         tex: BTreeMap::new(),
         samp: BTreeSet::new(),
+        samp_cmp: BTreeSet::new(),
         uav: BTreeMap::new(),
         sbuf: BTreeMap::new(),
         tbuf: BTreeSet::new(),
@@ -390,7 +392,12 @@ impl<'a> Emitter<'a> {
                                 return Err(format!("mimg at {:#x}: s{ss} not a sampler descriptor ({other:?})", ins.offset))
                             }
                         };
-                        self.samp.insert(sslot);
+                        // Depth-compare variants (opcode bit 3) need a comparison sampler.
+                        if ins.op & 8 != 0 {
+                            self.samp_cmp.insert(sslot);
+                        } else {
+                            self.samp.insert(sslot);
+                        }
                         v.push(Res::Samp(sslot));
                     }
                     self.res.insert(idx, v);
@@ -966,12 +973,21 @@ impl<'a> Emitter<'a> {
             Enc::Ds if self.is_gs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
                 self.emit_gs_lds(ins)
             }
-            Enc::Ds if self.is_cs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
+            Enc::Ds
+                if self.is_cs
+                    && matches!(
+                        m,
+                        "ds_read_b32" | "ds_read2_b32" | "ds_read2st64_b32" | "ds_write_b32" | "ds_write2_b32" | "ds_write2st64_b32"
+                    ) =>
+            {
                 // Compute: LDS is the thread group's shared memory → an HLSL `groupshared`
                 // array addressed by byte address / 4 (32 KiB, the D3D groupshared limit).
                 self.uses_lds = true;
                 let off = ins.aux.imm as u32;
-                let (off0, off1) = (off & 0xff, (off >> 8) & 0xff);
+                // Two-address forms scale their 8-bit offsets by 4 bytes ("2") or by
+                // 64 dwords = 256 bytes ("2st64"); express both in units of 4 bytes.
+                let scale = if m.contains("st64") { 64 } else { 1 };
+                let (off0, off1) = ((off & 0xff) * scale, ((off >> 8) & 0xff) * scale);
                 let addr = r(&s[0])?;
                 let at = |o: u32| format!("tb_lds[(({addr} + {o:#x}u) >> 2) & 8191u]");
                 let vd = match d {
@@ -985,7 +1001,7 @@ impl<'a> Emitter<'a> {
                         self.line(&format!("uint t{t} = {};", at(off & 0xffff)));
                         self.wv(&Opnd::Vgpr(vd), &format!("t{t}"))
                     }
-                    "ds_read2_b32" => {
+                    "ds_read2_b32" | "ds_read2st64_b32" => {
                         self.line(&format!("uint t{t}a = {}; uint t{t}b = {};", at(off0 * 4), at(off1 * 4)));
                         self.wv(&Opnd::Vgpr(vd), &format!("t{t}a"))?;
                         self.wv(&Opnd::Vgpr(vd + 1), &format!("t{t}b"))
@@ -1687,9 +1703,24 @@ impl<'a> Emitter<'a> {
             Some(Res::Samp(s)) => *s,
             _ => return Err("image op without sampler unsupported".into()),
         };
-        let ncoord = match dim {
-            1 => 2,
-            2 | 3 | 5 => 3,
+        // RDNA2 sample/gather family. Opcode = family base (0x20 sample, 0x40 gather4) +
+        // modifier (0 none, 1 cl, 2 d, 3 d_cl, 4 l, 5 b, 6 b_cl, 7 lz) + 8 (depth compare)
+        // + 0x10 (texel offset). Address operands arrive in this order:
+        //   [offset] [bias] [zref] [ddx.. ddy..] coords.. [lod] [lod clamp]
+        let op = ins.op;
+        let gather = (0x40..0x60).contains(&op);
+        if !gather && !(0x20..0x40).contains(&op) {
+            return Err("unsupported image op".into());
+        }
+        let (modi, cmp, has_off) = (op & 7, op & 8 != 0, op & 0x10 != 0);
+        // (coordinate count, derivative components, offset components)
+        let (ncoord, nder, noff) = match dim {
+            0 => (1usize, 1usize, 1usize),
+            1 => (2, 2, 2),
+            2 => (3, 3, 3),
+            3 => (3, 3, 0),
+            4 => (2, 1, 1),
+            5 => (3, 2, 2),
             _ => return Err(format!("image dim {dim} unsupported")),
         };
         // Address operands: explicit list with NSA, else consecutive VGPRs from vaddr.
@@ -1701,46 +1732,148 @@ impl<'a> Emitter<'a> {
         let addr = |i: usize| -> Opnd {
             if nsa > 0 { ins.src[i] } else { Opnd::Vgpr(first + i as u8) }
         };
-        let (pre, post) = match ins.mnemonic.as_str() {
-            "image_sample" | "image_sample_lz" => (0usize, 0usize),
-            "image_sample_l" => (0, 1),
-            "image_sample_b" => (1, 0),
-            _ => return Err("unsupported image op".into()),
+        let mut next = 0usize;
+        let mut take = |em: &mut Self| -> Opnd {
+            let o = addr(next);
+            next += 1;
+            em.touch(&o);
+            o
+        };
+        // Texel offset: packed signed 6-bit fields (x [5:0], y [13:8], z [21:16]).
+        let offset = if has_off {
+            let o = take(self);
+            if noff == 0 {
+                return Err("texel offset on a cube image".into());
+            }
+            let sx = |v: u32, sh: u32| (((v >> sh) & 0x3f) as i32) << 26 >> 26;
+            let reg = match o {
+                Opnd::Vgpr(n) => n,
+                _ => return Err("bad offset operand".into()),
+            };
+            match self.const_vgpr(idx, reg) {
+                Some(v) => {
+                    let c: Vec<String> = (0..noff).map(|k| sx(v, 8 * k as u32).to_string()).collect();
+                    Some(if noff == 1 { c[0].clone() } else { format!("int{noff}({})", c.join(", ")) })
+                }
+                None if gather => {
+                    // SM5 Gather accepts a run-time offset.
+                    let x = r(&o)?;
+                    let c: Vec<String> =
+                        (0..noff).map(|k| format!("(asint({x} << {}) >> 26)", 26 - 8 * k)).collect();
+                    Some(if noff == 1 { c[0].clone() } else { format!("int{noff}({})", c.join(", ")) })
+                }
+                None => return Err("non-constant texel offset on a sample op".into()),
+            }
+        } else {
+            None
+        };
+        let bias = if matches!(modi, 5 | 6) { Some(f(&take(self))?) } else { None };
+        let zref = if cmp { Some(f(&take(self))?) } else { None };
+        let grads = if matches!(modi, 2 | 3) {
+            let mut dx = vec![];
+            for _ in 0..nder {
+                dx.push(f(&take(self))?);
+            }
+            let mut dy = vec![];
+            for _ in 0..nder {
+                dy.push(f(&take(self))?);
+            }
+            let v = |c: &Vec<String>| if c.len() == 1 { c[0].clone() } else { format!("float{}({})", c.len(), c.join(", ")) };
+            Some((v(&dx), v(&dy)))
+        } else {
+            None
         };
         let mut coords = vec![];
-        for i in 0..ncoord {
-            let o = addr(pre + i);
-            self.touch(&o);
-            coords.push(f(&o)?);
+        for _ in 0..ncoord {
+            coords.push(f(&take(self))?);
         }
+        let lod = if modi == 4 { Some(f(&take(self))?) } else { None };
+        let clamp = if matches!(modi, 1 | 3 | 6) { Some(f(&take(self))?) } else { None };
         // Cube images are addressed by hardware (s, t, face) coordinates (see tb_cube_dir).
         let cvec = if dim == 3 {
             format!("tb_cube_dir({})", coords.join(", "))
+        } else if ncoord == 1 {
+            coords[0].clone()
         } else {
             format!("float{ncoord}({})", coords.join(", "))
         };
-        let call = match ins.mnemonic.as_str() {
-            "image_sample" => format!("tex{tslot}.Sample(samp{sslot}, {cvec})"),
-            "image_sample_lz" => format!("tex{tslot}.SampleLevel(samp{sslot}, {cvec}, 0.0)"),
-            "image_sample_l" => {
-                let o = addr(pre + ncoord);
-                self.touch(&o);
-                format!("tex{tslot}.SampleLevel(samp{sslot}, {cvec}, {})", f(&o)?)
-            }
-            _ => {
-                let o = addr(0);
-                self.touch(&o);
-                format!("tex{tslot}.SampleBias(samp{sslot}, {cvec}, {})", f(&o)?)
-            }
+        let tex = format!("tex{tslot}");
+        let smp = if cmp { format!("scmp{sslot}") } else { format!("samp{sslot}") };
+        let zero_off = if noff == 1 { "0".to_string() } else { format!("int{}({})", noff.max(1), vec!["0"; noff.max(1)].join(", ")) };
+        // Optional trailing ", offset[, clamp]" arguments.
+        let tail = |offset: &Option<String>, clamp: &Option<String>| -> Result<String, String> {
+            Ok(match (offset, clamp) {
+                (None, None) => String::new(),
+                (Some(o), None) => format!(", {o}"),
+                (o, Some(c)) => {
+                    if noff == 0 {
+                        return Err("LOD clamp on a cube image unsupported".into());
+                    }
+                    format!(", {}, {c}", o.clone().unwrap_or_else(|| zero_off.clone()))
+                }
+            })
         };
-        let _ = post;
         let t = self.tmp;
         self.tmp += 1;
-        self.line(&format!("float4 t{t} = {call};"));
         let vd = match ins.dst[0] {
             Opnd::Vgpr(n) => n,
             _ => return Err("bad vdata".into()),
         };
+        if gather {
+            // gather4: dmask picks the channel; the four texels fill vdata..vdata+3.
+            if !matches!(modi, 0 | 7) {
+                return Err("gather4 with explicit LOD/bias unsupported".into());
+            }
+            let chan = match ins.aux.mask {
+                1 => "Red",
+                2 => "Green",
+                4 => "Blue",
+                8 => "Alpha",
+                m => return Err(format!("gather4 with dmask {m:#x} unsupported")),
+            };
+            let off = offset.map(|o| format!(", {o}")).unwrap_or_default();
+            let call = match &zref {
+                Some(z) => format!("{tex}.GatherCmp{chan}({smp}, {cvec}, {z}{off})"),
+                None => format!("{tex}.Gather{chan}({smp}, {cvec}{off})"),
+            };
+            self.line(&format!("float4 t{t} = {call};"));
+            for k in 0..4u8 {
+                self.wv(&Opnd::Vgpr(vd + k), &format!("asuint(t{t}.{})", XYZW[k as usize]))?;
+            }
+            return Ok(());
+        }
+        let call = if let Some(z) = &zref {
+            // Depth-compare sampling returns a single value.
+            match modi {
+                0 => format!("{tex}.SampleCmp({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
+                7 => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
+                _ => return Err("depth-compare sample with explicit LOD/bias/gradient unsupported in SM5".into()),
+            }
+        } else {
+            match modi {
+                0 | 1 => format!("{tex}.Sample({smp}, {cvec}{})", tail(&offset, &clamp)?),
+                2 | 3 => {
+                    let (dx, dy) = grads.clone().ok_or("missing gradients")?;
+                    format!("{tex}.SampleGrad({smp}, {cvec}, {dx}, {dy}{})", tail(&offset, &clamp)?)
+                }
+                4 => format!("{tex}.SampleLevel({smp}, {cvec}, {}{})", lod.clone().ok_or("missing lod")?, tail(&offset, &None)?),
+                5 | 6 => format!("{tex}.SampleBias({smp}, {cvec}, {}{})", bias.clone().ok_or("missing bias")?, tail(&offset, &clamp)?),
+                _ => format!("{tex}.SampleLevel({smp}, {cvec}, 0.0{})", tail(&offset, &None)?),
+            }
+        };
+        if zref.is_some() {
+            self.line(&format!("float t{t} = {call};"));
+            // The compare result is replicated to every requested channel.
+            let mut n = 0u8;
+            for ch in 0..4 {
+                if (ins.aux.mask >> ch) & 1 != 0 {
+                    self.wv(&Opnd::Vgpr(vd + n), &format!("asuint(t{t})"))?;
+                    n += 1;
+                }
+            }
+            return Ok(());
+        }
+        self.line(&format!("float4 t{t} = {call};"));
         let mut n = 0u8;
         for ch in 0..4 {
             if (ins.aux.mask >> ch) & 1 != 0 {
@@ -1750,6 +1883,26 @@ impl<'a> Emitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Statically known value of a VGPR at instruction `idx`: the most recent write in
+    /// program order must be a `v_mov_b32` of a constant. Used where HLSL demands a
+    /// literal (texel offsets).
+    fn const_vgpr(&self, idx: usize, reg: u8) -> Option<u32> {
+        for ins in self.insns[..idx].iter().rev() {
+            if ins.dst.iter().any(|d| matches!(d, Opnd::Vgpr(n) if *n == reg)) {
+                if ins.mnemonic != "v_mov_b32" {
+                    return None;
+                }
+                return match ins.src.first() {
+                    Some(Opnd::ConstInt(v)) => Some(*v as i32 as u32),
+                    Some(Opnd::Literal(v)) => Some(*v),
+                    Some(Opnd::ConstF32(f)) => Some(f.to_bits()),
+                    _ => None,
+                };
+            }
+        }
+        None
     }
 
     fn emit_exp(&mut self, ins: &Insn, is_ps: bool) -> Result<(), String> {
@@ -1848,6 +2001,8 @@ impl<'a> Emitter<'a> {
         }
         for (slot, dim) in &self.tex {
             let ty = match dim {
+                0 => "Texture1D<float4>",
+                4 => "Texture1DArray<float4>",
                 1 => "Texture2D<float4>",
                 2 => "Texture3D<float4>",
                 3 => "TextureCube<float4>",
@@ -1858,6 +2013,12 @@ impl<'a> Emitter<'a> {
         }
         for slot in &self.samp {
             let _ = writeln!(h, "SamplerState samp{slot} : register(s{slot});");
+        }
+        for slot in &self.samp_cmp {
+            if self.samp.contains(slot) {
+                return Err(format!("sampler s{slot} used both as a regular and a comparison sampler"));
+            }
+            let _ = writeln!(h, "SamplerComparisonState scmp{slot} : register(s{slot});");
         }
         for ((is_uav, slot), dwords) in &self.sbuf {
             let (ty, nm, reg) = if *is_uav { ("RWStructuredBuffer", "ubuf", "u") } else { ("StructuredBuffer", "sbuf", "t") };

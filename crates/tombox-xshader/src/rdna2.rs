@@ -464,6 +464,13 @@ fn opcode_field(enc: Enc, w: u32) -> u32 {
 /// Known mnemonics for the opcodes we rely on (control flow + common scalar). The rest are
 /// tagged by family+opcode so the output is honest about what is and isn't yet named.
 fn mnemonic_for(enc: Enc, op: u32) -> String {
+    // MIMG sample (0x20..0x3f) / gather4 (0x40..0x5f) names are regular: base + [_c] +
+    // modifier + [_o], so generate them instead of tabulating all 64.
+    if enc == Enc::Mimg && (0x20..0x60).contains(&op) {
+        let base = if op >= 0x40 { "image_gather4" } else { "image_sample" };
+        let modi = ["", "_cl", "_d", "_d_cl", "_l", "_b", "_b_cl", "_lz"][(op & 7) as usize];
+        return format!("{base}{}{modi}{}", if op & 8 != 0 { "_c" } else { "" }, if op & 0x10 != 0 { "_o" } else { "" });
+    }
     match mnem::lookup(enc, op) {
         Some(s) => s.to_string(),
         None => format!("{:?}<{:#x}>", enc, op).to_lowercase(),
