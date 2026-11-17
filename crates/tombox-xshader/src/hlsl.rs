@@ -157,6 +157,8 @@ struct Emitter<'a> {
     is_cs: bool,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
+    /// Pixel shader needs its position within the 2x2 quad (ds_swizzle).
+    uses_quad: bool,
     regs: BTreeSet<String>,
     body: String,
     tmp: usize,
@@ -186,6 +188,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         tbuf: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
         live: Vec::new(),
+        uses_quad: false,
         regs: BTreeSet::new(),
         body: String::new(),
         tmp: 0,
@@ -879,6 +882,31 @@ impl<'a> Emitter<'a> {
             }
             Enc::Mimg => self.emit_mimg(idx, ins),
             Enc::Mubuf => self.emit_mubuf(idx, ins),
+            Enc::Ds if m == "ds_swizzle_b32" => {
+                // Quad swizzle (QDMode): each lane of a 2x2 pixel quad reads the lane selected
+                // by a 2-bit field of the 8-bit mask — how RDNA2 pixel shaders fetch neighbour
+                // values for derivatives. Per pixel: value at quad position (sx, sy) =
+                // v + (sx - px) * ddx_fine(v) + (sy - py) * ddy_fine(v), with (px, py) this
+                // pixel's position in its quad. Treats the register as float (derivative use).
+                if !is_ps {
+                    return Err("ds_swizzle outside a pixel shader".into());
+                }
+                let off = ins.aux.imm as u32;
+                if off & 0x8000 == 0 {
+                    return Err("ds_swizzle without QDMode unsupported".into());
+                }
+                self.uses_quad = true;
+                let src = f(&s[0])?;
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("float t{t} = {src}; uint t{t}s = ({:#x}u >> (tb_quad * 2u)) & 3u;", off & 0xff));
+                self.wv(
+                    &d.ok_or("no dst")?,
+                    &format!(
+                        "asuint(t{t} + ((float)(t{t}s & 1u) - (float)(tb_quad & 1u)) * ddx_fine(t{t}) + ((float)(t{t}s >> 1) - (float)(tb_quad >> 1)) * ddy_fine(t{t}))"
+                    ),
+                )
+            }
             Enc::Vinterp => {
                 if !is_ps {
                     return Err("v_interp outside a pixel shader".into());
@@ -1456,6 +1484,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 let _ = writeln!(h, "    {interp}{ty} i{ei} : {};", semantic(e));
             }
         }
+        let pos_field = match ex.input_sig.iter().position(|e| e.sysval == 1) {
+            Some(ei) => format!("i.i{ei}"),
+            None => "i.tb_pos".to_string(),
+        };
+        if is_ps && self.uses_quad && pos_field == "i.tb_pos" {
+            let _ = writeln!(h, "    float4 tb_pos : SV_Position;");
+        }
         let _ = writeln!(h, "}};\nstruct SOut {{");
         for (ei, e) in ex.output_sig.iter().enumerate() {
             let (ty, _) = sig_type(e);
@@ -1497,6 +1532,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         if !self.regs.is_empty() {
             let decl: Vec<String> = self.regs.iter().map(|r| format!("{r} = 0u")).collect();
             let _ = writeln!(h, "    uint {};", decl.join(", "));
+        }
+        if is_ps && self.uses_quad {
+            let _ = writeln!(init, "    uint tb_quad = ((uint){pos_field}.x & 1u) | (((uint){pos_field}.y & 1u) << 1);");
         }
         if is_ps {
             // PS entry ABI (observed): v0/v1 = perspective-centre barycentrics, then the

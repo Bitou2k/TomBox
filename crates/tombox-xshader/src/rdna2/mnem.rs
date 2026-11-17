@@ -207,6 +207,10 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
         Enc::Mimg => mimg(op),
         Enc::Mubuf => mubuf(op),
         Enc::Exp => Some("exp"),
+        Enc::Ds => match op {
+            0x35 => Some("ds_swizzle_b32"),
+            _ => None,
+        },
         Enc::Vinterp => Some(match op {
             0 => "v_interp_p1_f32",
             1 => "v_interp_p2_f32",
