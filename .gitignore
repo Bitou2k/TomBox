@@ -1,0 +1,18 @@
+# Game data and large inputs — never commit (per CLAUDE.md §10)
+input/
+analysis/*.bin
+analysis/*.dump
+
+# Third-party reference source (studied, not ours to redistribute)
+refs/
+
+# Rust build output
+target/
+**/*.rs.bk
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

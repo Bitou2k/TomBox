@@ -1,0 +1,13 @@
+# TomBox — Xbox Series X|S compatibility runtime (research project)
+# Workspace root.
+[workspace]
+resolver = "2"
+members = [
+    "crates/tombox-pe",
+    "crates/tombox-cli",
+]
+
+[profile.release]
+opt-level = 3
+debug = true
+overflow-checks = true   # keep integer-overflow checks even in release for parser safety
