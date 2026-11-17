@@ -487,3 +487,32 @@ can be logged; then find where the ContainerHeader read hands the compressed sou
 to the callback instead of the decompressed buffer. Chunk type = 0x0A
 (ContainerHeader), read via FIoDispatcherImpl::ReadWithCallback from
 FPackageStore::LoadContainers.
+
+## 2026-11-16 — ROOT CAUSE: compressed container header read without decompression
+
+Found the exact data behind the package-store crash:
+- The buffer deserialized as FContainerHeader is the raw contents of
+  pakchunk9-XSX.ucas at file offset 0 (verified: the exact bytes the game
+  deserialized, 789ced..., are at offset 0 of pakchunk9-XSX.ucas and NOWHERE
+  else).
+- pakchunk9-XSX.utoc: 433 compressed blocks, 1 method = "Zlib", block size 64KB.
+  block[0] (offset 0) = {compSize 2707, uncompSize 65536, methodIdx 1=Zlib}.
+  It zlib-inflates cleanly to a valid 64KB container header (starts with an
+  FIoContainerId).
+- So the container header IS correctly Zlib-compressed per the TOC, but the engine
+  hands the deserializer the RAW compressed block — it is not decompressing it.
+- global/pakchunk0/pakChunkEarly have UNCOMPRESSED headers (no 78 9c at offset 0),
+  which is why they loaded and pakchunk9 is the first container to crash.
+- FCompression::UncompressMemory is called during load but only from the .pak path
+  (FPakUncompressTask); the IoStore ScatterBlock decompress (0x5c0789) is never hit
+  before the crash. So the IoStore compressed-block decompression is not running for
+  this container-header read.
+
+This is the hardest blocker so far: it's not a shim-returns-wrong-value bug, it's
+the engine's IoStore read/decompress routing differing on PC. Fix options:
+  (a) make the engine's IoStore decompression run for this read (trace why
+      ScatterBlock/mmap path skips it),
+  (b) intercept the container-header file read and return inflated data (needs file
+      I/O hooking, scoped to not double-decompress content),
+  (c) rewrite affected .ucas/.utoc to store uncompressed headers (offset-shift the
+      whole container — deterministic but heavy).
