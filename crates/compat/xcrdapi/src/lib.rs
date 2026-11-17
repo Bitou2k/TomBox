@@ -119,9 +119,9 @@ unsafe extern "system" fn enqueue_shim(this: *mut c_void, preq: *const u8) {
     // Options byte 0 = CompressionFormat (0=None). If nonzero, Xbox DirectStorage
     // hardware-decompresses during the read; our raw read would leave it compressed.
     let compression = (options & 0xFF) as u8;
-    if ENQUEUE_DUMPS.load(Ordering::Relaxed) < 8 {
+    if ENQUEUE_DUMPS.load(Ordering::Relaxed) < 400 {
         record(M, "EnqueueRequest.opt",
-            &format!("options={options:#x} compression={compression} src_size={src_size:#x} dst_size={dst_size:#x}"));
+            &format!("options={options:#x} comp={compression} off={src_off:#x} size={src_size:#x} dst={dst_buf:#x}"));
     }
 
     // Service the read directly from the OS file we opened in OpenFile. (The real
@@ -135,17 +135,40 @@ unsafe extern "system" fn enqueue_shim(this: *mut c_void, preq: *const u8) {
             let mut ov = [0u8; 32];
             ov[16..20].copy_from_slice(&(src_off as u32).to_le_bytes());       // Offset
             ov[20..24].copy_from_slice(&(((src_off >> 32) as u32)).to_le_bytes()); // OffsetHigh
-            let mut got: u32 = 0;
-            let ok = unsafe { ReadFile(h, dst_buf as *mut u8, src_size as u32, &mut got, ov.as_mut_ptr()) };
-            // Flag any problem read: failed, short, or all-zero destination.
-            let zero = got >= 8 && unsafe { *(dst_buf as *const u64) } == 0
-                && unsafe { *((dst_buf + 8) as *const u64) } == 0;
-            let bad = ok == 0 || got != src_size as u32 || zero;
-            if bad || n < 3 {
-                let d0 = if got >= 8 { unsafe { *(dst_buf as *const u64) } } else { 0 };
-                record(M, "EnqueueRequest",
-                    &format!("{}read off={src_off:#x} size={src_size:#x} got={got:#x} ok={} data0={d0:#018x}",
-                        if bad { "BAD " } else { "" }, ok != 0));
+            if compression == 0 {
+                // Uncompressed: read straight into the destination.
+                let mut got: u32 = 0;
+                let ok = unsafe { ReadFile(h, dst_buf as *mut u8, src_size as u32, &mut got, ov.as_mut_ptr()) };
+                if ok == 0 || got != src_size as u32 {
+                    record(M, "EnqueueRequest", &format!("BAD read off={src_off:#x} size={src_size:#x} got={got:#x}"));
+                }
+            } else {
+                // Compressed: Xbox DirectStorage decompresses in hardware. Read the
+                // compressed bytes and zlib-inflate into the destination buffer.
+                let mut cbuf = vec![0u8; src_size as usize];
+                let mut got: u32 = 0;
+                let ok = unsafe { ReadFile(h, cbuf.as_mut_ptr(), src_size as u32, &mut got, ov.as_mut_ptr()) };
+                if ok != 0 && got > 0 {
+                    match miniz_oxide::inflate::decompress_to_vec_zlib(&cbuf[..got as usize]) {
+                        Ok(data) => {
+                            let cap = (dst_size as usize).max(data.len());
+                            let ncopy = data.len().min(cap);
+                            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst_buf as *mut u8, ncopy) };
+                            if n < 6 {
+                                record(M, "EnqueueRequest", &format!("INFLATE comp={compression} off={src_off:#x} csize={src_size:#x} -> {:#x} (dstSize={dst_size:#x})", data.len()));
+                            }
+                        }
+                        Err(e) => {
+                            // Partial output is still copied so a trailing-garbage stream yields usable data.
+                            let data = e.output;
+                            let ncopy = data.len().min(dst_size as usize);
+                            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst_buf as *mut u8, ncopy) };
+                            record(M, "EnqueueRequest", &format!("INFLATE-partial comp={compression} off={src_off:#x} csize={src_size:#x} status={:?} out={:#x}", e.status, data.len()));
+                        }
+                    }
+                } else {
+                    record(M, "EnqueueRequest", &format!("BAD compressed read off={src_off:#x} size={src_size:#x} got={got:#x}"));
+                }
             }
         }
         _ => {
