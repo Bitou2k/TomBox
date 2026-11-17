@@ -183,6 +183,87 @@ struct Emitter<'a> {
     out_params: Vec<u32>,
 }
 
+/// SGPR spills through vector lanes.
+///
+/// When a shader runs out of scalar registers the console compiler parks scalars (observed:
+/// texture/sampler descriptor dwords) in individual lanes of an otherwise unused VGPR with
+/// `v_writelane_b32 vN, sX, <lane>` and brings them back with `v_readlane_b32 sY, vN, <lane>`
+/// (VOP3 0x361 / 0x360; fixture `fortnite_lobby_desc.dxbc`). The translator models one lane
+/// per VGPR, so each (VGPR, constant lane) slot is lowered to a virtual scalar register
+/// s128.. and the two instructions become plain `s_mov_b32`, which the descriptor dataflow
+/// and the emitter already understand.
+///
+/// Refused (explicit error): a non-constant lane index, a read of a slot that was never
+/// written, more than 120 slots, or a spill VGPR that is also used as an ordinary vector.
+fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
+    const READLANE: u32 = 0x360;
+    const WRITELANE: u32 = 0x361;
+    let is_lane = |i: &Insn| i.enc == Enc::Vop3 && (i.op == READLANE || i.op == WRITELANE);
+    if !insns.iter().any(is_lane) {
+        return Ok(());
+    }
+    let mut slots: BTreeMap<(u8, i64), u8> = BTreeMap::new();
+    let mut spill_vregs: BTreeSet<u8> = BTreeSet::new();
+    for ins in insns.iter_mut() {
+        if !is_lane(ins) {
+            continue;
+        }
+        let at = ins.offset;
+        let lane = match ins.src.get(1) {
+            Some(Opnd::ConstInt(l)) if (0..64).contains(l) => *l,
+            other => return Err(format!("lane op at {at:#x}: non-constant lane operand {other:?}")),
+        };
+        if ins.op == WRITELANE {
+            let Some(Opnd::Vgpr(v)) = ins.dst.first().cloned() else {
+                return Err(format!("v_writelane at {at:#x}: destination is not a VGPR"));
+            };
+            let next = slots.len();
+            let slot = match slots.get(&(v, lane)) {
+                Some(s) => *s,
+                None => {
+                    if next >= 120 {
+                        return Err(format!("v_writelane at {at:#x}: too many lane spill slots"));
+                    }
+                    let s = 128 + next as u8;
+                    slots.insert((v, lane), s);
+                    s
+                }
+            };
+            spill_vregs.insert(v);
+            let value = ins.src.first().cloned().ok_or_else(|| format!("v_writelane at {at:#x}: no source"))?;
+            ins.dst = vec![Opnd::Sgpr(slot)];
+            ins.src = vec![value];
+        } else {
+            // The destination field of v_readlane names an SGPR (decoded generically as a VGPR).
+            let d = match ins.dst.first() {
+                Some(Opnd::Vgpr(n)) | Some(Opnd::Sgpr(n)) => *n,
+                other => return Err(format!("v_readlane at {at:#x}: unexpected destination {other:?}")),
+            };
+            let Some(Opnd::Vgpr(v)) = ins.src.first().cloned() else {
+                return Err(format!("v_readlane at {at:#x}: source is not a VGPR"));
+            };
+            let Some(&slot) = slots.get(&(v, lane)) else {
+                return Err(format!("v_readlane at {at:#x}: v{v} lane {lane} read before any v_writelane"));
+            };
+            ins.dst = vec![Opnd::Sgpr(d)];
+            ins.src = vec![Opnd::Sgpr(slot)];
+        }
+        ins.enc = Enc::Sop1;
+        ins.op = 0x03;
+        ins.mnemonic = "s_mov_b32".into();
+    }
+    for ins in insns.iter() {
+        for o in ins.dst.iter().chain(ins.src.iter()) {
+            if let Opnd::Vgpr(v) = o {
+                if spill_vregs.contains(v) {
+                    return Err(format!("v{v} is used both as a lane spill area and as a vector at {:#x}", ins.offset));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
     let (profile, is_ps) = match ex.stage {
         Stage::Vertex => ("vs_5_0", false),
@@ -191,7 +272,8 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         Stage::Geometry => ("gs_5_0", false),
         other => return Err(format!("stage {other:?} not supported yet")),
     };
-    let insns = disassemble(&ex.isa);
+    let mut insns = disassemble(&ex.isa);
+    lower_lane_spills(&mut insns)?;
     let mut em = Emitter {
         loop_depth: 0,
         ex,
