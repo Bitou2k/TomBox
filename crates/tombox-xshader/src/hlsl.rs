@@ -712,7 +712,9 @@ impl<'a> Emitter<'a> {
                 let disjoint = b1 < l2 || b2 < l1;
                 let nested = (l1 <= l2 && b2 <= b1) || (l2 <= l1 && b1 <= b2);
                 if !(disjoint || nested) {
-                    return Err("irreducible/overlapping loops".into());
+                    // Interleaved loops cannot be expressed as nested do/while: fall back
+                    // to the general block dispatcher.
+                    return self.emit_body_dispatch(is_ps);
                 }
             }
             // A forward branch from before the header into the body (the usual rotated
@@ -789,6 +791,73 @@ impl<'a> Emitter<'a> {
         if open {
             self.line("}");
         }
+        Ok(())
+    }
+
+    /// General control flow: a `while` + `switch` dispatcher over basic blocks, used when
+    /// the CFG is not reducible to nested loops. Each block ends by setting the next block
+    /// id (`tb_pc`); the program ends when it reaches the id one past the last instruction.
+    /// (Implicit-derivative sampling cannot live inside this loop — FXC rejects it, and the
+    /// shader then fails to compile rather than silently changing meaning.)
+    fn emit_body_dispatch(&mut self, is_ps: bool) -> Result<(), String> {
+        let n = self.insns.len();
+        let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+        let mut leaders: BTreeSet<usize> = BTreeSet::new();
+        leaders.insert(0);
+        let mut tgt: HashMap<usize, usize> = HashMap::new();
+        for (i, ins) in self.insns.iter().enumerate() {
+            if ins.enc != Enc::Sopp {
+                continue;
+            }
+            if Self::branch_cond(ins.op).is_some() {
+                let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
+                let ti = *off2idx
+                    .get(&(t as usize))
+                    .ok_or_else(|| format!("branch at {:#x} targets mid-instruction {t:#x}", ins.offset))?;
+                tgt.insert(i, ti);
+                leaders.insert(ti);
+                leaders.insert(i + 1);
+            } else if ins.op == 1 {
+                leaders.insert(i + 1);
+            }
+        }
+        let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
+        self.line("uint tb_pc = 0u; uint tb_guard = 0u;");
+        self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < 1000000u) {{"));
+        // Flat `if (tb_sel == K)` tests on a snapshot of the block id (FXC mishandles a
+        // `switch` whose selector is assigned inside its cases).
+        self.line("uint tb_sel = tb_pc; tb_pc = 0xffffffffu;");
+        let insns = self.insns.clone();
+        for (b, &start) in starts.iter().enumerate() {
+            let end = starts.get(b + 1).copied().unwrap_or(n);
+            self.line(&format!("if (tb_sel == {start}u) {{"));
+            for i in start..end {
+                let ins = &insns[i];
+                for o in ins.src.iter().chain(ins.dst.iter()) {
+                    self.touch(o);
+                }
+                let is_ctl = ins.enc == Enc::Sopp && (Self::branch_cond(ins.op).is_some() || ins.op == 1);
+                if !is_ctl {
+                    self.emit_insn(i, ins, is_ps, None)
+                        .map_err(|e| format!("{e} [{} @ {:#x}]", ins.mnemonic, ins.offset))?;
+                }
+            }
+            let last = &insns[end - 1];
+            let next = if last.enc == Enc::Sopp && last.op == 1 {
+                format!("{n}u")
+            } else if let (Some(c), Some(&t)) = (
+                if last.enc == Enc::Sopp { Self::branch_cond(last.op) } else { None },
+                tgt.get(&(end - 1)),
+            ) {
+                if last.op == 2 { format!("{t}u") } else { format!("({c}) ? {t}u : {end}u") }
+            } else {
+                format!("{end}u")
+            };
+            self.line(&format!("tb_pc = {next}; }}"));
+        }
+        // No block matched (cannot happen for a well-formed program): stop.
+        self.line(&format!("if (tb_pc == 0xffffffffu) tb_pc = {n}u;"));
+        self.line("}");
         Ok(())
     }
 
@@ -1127,12 +1196,12 @@ impl<'a> Emitter<'a> {
                             Opnd::Sgpr(n) => n,
                             _ => return Err("bad dst".into()),
                         };
-                        let ndw = (self.ex.isa_data.len() / 4).max(1);
+                        let ndw = ((self.ex.isa_data.len().saturating_sub(self.ex.isa.len())) / 4).max(1);
                         let t = self.tmp;
                         self.tmp += 1;
                         self.line(&format!("uint t{t} = ({} + {:#x}u) >> 2;", r(&s[0])?, ins.aux.imm as u32));
                         for k in 0..n {
-                            self.line(&format!("uint t{t}_{k} = tb_code[(t{t} + {k}u) % {ndw}u];"));
+                            self.line(&format!("uint t{t}_{k} = tb_code[(t{t} + {k}u - {}u) % {ndw}u];", self.ex.isa.len() / 4));
                         }
                         for k in 0..n {
                             let dst = Opnd::Sgpr(base + k as u8);
@@ -1182,6 +1251,43 @@ impl<'a> Emitter<'a> {
             }
             Enc::Mimg => self.emit_mimg(idx, ins),
             Enc::Mubuf => self.emit_mubuf(idx, ins),
+            Enc::Flat if m.starts_with("flat_load_dword") => {
+                // Per-lane load through a 64-bit address. Shaders use this for lookups in
+                // constant tables embedded in their own code section (address derived from
+                // `s_getpc_b64`), so it is only accepted when the program takes its PC.
+                if ins.aux.mask == 1 {
+                    return Err("scratch-memory load unsupported".into());
+                }
+                if !self.insns.iter().any(|i| i.mnemonic == "s_getpc_b64") {
+                    return Err("global/flat load in a shader that never takes its PC".into());
+                }
+                self.uses_code = true;
+                let n: u8 = match m {
+                    "flat_load_dword" => 1,
+                    "flat_load_dwordx2" => 2,
+                    "flat_load_dwordx3" => 3,
+                    _ => 4,
+                };
+                let extra = match &s[2] {
+                    Opnd::Null => String::new(),
+                    o => format!(" + {}", r(o)?),
+                };
+                let ndw = ((self.ex.isa_data.len().saturating_sub(self.ex.isa.len())) / 4).max(1);
+                let vd = match d {
+                    Some(Opnd::Vgpr(v)) => v,
+                    _ => return Err("bad vdst".into()),
+                };
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint t{t} = ({} + {:#x}u{extra}) >> 2;", r(&s[0])?, ins.aux.imm as i32 as u32));
+                for k in 0..n {
+                    self.line(&format!("uint t{t}_{k} = tb_code[(t{t} + {k}u - {}u) % {ndw}u];", self.ex.isa.len() / 4));
+                }
+                for k in 0..n {
+                    self.wv(&Opnd::Vgpr(vd + k), &format!("t{t}_{k}"))?;
+                }
+                Ok(())
+            }
             Enc::Ds if self.is_gs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
                 self.emit_gs_lds(ins)
             }
@@ -1400,6 +1506,36 @@ impl<'a> Emitter<'a> {
                 c.src[i] = Opnd::Temp(t as u16);
             }
             return self.emit_vec(&c);
+        }
+        if matches!(m.as_str(), "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64") {
+            // 64-bit vector shifts: value and result are register pairs (lo, hi).
+            let pair_hi = |o: &Opnd| match o {
+                Opnd::Vgpr(n) => Opnd::Vgpr(n + 1),
+                other => hi(other),
+            };
+            let n = format!("({} & 63u)", r(&s[0])?);
+            let (lo, hi_e) = (r(&s[1])?, r(&pair_hi(&s[1]))?);
+            let t = self.tmp;
+            self.tmp += 1;
+            let (rl, rh) = match m.as_str() {
+                "v_lshlrev_b64" => (
+                    format!("(({n} >= 32u) ? 0u : ({lo} << ({n} & 31u)))"),
+                    format!("(({n} == 0u) ? {hi_e} : (({n} >= 32u) ? ({lo} << ({n} - 32u)) : (({hi_e} << ({n} & 31u)) | ({lo} >> (32u - ({n} & 31u))))))"),
+                ),
+                "v_lshrrev_b64" => (
+                    format!("(({n} == 0u) ? {lo} : (({n} >= 32u) ? ({hi_e} >> ({n} - 32u)) : (({lo} >> ({n} & 31u)) | ({hi_e} << (32u - ({n} & 31u))))))"),
+                    format!("(({n} >= 32u) ? 0u : ({hi_e} >> ({n} & 31u)))"),
+                ),
+                _ => (
+                    format!("(({n} == 0u) ? {lo} : (({n} >= 32u) ? asuint(asint({hi_e}) >> ({n} - 32u)) : (({lo} >> ({n} & 31u)) | ({hi_e} << (32u - ({n} & 31u))))))"),
+                    format!("(({n} >= 32u) ? asuint(asint({hi_e}) >> 31) : asuint(asint({hi_e}) >> ({n} & 31u)))"),
+                ),
+            };
+            self.line(&format!("uint t{t}l = {rl}; uint t{t}h = {rh};"));
+            self.wv(&d, &format!("t{t}l"))?;
+            let dh = pair_hi(&d);
+            self.touch(&dh);
+            return self.wv(&dh, &format!("t{t}h"));
         }
         if m == "v_swap_b32" {
             let (x, y) = (name(&d)?, name(&s[0])?);
@@ -2258,10 +2394,14 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(h, "{ty} uav{slot} : register(u{slot});");
         }
         if self.uses_code {
-            // The program's code section (instructions + embedded constant tables), indexed
-            // by byte offset / 4 from the program start.
+            // Constant tables embedded after the program in the code section. Code pointers
+            // are byte offsets from the program start, so readers subtract the program
+            // length (in dwords) before indexing. Only the tail is emitted: FXC allows at
+            // most 4096 indexable literals.
             let words: Vec<String> = ex
                 .isa_data
+                .get(ex.isa.len()..)
+                .unwrap_or(&[])
                 .chunks_exact(4)
                 .map(|c| format!("{:#x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
                 .collect();

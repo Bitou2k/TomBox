@@ -84,6 +84,7 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x36d => "v_add3_u32", 0x36f => "v_lshl_or_b32", 0x371 => "v_and_or_b32", 0x372 => "v_or3_b32",
         0x30f => "v_add_co_u32", 0x310 => "v_sub_co_u32", 0x319 => "v_subrev_co_u32",
         0x362 => "v_ldexp_f32", 0x365 => "v_mbcnt_lo_u32_b32", 0x366 => "v_mbcnt_hi_u32_b32",
+        0x2ff => "v_lshlrev_b64", 0x300 => "v_lshrrev_b64", 0x301 => "v_ashrrev_i64",
         _ => return None,
     })
 }
@@ -215,6 +216,13 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
         Enc::Mimg => mimg(op),
         Enc::Mubuf => mubuf(op),
         Enc::Exp => Some("exp"),
+        Enc::Flat => match op & 0x7f {
+            0x0c => Some("flat_load_dword"),
+            0x0d => Some("flat_load_dwordx2"),
+            0x0e => Some("flat_load_dwordx3"),
+            0x0f => Some("flat_load_dwordx4"),
+            _ => None,
+        },
         Enc::Ds => match op {
             0x35 => Some("ds_swizzle_b32"),
             0x00 => Some("ds_add_u32"),
