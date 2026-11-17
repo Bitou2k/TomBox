@@ -694,6 +694,9 @@ impl<'a> Emitter<'a> {
                         written.insert(d + k as u8);
                     }
                 }
+                // buffer_gl0_inv / buffer_gl1_inv (MUBUF 0x71 / 0x72) invalidate the GPU data caches: no
+                // resource, no data, and no PC equivalent.
+                Enc::Mubuf if ins.op == 0x71 || ins.op == 0x72 => {}
                 Enc::Mubuf => {
                     let rs = ins.src.get(1).and_then(sg).ok_or("mubuf: bad srsrc")?;
                     let (slot, table) = match sym.get(&rs) {
@@ -1526,6 +1529,10 @@ impl<'a> Emitter<'a> {
                 Ok(())
             }
             Enc::Mimg => self.emit_mimg(idx, ins),
+            Enc::Mubuf if ins.op == 0x71 || ins.op == 0x72 => {
+                self.line("// (cache flush: no-op)");
+                Ok(())
+            }
             Enc::Mubuf => self.emit_mubuf(idx, ins),
             Enc::Flat if m.starts_with("flat_load_dword") => {
                 // Per-lane load through a 64-bit address. Shaders use this for lookups in

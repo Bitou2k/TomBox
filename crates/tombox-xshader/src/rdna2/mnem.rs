@@ -193,7 +193,7 @@ pub fn mubuf(op: u32) -> Option<&'static str> {
         0x0e => "buffer_load_dwordx3", 0x0f => "buffer_load_dwordx4", 0x18 => "buffer_store_byte",
         0x1a => "buffer_store_short", 0x1c => "buffer_store_dword", 0x1d => "buffer_store_dwordx2",
         0x1e => "buffer_store_dwordx3", 0x1f => "buffer_store_dwordx4",
-        0x30 => "buffer_atomic_swap", 0x31 => "buffer_atomic_cmpswap", 0x32 => "buffer_atomic_add",
+        0x30 => "buffer_atomic_swap", 0x31 => "buffer_atomic_cmpswap", 0x32 => "buffer_atomic_add", 0x71 => "buffer_gl0_inv", 0x72 => "buffer_gl1_inv",
         0x33 => "buffer_atomic_sub", 0x35 => "buffer_atomic_smin", 0x36 => "buffer_atomic_umin",
         0x37 => "buffer_atomic_smax", 0x38 => "buffer_atomic_umax", 0x39 => "buffer_atomic_and",
         0x3a => "buffer_atomic_or", 0x3b => "buffer_atomic_xor", 0x3c => "buffer_atomic_inc",
