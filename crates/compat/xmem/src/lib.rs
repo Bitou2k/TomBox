@@ -35,7 +35,10 @@ const MEM_WRITE_WATCH: u32 = 0x0020_0000;
 const MEM_RESET_UNDO: u32 = 0x0100_0000;
 const WIN_ALLOC_TYPE_MASK: u32 =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET_UNDO;
+const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_ANY: u32 = 0x10 | 0x20 | 0x40 | 0x80; // execute bits
 
 // ---- Heap-backed (real) implementations ----
 
@@ -83,9 +86,23 @@ pub extern "system" fn XMemVirtualAlloc(
         // No recognizable intent: default to a reserve+commit.
         win_type = MEM_RESERVE | MEM_COMMIT;
     }
-    // A zero protection is invalid for Windows; default to RW. (On Xbox, 0 can
-    // mean "default".) Non-zero protections (NOACCESS=1, RW=4, etc.) match.
-    let win_protect = if protect == 0 { PAGE_READWRITE } else { protect };
+    // Page protection: the Xbox `protect` value is NOT reliably Win32 PAGE_*.
+    // Evidence (crash): the game commits a page with protect=0x1 and then WRITES
+    // to it immediately, so on Xbox a committed page is accessible regardless of
+    // that value. We therefore drive protection from behavior, not the raw value:
+    //  * committing  -> at least READWRITE (EXECUTE_READWRITE if an execute bit
+    //    was requested), because the game uses committed memory.
+    //  * reserve-only -> NOACCESS (protection is irrelevant until commit).
+    let committing = win_type & MEM_COMMIT != 0;
+    let win_protect = if committing {
+        if protect & PAGE_EXECUTE_ANY != 0 {
+            PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_READWRITE
+        }
+    } else {
+        PAGE_NOACCESS
+    };
 
     let p = unsafe { VirtualAlloc(address, size, win_type, win_protect) };
     let err = if p.is_null() { unsafe { GetLastError() } } else { 0 };
