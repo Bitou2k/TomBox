@@ -11,6 +11,10 @@
 //! matches, but D3D12.x adds Xbox-specific device methods/semantics beyond the
 //! base interface — those will be addressed as the RHI exercises them.
 
+mod device_wrap;
+mod dxgi_device;
+mod heap_wrap;
+
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
@@ -68,8 +72,16 @@ pub extern "system" fn D3D12XboxCreateDevice(
     let f: extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(p) };
     let hr = f(core::ptr::null_mut(), D3D_FEATURE_LEVEL_12_0, riid, pp_device);
-    let dev = if pp_device.is_null() { core::ptr::null_mut() } else { unsafe { *pp_device } };
-    record(M, "D3D12XboxCreateDevice", &format!("host device create -> hr={hr:#010x} device={dev:p}"));
+    if hr == S_OK && !pp_device.is_null() {
+        let real = unsafe { *pp_device };
+        if !real.is_null() {
+            let wrapped = device_wrap::wrap_device(real);
+            unsafe { *pp_device = wrapped };
+            record(M, "D3D12XboxCreateDevice", &format!("host device {real:p} wrapped as {wrapped:p} (hr={hr:#010x})"));
+            return hr;
+        }
+    }
+    record(M, "D3D12XboxCreateDevice", &format!("host device create -> hr={hr:#010x} (unwrapped)"));
     hr
 }
 
