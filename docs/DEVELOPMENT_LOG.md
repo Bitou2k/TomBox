@@ -424,3 +424,22 @@ read directly. This is the asset-streaming subsystem that gates reaching the men
 ### Milestones
 - [x] 13 actual game renders a first frame (window created + presented).
 - [~] 14 main menu: blocked on DirectStorage request translation (asset streaming).
+
+## 2026-11-16 — DirectStorage complete; content fully loads
+
+Full Xbox DirectStorage -> PC translation now works end to end:
+- Factory IID substitution for OpenFile (slot 4), CreateQueue (slot 3),
+  CreateStatusArray (slot 5).
+- DSTORAGE_REQUEST Xbox->PC field reorder (Dest before Source on Xbox).
+- Reads serviced directly via Win32 (CreateFileW in OpenFile -> OS handle map;
+  positioned ReadFile in EnqueueRequest) because DStorageCore's own read path
+  faults on the Xbox-origin requests; the game's Submit still fires status/fence.
+
+Result: all 27GB content streams in, pakchunk10 (21GB) mounts, all 12 bundles
+install ("All Bundles Installs Complete!"), asset registry starts.
+
+### Current frontier: IoStore package-store build
+An async task lambda crashes (AV read null) in the FPackageId->FPackageStoreEntry
+map build (TMapBase::FindOrAddImpl) — the entries buffer [rbp+0xA0] is null.
+Post-content-load engine init; needs tracing where that buffer is set up (likely a
+stubbed Xbox path returning null, or an IoStore package-store format detail).
