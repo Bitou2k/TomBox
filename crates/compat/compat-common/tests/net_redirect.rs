@@ -14,6 +14,16 @@ fn redirect_mode_rewrites_names_and_refuses_other_addresses() {
     assert!(!addrs.is_empty());
     assert!(addrs.iter().all(|a| a.ip().is_loopback()), "got {addrs:?}");
 
+    // 1b. The backend host families the project owner listed (exact and as suffixes).
+    for h in [
+        "ol.epicgames.com", "account-public-service-prod.ol.epicgames.com", "ol.epicgames.net",
+        "on.epicgames.com", "game-social.epicgames.com", "ak.epicgames.com", "epicgames.dev",
+        "api.epicgames.dev", "superawesome.com", "cdn2.unrealengine.com", "x.akamaized.net",
+    ] {
+        let a: Vec<_> = (h, 443).to_socket_addrs().unwrap_or_else(|e| panic!("{h}: {e}")).collect();
+        assert!(!a.is_empty() && a.iter().all(|x| x.ip().is_loopback()), "{h} -> {a:?}");
+    }
+
     // 2. Connecting to the redirect host's address works.
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
