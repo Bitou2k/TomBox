@@ -163,6 +163,8 @@ struct Emitter<'a> {
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     is_cs: bool,
+    /// Nesting depth of emitted HLSL loops at the current instruction.
+    loop_depth: u32,
     is_gs: bool,
     /// Compute shader uses LDS (groupshared memory).
     uses_lds: bool,
@@ -191,6 +193,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
     };
     let insns = disassemble(&ex.isa);
     let mut em = Emitter {
+        loop_depth: 0,
         ex,
         insns,
         res: HashMap::new(),
@@ -744,6 +747,7 @@ impl<'a> Emitter<'a> {
                 }
                 cur.clear();
                 self.line("do {");
+                self.loop_depth += 1;
                 self.line(&format!("tb_c{b} = false;"));
             }
             let active: Vec<usize> =
@@ -786,6 +790,7 @@ impl<'a> Emitter<'a> {
                 let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
                 let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(" || ")) };
                 self.line(&format!("}} while (tb_c{i}{exit} && ++tb_guard < 65536u);"));
+                self.loop_depth = self.loop_depth.saturating_sub(1);
             }
         }
         if open {
@@ -822,8 +827,10 @@ impl<'a> Emitter<'a> {
             }
         }
         let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
+        self.loop_depth = 0;
         self.line("uint tb_pc = 0u; uint tb_guard = 0u;");
         self.line(&format!("[loop] while (tb_pc != {n}u && tb_guard++ < 1000000u) {{"));
+        self.loop_depth += 1;
         // Flat `if (tb_sel == K)` tests on a snapshot of the block id (FXC mishandles a
         // `switch` whose selector is assigned inside its cases).
         self.line("uint tb_sel = tb_pc; tb_pc = 0xffffffffu;");
@@ -858,6 +865,7 @@ impl<'a> Emitter<'a> {
         // No block matched (cannot happen for a well-formed program): stop.
         self.line(&format!("if (tb_pc == 0xffffffffu) tb_pc = {n}u;"));
         self.line("}");
+        self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(())
     }
 
@@ -2192,15 +2200,26 @@ impl<'a> Emitter<'a> {
             }
             return Ok(());
         }
+        // FXC (SM5) refuses implicit-derivative samples inside a loop it cannot unroll
+        // (X3570/X3511). The console GPU computes those derivatives per quad regardless of
+        // control flow; there is no SM5 equivalent, so inside emitted loops such samples
+        // are APPROXIMATED with LOD 0 (exact for single-mip textures, too sharp otherwise).
+        let in_loop = self.loop_depth > 0;
+        if in_loop && matches!(modi, 0 | 1 | 5 | 6) {
+            self.line("// APPROX-LOOP-SAMPLE: implicit-derivative sample inside a loop emitted as LOD 0");
+        }
         let call = if let Some(z) = &zref {
             // Depth-compare sampling returns a single value.
             match modi {
+                0 if in_loop => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
                 0 => format!("{tex}.SampleCmp({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
                 7 => format!("{tex}.SampleCmpLevelZero({smp}, {cvec}, {z}{})", tail(&offset, &None)?),
                 _ => return Err("depth-compare sample with explicit LOD/bias/gradient unsupported in SM5".into()),
             }
         } else {
             match modi {
+                0 | 1 if in_loop => format!("{tex}.SampleLevel({smp}, {cvec}, 0.0{})", tail(&offset, &None)?),
+                5 | 6 if in_loop => format!("{tex}.SampleLevel({smp}, {cvec}, {}{})", bias.clone().ok_or("missing bias")?, tail(&offset, &None)?),
                 0 | 1 => format!("{tex}.Sample({smp}, {cvec}{})", tail(&offset, &clamp)?),
                 2 | 3 => {
                     let (dx, dy) = grads.clone().ok_or("missing gradients")?;
