@@ -660,3 +660,22 @@ redirected to the backend.
 
 **Unverified / open:** the GDK "user not found" HRESULT; other user-taking GDK families
 (XGameSave, XGameUi) still reach the real runtime with the local handle and will fail there.
+
+## 2026-11-17 (end) — login completes, game-mode select reached
+
+After the owner's backend accepted the `xbl_xtoken` grant, the login state machine ran to
+`CreatingParty --> Completed` (`HandleLoginRequestComplete Result=2`). The first attempt then
+died with "GPU Crashed or D3D Device Removed": really a pipeline-create failure, because one
+lobby pixel shader samples a texture with implicit derivatives inside a real loop and FXC
+(SM5) cannot compile that (X3570/X3511). The translator now emits such in-loop samples as
+LOD 0 (marked `APPROX-LOOP-SAMPLE`; exact only for single-mip textures) — fixture
+`analysis/shaders/fortnite_loop_sample.dxbc`, 25/25 fixtures compile.
+
+**Result (one run, driven with synthetic mouse input):** safe-zone screen, then the
+game-mode select screen (Save the World / Battle Royale / Creative, "Signed in as:
+TomBoxPlayer") — `analysis/evidence/2026-11-17_game_mode_select.png`.
+
+Input note: the title reads raw mouse deltas (real PC GameInput) and accumulates them in its
+3840x2160 space, so the in-game cursor moves at 1/3 window scale and is unrelated to the OS
+cursor position; `tools/dev/mouse.ps1` sends relative moves. Proper window-to-title input
+mapping is not implemented. No audio.
