@@ -163,6 +163,26 @@ unsafe extern "system" fn create_descriptor_heap(
         // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
         // patch the shared heap vtable once to fix the handle-getter ABI.
         crate::heap_wrap::ensure_patched(unsafe { *ppv });
+        // Log DESC { Type@0, NumDescriptors@4, Flags@8, NodeMask@0xC } + GPU base so
+        // we can correlate the shader-visible online heap with the handles the game
+        // later binds. Only log shader-visible (Flags bit0) or the first few.
+        static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if !pdesc.is_null() {
+            let d = pdesc as *const u32;
+            let (htype, numd, flags) = unsafe { (*d.add(0), *d.add(1), *d.add(2)) };
+            let shader_visible = flags & 1 != 0;
+            if shader_visible || N.fetch_add(1, Ordering::Relaxed) < 10 {
+                let heap = unsafe { *ppv };
+                // GetGPUDescriptorHandleForHeapStart (slot 10, now our bridge -> u64)
+                let gpu_base: u64 = if shader_visible {
+                    let g: unsafe extern "system" fn(*mut c_void) -> u64 =
+                        unsafe { core::mem::transmute(*(*(heap as *const *const usize)).add(10)) };
+                    unsafe { g(heap) }
+                } else { 0 };
+                record("d3d12_xs", "CreateDescriptorHeap",
+                    &format!("type={htype} num={numd} flags={flags:#x} shaderVis={shader_visible} heap={heap:p} gpuBase={gpu_base:#x}"));
+            }
+        }
     }
     hr
 }
@@ -211,20 +231,26 @@ unsafe extern "system" fn create_command_list_x(
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
     let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, riid, ppv) };
-    // PC CreateCommandList returns an OPEN (recording) list; the Xbox RHI expects
-    // it CLOSED and calls Reset() to begin. Close it now so Reset() is valid.
     if hr == S_OK && !ppv.is_null() {
-        let list = unsafe { *ppv };
-        if !list.is_null() {
-            let lvt = unsafe { *(list as *const *const usize) };
-            // ID3D12GraphicsCommandList::Close = slot 9
-            let close: unsafe extern "system" fn(*mut c_void) -> i32 =
-                unsafe { core::mem::transmute(*lvt.add(9)) };
-            unsafe { close(list) };
-        }
+        // Repoint the real list at the Xbox-layout vtable (fixes the +4 slot shift).
+        crate::cmdlist_wrap::apply(unsafe { *ppv });
     }
-    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} -> hr={hr:#010x} (closed)"));
+    record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} -> hr={hr:#010x}"));
     hr
+}
+
+/// Slot 15: GetDescriptorHandleIncrementSize(type) -> UINT. Log what the game
+/// queries and what the real (NVIDIA) device reports, then forward.
+unsafe extern "system" fn get_descriptor_increment(this: *mut DeviceWrapper, heap_type: u32) -> u32 {
+    let real = unsafe { (*this).real };
+    let f: unsafe extern "system" fn(*mut c_void, u32) -> u32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
+    let sz = unsafe { f(real, heap_type) };
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        record("d3d12_xs", "GetDescriptorHandleIncrementSize", &format!("type={heap_type} -> {sz}"));
+    }
+    sz
 }
 
 // Forwarding thunk: this(rcx) -> this->real; jmp real->vtbl[slot].
@@ -280,6 +306,7 @@ fn vtable() -> *const usize {
             v.push(dev_stub as usize);
         }
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
+        v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
         v[73] = create_command_list_x as usize;  // Xbox command-list create
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     }) as *const usize

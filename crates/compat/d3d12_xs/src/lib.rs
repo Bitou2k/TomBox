@@ -14,6 +14,7 @@
 mod device_wrap;
 mod dxgi_device;
 mod heap_wrap;
+mod cmdlist_wrap;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -34,6 +35,39 @@ pub static IID_ID3D12Device: [u8; 16] = [
 ];
 
 const D3D_FEATURE_LEVEL_12_0: u32 = 0xc000;
+
+/// IID_ID3D12Debug = {344488b7-6846-474b-b989-f027448245e0}
+static IID_ID3D12DEBUG: device_wrap::Guid = device_wrap::Guid {
+    d1: 0x3444_88b7, d2: 0x6846, d3: 0x474b, d4: [0xb9, 0x89, 0xf0, 0x27, 0x44, 0x82, 0x45, 0xe0],
+};
+
+/// Enable the D3D12 debug layer (best-effort) so validation errors are emitted via
+/// OutputDebugString and captured by the tracer. Gated on env TOMBOX_D3D12_DEBUG.
+fn maybe_enable_debug_layer() {
+    if std::env::var("TOMBOX_D3D12_DEBUG").is_err() {
+        return;
+    }
+    let p = host_proc(b"D3D12GetDebugInterface\0");
+    if p == 0 {
+        return;
+    }
+    let f: unsafe extern "system" fn(*const device_wrap::Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(p) };
+    let mut dbg: *mut c_void = core::ptr::null_mut();
+    let hr = unsafe { f(&IID_ID3D12DEBUG, &mut dbg) };
+    if hr == 0 && !dbg.is_null() {
+        unsafe {
+            let vt = *(dbg as *const *const usize);
+            let enable: unsafe extern "system" fn(*mut c_void) = core::mem::transmute(*vt.add(3)); // EnableDebugLayer
+            enable(dbg);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*vt.add(2));
+            rel(dbg);
+        }
+        record(M, "debug", "D3D12 debug layer ENABLED");
+    } else {
+        record(M, "debug", &format!("D3D12GetDebugInterface hr={hr:#010x} (SDK layers missing?)"));
+    }
+}
 
 fn host_d3d12() -> HMODULE {
     static CELL: AtomicUsize = AtomicUsize::new(0);
@@ -63,6 +97,7 @@ pub extern "system" fn D3D12XboxCreateDevice(
     riid: *const c_void,
     pp_device: *mut *mut c_void,
 ) -> i32 {
+    maybe_enable_debug_layer();
     let p = host_proc(b"D3D12CreateDevice\0");
     if p == 0 {
         record(M, "D3D12XboxCreateDevice", "host D3D12CreateDevice missing -> E_FAIL");

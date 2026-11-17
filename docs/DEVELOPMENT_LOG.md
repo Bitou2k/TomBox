@@ -314,3 +314,38 @@ proven approach, large volume.
 - [~] 11 graphics device + features: device, caps, descriptor heaps, command
   queues AND command-list creation/reset all driving the real GPU; command
   recording -> present is the next phase.
+
+## 2026-11-16 — Session 2 cont.: Xbox D3D12.x command-list vtable solved
+
+### Root cause of the descriptor-table crash: a +4 vtable slot shift
+Enabled the D3D12 debug layer (TOMBOX_D3D12_DEBUG) in the shim — its validation
+messages flow through OutputDebugString into the tracer, turning opaque driver
+crashes into precise errors. It reported #646 INVALID_DESCRIPTOR_HANDLE in
+SetGraphicsRootDescriptorTable(root=2, handle=<stack ptr>). Patched the shared
+command-list vtable to log binds + caller RVA: the caller was
+FD3D12DescriptorCache::SetDescriptorHeaps calling command-list **slot 32** with
+(NumHeaps=2, ppHeaps=&{srvHeap,samplerHeap}) — i.e. it was **SetDescriptorHeaps**
+(PC slot 28), not SetGraphicsRootDescriptorTable (PC slot 32).
+
+Reverse-engineered the Xbox command-list vtable from call sites in the Fortnite
+RHI: slots 0..=26 are identical to PC (verified: Close=9, Reset=10,
+DrawInstanced=12, DrawIndexedInstanced=13, Dispatch=14, SetPipelineState=25,
+ResourceBarrier=26), then **4 Xbox-specific methods are inserted after PC slot
+27**, shifting every method >=28 by +4 (SetDescriptorHeaps 28->32,
+OMSetRenderTargets 46->50, all verified).
+
+Fix (cmdlist_wrap.rs): build an "Xbox-layout" vtable whose slot i holds the real
+PC method pointer for the mapped PC slot (identity 0..=26, stub 27..=31, i-4 for
+>=32), then repoint each real command-list object at it. No thunks needed — the
+object IS the real list, so the real method runs on the real `this`. Slots 0..=26
+stay identical so the runtime's own QI/GetType/AddRef/Release still work at
+ExecuteCommandLists time.
+
+Result: **#646 gone, all D3D12 validation clean.** The game now records and
+submits GPU work correctly. New blocker is unrelated: IoStore/.ucas content
+containers fail to open (DirectStorage path), fatal at pak mount.
+
+### Milestones
+- [x] 11 graphics device + required features: device, caps, descriptor heaps,
+  command queues, command lists, descriptor-table binding all correct on the
+  real GPU with zero D3D12 validation errors.
