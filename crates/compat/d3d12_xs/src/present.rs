@@ -296,6 +296,11 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
 unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if plane_count != 0 && !planes.is_null() {
+        // The frame identified by this token counts as flipped from here on (the title's
+        // flip tracking keys off it), even if the host-side present below fails.
+        crate::frame::mark_flipped(core::ptr::read_unaligned(planes as *const u64));
+    }
     if FAILED.load(Ordering::Relaxed) || plane_count == 0 || planes.is_null() {
         return 0;
     }
@@ -466,6 +471,35 @@ macro_rules! qlow {
 }
 qlow!((l8,8),(l9,9),(l10,10),(l11,11),(l12,12),(l13,13),(l14,14),(l15,15),(l16,16),(l17,17),(l18,18));
 
+/// Title-side ExecuteCommandLists (PC slot 10): the title passes command-list *shims*
+/// (see cmdlist_wrap); translate them to the real lists before submitting.
+unsafe extern "system" fn exec_lists_x(queue: *mut c_void, n: u32, lists: *const *mut c_void) {
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+        core::mem::transmute(REAL_QVT[10].load(Ordering::Relaxed));
+    if lists.is_null() || n == 0 {
+        return f(queue, n, lists);
+    }
+    let real: Vec<*mut c_void> =
+        (0..n as usize).map(|i| crate::cmdlist_wrap::unwrap(*lists.add(i))).collect();
+    f(queue, n, real.as_ptr())
+}
+
+/// Vtable entry for slot 10: title callers get `exec_lists_x`, everyone else the real method.
+#[unsafe(naked)]
+unsafe extern "system" fn q_exec_dispatch() {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]",
+        "sub rax, [rip + {base}]",
+        "cmp rax, [rip + {size}]",
+        "jb 2f",
+        "lea rax, [rip + {real}]",
+        "jmp qword ptr [rax + 80]",
+        "2:",
+        "jmp {x}",
+        base = sym EXE_BASE, size = sym EXE_SIZE, real = sym REAL_QVT, x = sym exec_lists_x,
+    );
+}
+
 /// Repoint a freshly created real command queue at the extended (Xbox-sized) vtable.
 pub fn apply_queue_vtable(queue: *mut c_void) {
     if queue.is_null() {
@@ -484,6 +518,7 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
             }
             install_qthunks();
             install_qlow();
+            QUEUE_VT[10].store(q_exec_dispatch as usize, Ordering::Relaxed);
             XBOX_QVT[30].store(present_x as usize, Ordering::Relaxed);
             XBOX_QVT[23].store(signal_x as usize, Ordering::Relaxed);
             let base = GetModuleHandleW(core::ptr::null()) as usize;

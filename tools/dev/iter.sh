@@ -12,7 +12,7 @@ for d in acphal d3d12_xs dxcompiler_xs mfplat xcrdapi xmem; do
 done
 rm -rf /c/Users/drych/AppData/Local/Temp/tombox_shaders
 export TOMBOX_LOG="C:/Users/drych/AppData/Local/Temp/tombox_g.log"; rm -f "$TOMBOX_LOG"
-timeout ${1:-240} "$SB/mdbg.exe" "G:/FortniteGame/Binaries/XSX/FortniteClient-XSX-Shipping.exe" -unattended > "$SB/run.txt" 2>&1
+MDBG_LIMIT=${1:-240} timeout $((${1:-240}+30)) "$SB/mdbg.exe" "G:/FortniteGame/Binaries/XSX/FortniteClient-XSX-Shipping.exe" -unattended > "$SB/run.txt" 2>&1
 grep -aE "shader_xlat FAIL|PSO_X (.*FAIL)|PSO_X untrans" "$TOMBOX_LOG" | cut -c15-240 | tail -5
 grep -aE "PSO_X counts" "$TOMBOX_LOG" | tail -1 | cut -c15-200
 grep -a "PresentX frame" "$TOMBOX_LOG" | tail -1 | cut -c15-80

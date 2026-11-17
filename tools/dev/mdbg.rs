@@ -87,7 +87,8 @@ fn main() {
 
     let mut modules: BTreeMap<u64, String> = BTreeMap::new();
     let start = std::time::Instant::now();
-    let limit = std::time::Duration::from_secs(70);
+    // Run-time limit in seconds (env MDBG_LIMIT, default 70).
+    let limit = std::time::Duration::from_secs(std::env::var("MDBG_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(70));
     let mut exc_count = 0u32;
     let mut av_captured = false;
     let exit_code;
@@ -130,7 +131,21 @@ fn main() {
     let mut exebp_replant_pending = false;
     let mut exebp_hits: u64 = 0;
 
+    // MDBG_HANGDUMP=<secs>: once, that long after launch, print a stack scan of every thread
+    // (for diagnosing stalls: which threads are blocked where).
+    let hangdump = std::env::var("MDBG_HANGDUMP").ok().and_then(|v| v.parse::<u64>().ok());
+    let mut hang_dumped = false;
+    let mut tids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     loop {
+        if let Some(s) = hangdump {
+            if !hang_dumped && start.elapsed().as_secs() >= s {
+                hang_dumped = true;
+                eprintln!("[HANG] thread dump at {s}s ({} threads)", tids.len());
+                for &t in &tids {
+                    dump_thread(hproc, t, &modules);
+                }
+            }
+        }
         if start.elapsed() > limit {
             eprintln!("[trace] time limit reached; terminating");
             unsafe { TerminateProcess(hproc, 1); }
@@ -140,6 +155,11 @@ fn main() {
         let mut evt: DEBUG_EVENT = unsafe { std::mem::zeroed() };
         if unsafe { WaitForDebugEventEx(&mut evt, 1000) } == 0 { continue; }
         let mut status = DBG_CONTINUE;
+        match evt.code {
+            2 | 3 => { tids.insert(evt.tid); }
+            4 => { tids.remove(&evt.tid); }
+            _ => {}
+        }
         match evt.code {
             3 => { // CREATE_PROCESS: hFile(0), hProcess(8), hThread(16), lpBaseOfImage(24)
                 let base = rd_u64(&evt.u, 24);
@@ -542,6 +562,37 @@ fn capture_probe(hproc: HANDLE, tid: u32, xgr_base: u64) {
         if let Some(vt) = read_u64(hproc, svc) {
             eprintln!("[PROBE] service vtable = 0x{:x}  (RVA 0x{:x}) <- ask IDA what class/RTTI this is", vt, vt.wrapping_sub(xgr_base));
         }
+    }
+    unsafe { CloseHandle(hthread); }
+}
+
+/// Print rip + code-looking stack values of one thread (skips threads idle in the kernel
+/// with no title/compat frames near the top of their stack).
+fn dump_thread(hproc: HANDLE, tid: u32, modules: &BTreeMap<u64, String>) {
+    let hthread = unsafe { OpenThread(0x0008 | 0x0040, 0, tid) };
+    if hthread == 0 { return; }
+    let mut ctx = Ctx([0u8; 1256]);
+    ctx.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
+    if unsafe { GetThreadContext(hthread, ctx.0.as_mut_ptr()) } == 0 {
+        unsafe { CloseHandle(hthread); }
+        return;
+    }
+    let rsp = rd_u64(&ctx.0, 0x98);
+    let rip = rd_u64(&ctx.0, 0xF8);
+    let mut buf = vec![0u8; 16384];
+    let mut got = 0usize;
+    unsafe { ReadProcessMemory(hproc, rsp as *const c_void, buf.as_mut_ptr(), buf.len(), &mut got); }
+    let name = |v: u64| modules.range(..=v).next_back().filter(|(b, _)| v - **b < 0x6000000 && v > 0x10000).map(|(b, n)| format!("{} +0x{:x}", n, v - b));
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i + 8 <= got && lines.len() < 60 {
+        if let Some(s) = name(rd_u64(&buf, i)) { lines.push(format!("    [rsp+0x{:x}] {}", i, s)); }
+        i += 8;
+    }
+    let interesting = lines.iter().any(|l| !(l.contains("ntdll") || l.contains("kernel32") || l.contains("KernelBase") || l.contains("KERNELBASE")));
+    if interesting {
+        eprintln!("[HANG] tid={} rip={}", tid, name(rip).unwrap_or_else(|| format!("0x{:x}", rip)));
+        for l in lines { eprintln!("{l}"); }
     }
     unsafe { CloseHandle(hthread); }
 }

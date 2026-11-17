@@ -535,3 +535,42 @@ Built `crates/tombox-xshader` (2 passing regression tests):
 
 Next: VOP opcode-semantics table → RDNA2→HLSL emitter (straight-line first) → dxc compile →
 wire into create_gfx_pso_x with caching + fallback. See docs/FORTNITE_ANALYSIS.md.
+
+## 2026-11-17 (later) — network guard, frame pacing, first visible frame
+
+**Network guard.** Once pipeline creation worked the title's online subsystems started and
+issued real WinHTTP requests (analytics to `datarouter.ol.epicgames.com`, observed
+succeeding). `compat-common::net_guard` now fails DNS/connect/sendto/WinHTTP in-process
+(14 entry points); every run summary prints the guard status. Details and gaps in
+`docs/TECHNICAL_DEBT.md`.
+
+**Translator.** Block dispatcher for CFGs that are not nested loops, 64-bit vector shifts,
+`flat_load_dword*` from embedded constant tables (only the table tail is emitted: FXC's
+4096 indexable-literal limit). Global archive coverage 1410/1689 (83.5%).
+
+**Command-list shim.** `FD3D12StateCacheBase::ApplyState` (EXE+0x4e0433) writes command
+packets inline through `[list+18h]`/`[list+30h]` and only calls the vtable when the buffer is
+full. The title now receives a zeroed shim object (write ptr == end ptr) whose thunks forward
+to the real list; `ExecuteCommandLists` unwraps shims. Only that one inline site is verified.
+
+**Frame pacing (`d3d12_xs/src/frame.rs`).** The stall after engine frame 8 was the game
+thread waiting on a flip-synchronised render fence (UE watchdog `FThreadHeartBeat` then
+killed the process ~90 s later). Device slots 78/79/80/81 = SetFrameIntervalX /
+ScheduleFrameEventX / WaitFrameEventX / per-token frame statistics, reconstructed from
+`XboxCommonGDKUpdateFrameEvents`, `FD3D12Viewport::PresentInternal`,
+`RHIWaitForFlip` and `GetFrameStatisticsForMostRecentFrame`. Implemented: interval timer,
+flip-event signalling, tokens, statistics for tokens that reached PresentX.
+
+**Result (verified, repeatable twice undebugged):** the title runs > 3 minutes without the
+watchdog firing, the game thread is in `UGameEngine::Tick`, 4000–5400 PresentX frames, and
+the host window shows drawn, animated content — a blue full-screen background with a yellow
+rotating quad (`analysis/evidence/2026-11-17_first_visible_frame_{a,b}.png`). This is output
+of the title's own draw calls through translated shaders.
+
+**Not yet true:** no textures (device slot 44 CreatePlacedResourceX and slot 61 sampler are
+still stubs, cmdlist slots 67/68/83 are no-ops), so logos/text are missing; no audio; one
+debugger run showed a 14 s RHI-thread stall followed by a watchdog kill (not reproduced
+undebugged; cause unknown).
+
+Tools: `tools/dev/mdbg.rs` gained `MDBG_LIMIT` and `MDBG_HANGDUMP` (all-thread stack scan);
+`tools/dev/hang.sh` symbolises the dump.

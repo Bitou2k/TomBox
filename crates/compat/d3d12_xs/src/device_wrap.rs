@@ -236,8 +236,9 @@ unsafe extern "system" fn create_command_list_x(
         unsafe { core::mem::transmute(*real_vtbl(real).add(12)) };
     let hr = unsafe { f(real, node_mask, list_type, alloc, init_state, riid, ppv) };
     if hr == S_OK && !ppv.is_null() {
-        // Repoint the real list at the Xbox-layout vtable (fixes the +4 slot shift).
-        crate::cmdlist_wrap::apply(unsafe { *ppv });
+        // Hand the title a shim object (Xbox vtable layout + inert inline-buffer fields)
+        // instead of the real PC command list; see cmdlist_wrap.
+        unsafe { *ppv = crate::cmdlist_wrap::wrap(*ppv) };
     }
     record("d3d12_xs", "CreateCommandList", &format!("nodeMask={node_mask} type={list_type} -> hr={hr:#010x}"));
     hr
@@ -884,6 +885,11 @@ fn vtable() -> *const usize {
             v.push(dev_stub as usize);
         }
         unsafe { install_dev_stubs(&mut v); } // 44..90: logging S_OK stubs (diagnostic)
+        // Frame pacing (see frame.rs).
+        v[78] = crate::frame::set_frame_interval_x as usize;
+        v[79] = crate::frame::schedule_frame_event_x as usize;
+        v[80] = crate::frame::wait_frame_event_x as usize;
+        v[81] = crate::frame::frame_statistics_x as usize;
         v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
         v[55] = create_derived_pso_x as usize; // Xbox derived-PSO create (base PSO + state patches)
         v[62] = create_compute_pso_x as usize; // Xbox compute PSO create
