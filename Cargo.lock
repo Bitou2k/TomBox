@@ -28,6 +28,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mfplat"
+version = "0.1.0"
+dependencies = [
+ "compat-common",
+]
+
+[[package]]
 name = "tombox-archive"
 version = "0.1.0"
 

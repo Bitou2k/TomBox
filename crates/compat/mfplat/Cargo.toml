@@ -1,0 +1,15 @@
+[package]
+name = "mfplat"
+version = "0.1.0"
+edition = "2021"
+description = "Forwarding proxy for Xbox mfplat.dll: forwards the 15 standard MF exports to the real system mfplat (copied as mfplat_sys.dll), and supplies the Xbox-only MFResetDXGIDeviceManagerX."
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[lib]
+name = "mfplat"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+compat-common = { path = "../compat-common" }

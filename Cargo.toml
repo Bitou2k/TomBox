@@ -13,6 +13,7 @@ members = [
     "crates/compat/xcrdapi",
     "crates/compat/dxcompiler_xs",
     "crates/compat/acphal",
+    "crates/compat/mfplat",
 ]
 
 [profile.release]
