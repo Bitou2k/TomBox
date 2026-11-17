@@ -410,6 +410,62 @@ qthunks!(
     (q59,x59,59),(q60,x60,60),(q61,x61,61),(q62,x62,62),(q63,x63,63),
 );
 
+/// Xbox queue slot 23 = Signal(pFence, Value, Flags) — called from FD3D12Fence::
+/// InternalSignal (EXE+0x7061d3). PC `Signal` is slot 14 and takes (pFence, Value).
+unsafe extern "system" fn signal_x(queue: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> i32 {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 =
+        core::mem::transmute(REAL_QVT[14].load(Ordering::Relaxed));
+    let hr = f(queue, fence, value);
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 3 {
+        record("d3d12_xs", "queue.SignalX", &format!("fence={fence:p} value={value} -> hr={hr:#010x}"));
+    }
+    hr
+}
+
+/// Diagnostic for title calls on the PC-range queue slots (8..18): logs the first few per
+/// slot so we can verify the Xbox queue really uses PC numbering there.
+unsafe extern "system" fn qlow_log(slot: u64, caller: usize) {
+    static PER: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+    if PER[(slot as usize).min(31)].fetch_add(1, Ordering::Relaxed) < 2 {
+        let base = EXE_BASE.load(Ordering::Relaxed);
+        record("d3d12_xs", "queue.pc", &format!("title called PC-range queue slot {slot} from EXE+{:#x}", caller.wrapping_sub(base)));
+    }
+}
+
+macro_rules! qlow {
+    ($(($name:ident, $slot:literal)),* $(,)?) => {
+        $(
+            #[unsafe(naked)]
+            unsafe extern "system" fn $name() {
+                core::arch::naked_asm!(
+                    "mov rax, [rsp]",
+                    "sub rax, [rip + {base}]",
+                    "cmp rax, [rip + {size}]",
+                    "jae 2f",
+                    // title caller: log (preserving argument registers), then forward
+                    "push rcx", "push rdx", "push r8", "push r9",
+                    "sub rsp, 0x28",
+                    "mov ecx, {s}",
+                    "mov rdx, [rsp + 0x48]",
+                    "call {log}",
+                    "add rsp, 0x28",
+                    "pop r9", "pop r8", "pop rdx", "pop rcx",
+                    "2:",
+                    "lea rax, [rip + {real}]",
+                    "jmp qword ptr [rax + {off}]",
+                    base = sym EXE_BASE, size = sym EXE_SIZE, real = sym REAL_QVT, log = sym qlow_log,
+                    s = const $slot, off = const $slot * 8,
+                );
+            }
+        )*
+        unsafe fn install_qlow() {
+            $( QUEUE_VT[$slot].store($name as usize, Ordering::Relaxed); )*
+        }
+    };
+}
+qlow!((l8,8),(l9,9),(l10,10),(l11,11),(l12,12),(l13,13),(l14,14),(l15,15),(l16,16),(l17,17),(l18,18));
+
 /// Repoint a freshly created real command queue at the extended (Xbox-sized) vtable.
 pub fn apply_queue_vtable(queue: *mut c_void) {
     if queue.is_null() {
@@ -427,7 +483,9 @@ pub fn apply_queue_vtable(queue: *mut c_void) {
                 QUEUE_VT[i].store(*real_vt.add(i), Ordering::Relaxed);
             }
             install_qthunks();
+            install_qlow();
             XBOX_QVT[30].store(present_x as usize, Ordering::Relaxed);
+            XBOX_QVT[23].store(signal_x as usize, Ordering::Relaxed);
             let base = GetModuleHandleW(core::ptr::null()) as usize;
             let e_lfanew = core::ptr::read_unaligned((base + 0x3c) as *const u32) as usize;
             let size = core::ptr::read_unaligned((base + e_lfanew + 0x50) as *const u32) as usize;
