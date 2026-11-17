@@ -1467,18 +1467,33 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Enc::Ds if self.is_cs && matches!(m, "ds_add_u32" | "ds_add_rtn_u32") => {
-                // Atomic add on group-shared memory (optionally returning the old value).
+            Enc::Ds
+                if self.is_cs
+                    && matches!(
+                        m.replace("_rtn", "").as_str(),
+                        "ds_add_u32" | "ds_min_u32" | "ds_max_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32"
+                    ) =>
+            {
+                // Atomic read-modify-write on group-shared memory (the `_rtn` forms also
+                // return the old value) → the matching HLSL Interlocked* intrinsic.
                 self.uses_lds = true;
+                let func = match m.replace("_rtn", "").as_str() {
+                    "ds_add_u32" => "InterlockedAdd",
+                    "ds_min_u32" => "InterlockedMin",
+                    "ds_max_u32" => "InterlockedMax",
+                    "ds_and_b32" => "InterlockedAnd",
+                    "ds_or_b32" => "InterlockedOr",
+                    _ => "InterlockedXor",
+                };
                 let off = ins.aux.imm as u32 & 0xffff;
                 let addr = r(&s[0])?;
                 let t = self.tmp;
                 self.tmp += 1;
                 self.line(&format!(
-                    "uint t{t} = 0u; if (exec_lo & 1u) {{ InterlockedAdd(tb_lds[(({addr} + {off:#x}u) >> 2) & 8191u], {}, t{t}); }}",
+                    "uint t{t} = 0u; if (exec_lo & 1u) {{ {func}(tb_lds[(({addr} + {off:#x}u) >> 2) & 8191u], {}, t{t}); }}",
                     r(&s[1])?
                 ));
-                if m == "ds_add_rtn_u32" {
+                if m.contains("_rtn") {
                     self.wv(&d.ok_or("no dst")?, &format!("t{t}"))?;
                 }
                 Ok(())
@@ -1889,7 +1904,17 @@ impl<'a> Emitter<'a> {
             if self.tbuf_uint.contains(&slot) {
                 // uint-typed UAV (see atomics): single-component raw loads/stores.
                 let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-                if offen || !idxen || ins.aux.imm != 0 || !ins.mnemonic.ends_with("_format_x") {
+                // A buffer used with atomics has a single 32-bit channel (D3D requires
+                // R32_UINT/SINT for Interlocked*), so multi-component `_format_xy/xyz/xyzw`
+                // accesses move only X; a load fills the missing channels with (0, 0, 1).
+                let comps = match ins.mnemonic.rsplit('_').next() {
+                    Some("x") => 1u8,
+                    Some("xy") => 2,
+                    Some("xyz") => 3,
+                    Some("xyzw") => 4,
+                    _ => 0,
+                };
+                if offen || !idxen || ins.aux.imm != 0 || comps == 0 {
                     return Err("uint typed-buffer MUBUF form unsupported".into());
                 }
                 let index = r(&ins.src[0])?;
@@ -1902,6 +1927,11 @@ impl<'a> Emitter<'a> {
                     self.tmp += 1;
                     self.line(&format!("uint t{t} = utb{slot}[{index}];"));
                     self.wv(&vd, &format!("t{t}"))?;
+                    if let Opnd::Vgpr(v) = vd {
+                        for k in 1..comps {
+                            self.wv(&Opnd::Vgpr(v + k), if k == 3 { "1u" } else { "0u" })?;
+                        }
+                    }
                 }
                 return Ok(());
             }
