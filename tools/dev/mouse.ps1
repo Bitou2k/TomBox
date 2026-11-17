@@ -8,6 +8,7 @@ public static class TbMouse {
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, UIntPtr e);
     public static IntPtr Find() {
         IntPtr found = IntPtr.Zero;
@@ -23,6 +24,8 @@ if ($h -eq [IntPtr]::Zero) { Write-Output "no TomBoxHostWindow"; exit 1 }
 $rx = $Dx; $ry = $Dy
 while ($rx -ne 0 -or $ry -ne 0) {
     $sx = [Math]::Max(-10, [Math]::Min(10, $rx)); $sy = [Math]::Max(-10, [Math]::Min(10, $ry))
+    # Injected relative moves only produce input while the OS cursor can move: keep it mid-screen.
+    [void][TbMouse]::SetCursorPos(900, 600)
     [TbMouse]::mouse_event(0x0001, $sx, $sy, 0, [UIntPtr]::Zero)
     $rx -= $sx; $ry -= $sy; Start-Sleep -Milliseconds 12
 }

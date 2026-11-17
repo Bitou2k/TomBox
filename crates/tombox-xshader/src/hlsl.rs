@@ -26,13 +26,28 @@ pub struct Translated {
     pub profile: &'static str,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sym {
     Table(u8),
     Desc { table: u8, off: u32, k: u32 },
+    /// Dword `k` of one of several descriptors (control-flow join of different `s_load`s,
+    /// e.g. a loop that picks texture i of N). `set` indexes `Emitter::multi_sets`; which
+    /// candidate is live is tracked at run time in a `tb_dsel<reg>` variable.
+    Multi { set: u16, k: u32 },
     /// A PC-relative pointer into the shader's own code section (`s_getpc_b64` + offsets),
     /// used to read constant tables embedded after the program.
     Code,
+}
+
+/// An image op whose texture and/or sampler register holds one of several descriptors.
+/// Each candidate is `(descriptor id, resolved resource)`; the id is what the run-time
+/// selector `tb_dsel<reg>` holds.
+#[derive(Clone, Debug)]
+struct MSel {
+    tex_reg: u8,
+    samp_reg: u8,
+    tex: Vec<(u32, Res)>,
+    samp: Vec<(u32, Res)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +204,14 @@ struct Emitter<'a> {
     uses_lds: bool,
     /// Shader reads constant tables embedded in its code section.
     uses_code: bool,
+    /// Interned candidate lists `(table, offset)` for `Sym::Multi`.
+    multi_sets: Vec<Vec<(u8, u32)>>,
+    /// Image ops whose texture and/or sampler is one of several descriptors.
+    msel: HashMap<usize, MSel>,
+    /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
+    /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
+    dsel_loads: HashMap<usize, (u8, u32)>,
+    dsel_moves: HashMap<usize, (u8, u8)>,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
     /// Pixel shader needs its position within the 2x2 quad (ds_swizzle).
@@ -313,6 +336,10 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         is_gs: ex.stage == Stage::Geometry,
         uses_lds: false,
         uses_code: false,
+        multi_sets: Vec::new(),
+        msel: HashMap::new(),
+        dsel_loads: HashMap::new(),
+        dsel_moves: HashMap::new(),
         live: Vec::new(),
         uses_quad: false,
         regs: BTreeSet::new(),
@@ -441,10 +468,27 @@ impl<'a> Emitter<'a> {
                         true
                     }
                     Some((osym, owr)) => {
-                        let before = (osym.len(), owr.len());
-                        osym.retain(|k, v| sym.get(k) == Some(v));
+                        let before = (osym.clone(), owr.len());
+                        let keys: Vec<u8> = osym.keys().copied().collect();
+                        for k in keys {
+                            let a = osym[&k];
+                            match sym.get(&k).copied() {
+                                Some(b) if a == b => {}
+                                Some(b) => match self.join_desc(a, b) {
+                                    Some(j) => {
+                                        osym.insert(k, j);
+                                    }
+                                    None => {
+                                        osym.remove(&k);
+                                    }
+                                },
+                                None => {
+                                    osym.remove(&k);
+                                }
+                            }
+                        }
                         owr.extend(written.iter().copied());
-                        before != (osym.len(), owr.len())
+                        before != (osym.clone(), owr.len())
                     }
                 };
                 if changed && !work.contains(&s) {
@@ -454,6 +498,9 @@ impl<'a> Emitter<'a> {
         }
         (self.res, self.cb_size, self.tex, self.samp, self.samp_cmp, self.uav, self.sbuf, self.tbuf, self.tbuf_uint) = saved;
 
+        self.msel.clear();
+        self.dsel_loads.clear();
+        self.dsel_moves.clear();
         // Recording pass with the converged entry states.
         for (b, r) in ranges.iter().enumerate() {
             if let Some((mut sym, mut written)) = states[b].clone() {
@@ -461,6 +508,46 @@ impl<'a> Emitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Candidate descriptors `(table, offset)` of a symbol that is dword 0 of a descriptor.
+    fn desc_candidates(&self, s: Option<&Sym>) -> Option<Vec<(u8, u32)>> {
+        match s {
+            Some(Sym::Desc { table, off, k: 0 }) => Some(vec![(*table, *off)]),
+            Some(Sym::Multi { set, k: 0 }) => self.multi_sets.get(*set as usize).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Join of two different descriptor symbols at a control-flow merge: the union of
+    /// their candidates when both are the same dword of some descriptor, else nothing.
+    fn join_desc(&mut self, a: Sym, b: Sym) -> Option<Sym> {
+        let parts = |s: Sym, sets: &Vec<Vec<(u8, u32)>>| -> Option<(Vec<(u8, u32)>, u32)> {
+            match s {
+                Sym::Desc { table, off, k } => Some((vec![(table, off)], k)),
+                Sym::Multi { set, k } => sets.get(set as usize).map(|v| (v.clone(), k)),
+                _ => None,
+            }
+        };
+        let (mut ca, ka) = parts(a, &self.multi_sets)?;
+        let (cb, kb) = parts(b, &self.multi_sets)?;
+        if ka != kb {
+            return None;
+        }
+        ca.extend(cb);
+        ca.sort();
+        ca.dedup();
+        if ca.len() > 16 {
+            return None; // not a small "one of N" selection
+        }
+        let set = match self.multi_sets.iter().position(|v| *v == ca) {
+            Some(i) => i,
+            None => {
+                self.multi_sets.push(ca);
+                self.multi_sets.len() - 1
+            }
+        };
+        Some(Sym::Multi { set: set as u16, k: ka })
     }
 
     /// Transfer function for one basic block (also records resources / reports errors).
@@ -495,6 +582,11 @@ impl<'a> Emitter<'a> {
                             }
                         }
                         written.insert(d);
+                        if let Some(s) = ins.src.first().and_then(sg) {
+                            if matches!(sym.get(&d), Some(Sym::Desc { k: 0, .. }) | Some(Sym::Multi { k: 0, .. })) {
+                                self.dsel_moves.insert(idx, (d, s));
+                            }
+                        }
                     }
                 }
                 Enc::Sop1 if ins.mnemonic == "s_mov_b64" => {
@@ -505,6 +597,9 @@ impl<'a> Emitter<'a> {
                         for k in 0..2u8 {
                             match s.and_then(|s| sym.get(&(s + k)).cloned()) {
                                 Some(v) => {
+                                    if k == 0 && matches!(v, Sym::Desc { k: 0, .. } | Sym::Multi { k: 0, .. }) {
+                                        self.dsel_moves.insert(idx, (d, s.unwrap_or(d)));
+                                    }
                                     sym.insert(d + k, v);
                                 }
                                 None => {
@@ -568,6 +663,7 @@ impl<'a> Emitter<'a> {
                     }
                     for k in 0..n {
                         sym.insert(d + k as u8, Sym::Desc { table, off: ins.aux.imm as u32, k });
+                        self.dsel_loads.insert(idx, (d, ((table as u32) << 24) | ins.aux.imm as u32));
                         written.insert(d + k as u8);
                     }
                 }
@@ -658,37 +754,47 @@ impl<'a> Emitter<'a> {
                     let rs = ins.src.get(n - 2).and_then(sg).ok_or("mimg: bad srsrc")?;
                     let ss = ins.src.get(n - 1).and_then(sg).ok_or("mimg: bad ssamp")?;
                     let dim = ins.aux.imm as u32;
-                    let (tslot, ttable) = match sym.get(&rs) {
-                        Some(Sym::Desc { off, k: 0, table }) => (off / 32, *table),
-                        other => {
-                            return Err(format!("mimg at {:#x}: s{rs} not an image descriptor ({other:?})", ins.offset))
+                    let tex_c = self.desc_candidates(sym.get(&rs)).ok_or_else(|| {
+                        format!("mimg at {:#x}: s{rs} not an image descriptor ({:?})", ins.offset, sym.get(&rs))
+                    })?;
+                    let mut tex_res: Vec<(u32, Res)> = Vec::new();
+                    for (ttable, off) in &tex_c {
+                        let tslot = off / 32;
+                        let is_uav = self.table_kind(*ttable) == Some(1);
+                        let map = if is_uav { &mut self.uav } else { &mut self.tex };
+                        if let Some(prev) = map.insert(tslot, dim) {
+                            if prev != dim {
+                                return Err(format!("image slot {tslot} used with two dimensions"));
+                            }
                         }
-                    };
-                    let is_uav = self.table_kind(ttable) == Some(1);
-                    let mut v = vec![if is_uav { Res::Uav(tslot, dim) } else { Res::Tex(tslot, dim) }];
-                    let map = if is_uav { &mut self.uav } else { &mut self.tex };
-                    if let Some(prev) = map.insert(tslot, dim) {
-                        if prev != dim {
-                            return Err(format!("image slot {tslot} used with two dimensions"));
+                        tex_res.push((((*ttable as u32) << 24) | off, if is_uav { Res::Uav(tslot, dim) } else { Res::Tex(tslot, dim) }));
+                    }
+                    let mut samp_res: Vec<(u32, Res)> = Vec::new();
+                    if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") {
+                        let samp_c = self.desc_candidates(sym.get(&ss)).ok_or_else(|| {
+                            format!("mimg at {:#x}: s{ss} not a sampler descriptor ({:?})", ins.offset, sym.get(&ss))
+                        })?;
+                        for (stable, off) in &samp_c {
+                            let sslot = off / 16;
+                            // Depth-compare variants (opcode bit 3) need a comparison sampler.
+                            if ins.op & 8 != 0 {
+                                self.samp_cmp.insert(sslot);
+                            } else {
+                                self.samp.insert(sslot);
+                            }
+                            samp_res.push((((*stable as u32) << 24) | off, Res::Samp(sslot)));
                         }
                     }
-                    if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") {
-                        let sslot = match sym.get(&ss) {
-                            Some(Sym::Desc { off, k: 0, .. }) => off / 16,
-                            other => {
-                                return Err(format!("mimg at {:#x}: s{ss} not a sampler descriptor ({other:?})", ins.offset))
-                            }
-                        };
-                        // Depth-compare variants (opcode bit 3) need a comparison sampler.
-                        if ins.op & 8 != 0 {
-                            self.samp_cmp.insert(sslot);
-                        } else {
-                            self.samp.insert(sslot);
-                        }
-                        v.push(Res::Samp(sslot));
+                    let mut v = vec![tex_res[0].1];
+                    if let Some(s) = samp_res.first() {
+                        v.push(s.1);
+                    }
+                    if tex_res.len() > 1 || samp_res.len() > 1 {
+                        self.msel.insert(idx, MSel { tex_reg: rs, samp_reg: ss, tex: tex_res, samp: samp_res });
                     }
                     self.res.insert(idx, v);
                 }
+
                 _ => {
                     for d in &ins.dst {
                         if let Some(n) = sg(d) {
@@ -1061,6 +1167,49 @@ impl<'a> Emitter<'a> {
         let s = &ins.src;
         let d = ins.dst.first().cloned();
         self.line(&format!("// {:#06x} {m}", ins.offset));
+        // Run-time descriptor selectors (only for shaders with a "one of N" image op).
+        if !self.msel.is_empty() {
+            if let Some(&(d, id)) = self.dsel_loads.get(&idx) {
+                self.regs.insert(format!("tb_dsel{d}"));
+                self.line(&format!("tb_dsel{d} = {id:#x}u;"));
+            }
+            if let Some(&(d, s)) = self.dsel_moves.get(&idx) {
+                self.regs.insert(format!("tb_dsel{d}"));
+                self.regs.insert(format!("tb_dsel{s}"));
+                self.line(&format!("tb_dsel{d} = tb_dsel{s};"));
+            }
+        }
+        if ins.enc == Enc::Mimg {
+            if let Some(sel) = self.msel.get(&idx).cloned() {
+                // One guarded copy of the op per (texture, sampler) candidate pair.
+                self.regs.insert(format!("tb_dsel{}", sel.tex_reg));
+                self.regs.insert(format!("tb_dsel{}", sel.samp_reg));
+                let samps: Vec<Option<(u32, Res)>> =
+                    if sel.samp.is_empty() { vec![None] } else { sel.samp.iter().copied().map(Some).collect() };
+                let mut first = true;
+                for (tid, tres) in &sel.tex {
+                    for s in &samps {
+                        let mut cond = vec![];
+                        if sel.tex.len() > 1 {
+                            cond.push(format!("tb_dsel{} == {tid:#x}u", sel.tex_reg));
+                        }
+                        let mut v = vec![*tres];
+                        if let Some((sid, sres)) = s {
+                            if sel.samp.len() > 1 {
+                                cond.push(format!("tb_dsel{} == {sid:#x}u", sel.samp_reg));
+                            }
+                            v.push(*sres);
+                        }
+                        self.line(&format!("{}if ({}) {{", if first { "" } else { "else " }, cond.join(" && ")));
+                        first = false;
+                        self.res.insert(idx, v);
+                        self.emit_mimg(idx, ins)?;
+                        self.line("}");
+                    }
+                }
+                return Ok(());
+            }
+        }
         match ins.enc {
             Enc::Sopp if ins.op == 0x10 => self.emit_sendmsg(ins),
             Enc::Sopp if ins.op == 0x0a && self.is_cs => {
