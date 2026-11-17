@@ -217,3 +217,36 @@ file / content mounting** (how the title resolves and reads packaged files), to 
 `crates/tombox-disasm` is committed. The diagnostic tracer (`mdbg`), minidump parser
 (`mdparse`), symbol resolver (`symres`) and export/IAT readers currently live in the
 session scratchpad and should be formalized into the repo (`tombox-trace`, `tombox-sym`).
+
+## 2026-11-16 — Session 2 cont.: REAL D3D12 DEVICE CREATED; full engine init runs
+
+### The game now runs its entire Unreal Engine init on PC
+With G:\ mapped to the package (subst) and the compat layer, FortniteClient-XSX
+boots through its real init, with full UE logging:
+- FEngineLoop PreInit (project descriptor now loads from G:\FortniteGame\)
+- IoStore/DirectStorage (XCRDAPI DStorageGetFactory -> forwarded to real PC
+  dstorage.dll with PC IID substitution; Xbox/PC IDStorageFactory compatible)
+- APU audio heap (AcpHal ApuCreateHeap/ApuAlloc/ApuHeapGetState -> real host memory)
+- Chaos physics, localization, LogOnline/MCP, GDKInput (5 controller devices),
+  Slate (UI user)
+- D3D12RHI: XGCreateTextureComputer (REAL xg_xs.dll used as-is — pure RDNA2
+  tiling math, self-contained: imports only msvcrt + api-ms-win-core + our xmem)
+- **D3D12XboxCreateDevice -> created a REAL PC D3D12 device** (host d3d12.dll;
+  Xbox device IID == PC ID3D12Device {189819f1-...}, hr=S_OK, live device handle)
+
+### Current wall: D3D12.x device interface divergence
+`RootDevice->QueryInterface(__uuidof(IDXGIDevice))` fails: Xbox D3D12.x merges the
+DXGI device into ID3D12Device; PC keeps them separate. First point where D3D12.x
+needs a **wrapper/translation**, not a plain forward. Next phase: a COM proxy for
+the device (handle QI for IDXGIDevice + Xbox-specific methods, forward the rest),
+then command queues, swapchain/present, resources, PSOs, shaders.
+
+### Key technique discovered
+Some Xbox DLLs are pure computation and run on PC as-is (real xg_xs.dll). Others
+forward to PC equivalents with IID substitution (DStorage, D3D12 device). Only the
+hardware/semantics-divergent surface needs real translation.
+
+### Milestones (CLAUDE.md §12)
+- [x] 12 Actual Fortnite reaches meaningful initialization — ACHIEVED (full UE init).
+- [~] 11 Graphics device initialized — device CREATED; post-device RHI setup pending
+  the D3D12.x wrapper.

@@ -1,72 +1,116 @@
 //! `d3d12_xs.dll` compatibility shim (Xbox Series Direct3D 12.x).
 //!
-//! These are logging stubs for now: they let the loader resolve imports so the
-//! process starts and we can observe the real D3D12.x bring-up order. Device
-//! creation returns `E_NOTIMPL` (fail-loud, no faked device) until the graphics
-//! backend exists. The one real thing here is the exported `IID_ID3D12Device`
-//! GUID data symbol, which the game imports by name.
+//! The Fortnite RHI creates its device via `D3D12XboxCreateDevice(adapter,
+//! D3D12XBOX_CREATE_DEVICE_PARAMETERS*, riid, ppDevice)` and the requested device
+//! IID is **identical to PC `ID3D12Device`** `{189819f1-...}`. So we create a real
+//! PC D3D12 device through the host `d3d12.dll` and hand it back. The Xbox-only
+//! create parameters are ignored (PC uses adapter + feature level). Root-signature
+//! serialization forwards to the host `d3d12.dll` (same exports).
+//!
+//! This is the entry to the graphics-translation layer: the base ID3D12Device
+//! matches, but D3D12.x adds Xbox-specific device methods/semantics beyond the
+//! base interface — those will be addressed as the RHI exercises them.
 
 use core::ffi::c_void;
-use compat_common::{record, E_NOTIMPL, S_OK};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Once;
+use compat_common::{record, E_FAIL, S_OK};
 
 const M: &str = "d3d12_xs";
 
-/// IID_ID3D12Device = {189819F1-1DB6-4B57-BE54-1821339B85F7}, little-endian
-/// GUID byte layout (Data1 LE, Data2 LE, Data3 LE, Data4 as-is). This is a real,
-/// correct value — the game reads it to request the device interface.
-#[no_mangle]
-pub static IID_ID3D12Device: [u8; 16] = [
-    0xF1, 0x19, 0x98, 0x18, // Data1 = 0x189819F1
-    0xB6, 0x1D, // Data2 = 0x1DB6
-    0x57, 0x4B, // Data3 = 0x4B57
-    0xBE, 0x54, 0x18, 0x21, 0x33, 0x9B, 0x85, 0xF7, // Data4
-];
-
-#[no_mangle]
-pub extern "system" fn D3D12CreateDevice(
-    _adapter: *mut c_void,
-    _min_feature_level: u32,
-    _riid: *const c_void,
-    _ppdevice: *mut *mut c_void,
-) -> i32 {
-    record(M, "D3D12CreateDevice", "[STUB -> E_NOTIMPL] (no graphics backend yet)");
-    E_NOTIMPL
+type HMODULE = *mut c_void;
+extern "system" {
+    fn LoadLibraryW(p: *const u16) -> HMODULE;
+    fn GetProcAddress(h: HMODULE, n: *const u8) -> *mut c_void;
 }
 
+#[no_mangle]
+pub static IID_ID3D12Device: [u8; 16] = [
+    0xF1, 0x19, 0x98, 0x18, 0xB6, 0x1D, 0x57, 0x4B, 0xBE, 0x54, 0x18, 0x21, 0x33, 0x9B, 0x85, 0xF7,
+];
+
+const D3D_FEATURE_LEVEL_12_0: u32 = 0xc000;
+
+fn host_d3d12() -> HMODULE {
+    static CELL: AtomicUsize = AtomicUsize::new(0);
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // Full path avoids any name-based self-reference (we are d3d12_xs.dll).
+        let name: Vec<u16> = r"C:\Windows\System32\d3d12.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        let h = unsafe { LoadLibraryW(name.as_ptr()) } as usize;
+        record(M, "init", &format!("host d3d12.dll = {h:#x}"));
+        CELL.store(h, Ordering::Relaxed);
+    });
+    CELL.load(Ordering::Relaxed) as HMODULE
+}
+
+fn host_proc(name: &[u8]) -> usize {
+    let h = host_d3d12();
+    if h.is_null() { return 0; }
+    unsafe { GetProcAddress(h, name.as_ptr()) as usize }
+}
+
+/// Xbox device creation -> real PC D3D12 device. adapter/params ignored; the
+/// device IID matches PC ID3D12Device.
 #[no_mangle]
 pub extern "system" fn D3D12XboxCreateDevice(
     _adapter: *mut c_void,
     _params: *const c_void,
-    _riid: *const c_void,
-    _ppdevice: *mut *mut c_void,
+    riid: *const c_void,
+    pp_device: *mut *mut c_void,
 ) -> i32 {
-    record(M, "D3D12XboxCreateDevice", "[STUB -> E_NOTIMPL] (no graphics backend yet)");
-    E_NOTIMPL
+    let p = host_proc(b"D3D12CreateDevice\0");
+    if p == 0 {
+        record(M, "D3D12XboxCreateDevice", "host D3D12CreateDevice missing -> E_FAIL");
+        return E_FAIL;
+    }
+    // D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL, REFIID, void**)
+    let f: extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(p) };
+    let hr = f(core::ptr::null_mut(), D3D_FEATURE_LEVEL_12_0, riid, pp_device);
+    let dev = if pp_device.is_null() { core::ptr::null_mut() } else { unsafe { *pp_device } };
+    record(M, "D3D12XboxCreateDevice", &format!("host device create -> hr={hr:#010x} device={dev:p}"));
+    hr
+}
+
+#[no_mangle]
+pub extern "system" fn D3D12CreateDevice(
+    adapter: *mut c_void,
+    min_feature_level: u32,
+    riid: *const c_void,
+    pp_device: *mut *mut c_void,
+) -> i32 {
+    let p = host_proc(b"D3D12CreateDevice\0");
+    if p == 0 { return E_FAIL; }
+    let f: extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(p) };
+    f(adapter, min_feature_level, riid, pp_device)
 }
 
 #[no_mangle]
 pub extern "system" fn D3D12SerializeRootSignature(
-    _desc: *const c_void,
-    _version: u32,
-    _ppblob: *mut *mut c_void,
-    _pperror: *mut *mut c_void,
+    desc: *const c_void, version: u32, ppblob: *mut *mut c_void, pperror: *mut *mut c_void,
 ) -> i32 {
-    record(M, "D3D12SerializeRootSignature", "[STUB -> E_NOTIMPL]");
-    E_NOTIMPL
+    let p = host_proc(b"D3D12SerializeRootSignature\0");
+    if p == 0 { return E_FAIL; }
+    let f: extern "system" fn(*const c_void, u32, *mut *mut c_void, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(p) };
+    f(desc, version, ppblob, pperror)
 }
 
 #[no_mangle]
 pub extern "system" fn D3D12SerializeVersionedRootSignature(
-    _desc: *const c_void,
-    _ppblob: *mut *mut c_void,
-    _pperror: *mut *mut c_void,
+    desc: *const c_void, ppblob: *mut *mut c_void, pperror: *mut *mut c_void,
 ) -> i32 {
-    record(M, "D3D12SerializeVersionedRootSignature", "[STUB -> E_NOTIMPL]");
-    E_NOTIMPL
+    let p = host_proc(b"D3D12SerializeVersionedRootSignature\0");
+    if p == 0 { return E_FAIL; }
+    let f: extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(p) };
+    f(desc, ppblob, pperror)
 }
 
 #[no_mangle]
 pub extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> i32 {
-    record(M, "D3D12XboxSetProcessDebugFlags", "[STUB -> S_OK] (benign)");
+    record(M, "D3D12XboxSetProcessDebugFlags", "[S_OK]");
     S_OK
 }
