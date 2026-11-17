@@ -516,3 +516,22 @@ the engine's IoStore read/decompress routing differing on PC. Fix options:
       I/O hooking, scoped to not double-decompress content),
   (c) rewrite affected .ucas/.utoc to store uncompressed headers (offset-shift the
       whole container — deterministic but heavy).
+
+## 2026-11-17 — Shader format cracked; RDNA2 translator foundation built
+
+Reached the game's own "Gaming UI" window (black). Root-caused the black screen: every
+graphics PSO fails because the shaders ship as Xbox-native code, DXIL stripped. Reversed the
+full chain with evidence: `DXBC → DXIL(NOBC) → XDAT v3 → zlib(78 9c) → FSSM(v0x101) → native
+RDNA2 ISA` (confirmed by s_waitcnt/s_endpgm/s_code_end/s_cbranch markers). Not encrypted.
+
+Decision (user): build the real translator. Architecture: runtime JIT at PSO-create (Xbox
+device slot 60/55), per-hash disk cache, backend RDNA2 → HLSL → dxc → DXIL. Rationale: RDNA2
+VGPR ops are per-lane = per-thread, mapping cleanly to HLSL; dxc handles DXIL emit+signing.
+
+Built `crates/tombox-xshader` (2 passing regression tests):
+- `extract()`: DXBC→XDAT→zlib→FSSM→ISA, bounds-checked, validated against RDNA2 markers.
+- `rdna2::disassemble()`: length-accurate decoder + full operand decode (SOP*/SMEM/VOP*/VINTRP/
+  EXP), self-validated by landing exactly on s_endpgm (VS 67 instrs/400B, PS 117/604B).
+
+Next: VOP opcode-semantics table → RDNA2→HLSL emitter (straight-line first) → dxc compile →
+wire into create_gfx_pso_x with caching + fallback. See docs/FORTNITE_ANALYSIS.md.
