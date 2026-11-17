@@ -349,3 +349,22 @@ containers fail to open (DirectStorage path), fatal at pak mount.
 - [x] 11 graphics device + required features: device, caps, descriptor heaps,
   command queues, command lists, descriptor-table binding all correct on the
   real GPU with zero D3D12 validation errors.
+
+## 2026-11-16 — DirectStorage container open + found incomplete extraction
+
+### Xbox DirectStorage OpenFile IID substitution
+With the command-list vtable fixed, the next fatal was IoStore content: the Xbox
+IoStore backend (FXSXFileIoStoreImpl::OpenContainer) opens .ucas containers via
+DirectStorage factory->OpenFile (slot 4, PC-compatible slot). It passes the Xbox
+IDStorageFile IID, which PC OpenFile rejects (like the factory IID). xcrdapi now
+patches the real factory's vtable slot 4 to substitute PC IID_IDStorageFile
+{5de95e7b-...}. Result: OpenFile succeeds, containers open, pakChunkEarly-XSX
+mounts, plugins mount, device-profile CVars apply.
+
+### ROOT ISSUE found: the dump was only partially extracted
+The remaining fatal (appError Line 644) is almost certainly missing content: the
+original ZIP is 834 entries / 26.9 GB, but only 905 MB (302 files) had been
+extracted — just the smallest paks (global, pakChunkEarly, pakchunk0). Missing:
+pakchunk10-XSX.ucas (21 GB — the bulk of the game), pakchunk12/7/8/2/5/11, all
+Movies, 468 files total. Verified the 302 present files are byte-complete (no
+truncation). Extracting the missing 468 now (disk has 294 GB free).
