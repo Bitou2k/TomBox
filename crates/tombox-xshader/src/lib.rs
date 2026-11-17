@@ -301,18 +301,25 @@ fn range_contains_endpgm(sect: &[u8]) -> bool {
 
 /// Trim an ISA section to end just after the first `s_endpgm`, dropping `s_code_end` pad.
 fn trim_to_endpgm(sect: &[u8]) -> Vec<u8> {
+    // A program may contain early `s_endpgm`s (e.g. a pixel-kill path) with more code
+    // after them, so the program ends at the LAST `s_endpgm` before the `s_code_end`
+    // padding, not the first one.
+    let mut last_end = None;
     let mut p = 0;
     while p + 4 <= sect.len() {
         let w = u32::from_le_bytes([sect[p], sect[p + 1], sect[p + 2], sect[p + 3]]);
-        if w == S_ENDPGM {
-            return sect[..p + 4].to_vec();
-        }
         if w == S_CODE_END {
             break;
         }
+        if w == S_ENDPGM {
+            last_end = Some(p + 4);
+        }
         p += 4;
     }
-    sect.to_vec()
+    match last_end {
+        Some(e) => sect[..e].to_vec(),
+        None => sect.to_vec(),
+    }
 }
 
 /// Find the entry-point name (observed as an ASCII run near the FSSM tail, e.g. "Main").

@@ -442,6 +442,12 @@ unsafe extern "system" fn create_committed_resource(
     };
     let hr = unsafe { f(real, pheap, heap_flags, desc_ptr, init_state, pclear, use_riid, ppv) };
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if hr < 0 && !pdesc.is_null() {
+        let orig = unsafe { core::slice::from_raw_parts(pdesc as *const u8, 0x38) };
+        let hp = if pheap.is_null() { String::new() } else { unsafe { format!("heap{{type={} cpu={} pool={}}}", *pheap, *pheap.add(1), *pheap.add(2)) } };
+        record("d3d12_xs", "CreateCommittedResource", &format!(
+            "FAILED hr={hr:#010x} {hp} heapFlags={heap_flags:#x} state={init_state:#x} clear={pclear:p} {}", desc_str(orig)));
+    }
     if N.fetch_add(1, Ordering::Relaxed) < 10 {
         let htype = if pheap.is_null() { 0xffff_ffff } else { unsafe { *pheap } };
         let (dim, w) = if pdesc.is_null() { (0xffff_ffff, 0) } else { unsafe { (*pdesc, *(pdesc.add(2) as *const u64)) } };
@@ -742,6 +748,80 @@ unsafe extern "system" fn create_compute_pso_x(
     hr
 }
 
+/// ID3D12Device::CreateHeap (slot 28). Logs the desc and result; Xbox-only heap flag bits
+/// are masked off (PC accepts only the low D3D12_HEAP_FLAGS bits).
+unsafe extern "system" fn create_heap(
+    this: *mut DeviceWrapper, pdesc: *const u8, riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(28)) };
+    if pdesc.is_null() {
+        return unsafe { f(real, pdesc, riid, ppv) };
+    }
+    let mut d = unsafe { core::slice::from_raw_parts(pdesc, 0x30).to_vec() };
+    let u32at = |d: &[u8], o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    let u64at = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    let (size, htype, align, flags) = (u64at(&d, 0), u32at(&d, 8), u64at(&d, 0x20), u32at(&d, 0x28));
+    let mut hr = unsafe { f(real, d.as_ptr(), riid, ppv) };
+    let mut note = String::new();
+    if hr < 0 {
+        // Retry with PC-valid values: flags limited to the documented PC bits, and a
+        // PC-legal alignment (0 = default 64 KiB).
+        // PC-defined D3D12_HEAP_FLAGS bits: 0x1 0x4 0x8 0x20 0x40 0x80 0x100 0x200 0x400 0x800 0x1000.
+        // (The title passes 0x2, which is not a PC flag.)
+        let pc_flags = flags & 0x1fed;
+        d[0x28..0x2c].copy_from_slice(&pc_flags.to_le_bytes());
+        if align != 0 && align != 0x10000 && align != 0x400000 {
+            d[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
+        }
+        let hr2 = unsafe { f(real, d.as_ptr(), riid, ppv) };
+        note = format!(" | retry flags={pc_flags:#x} -> hr={hr2:#010x}");
+        hr = hr2;
+    }
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 || hr < 0 {
+        record("d3d12_xs", "CreateHeap", &format!(
+            "size={size:#x} type={htype} cpuPage={} pool={} align={align:#x} flags={flags:#x} -> hr={hr:#010x}{note}",
+            u32at(&d, 0xc), u32at(&d, 0x10)));
+    }
+    hr
+}
+
+/// Describe a D3D12_RESOURCE_DESC for diagnostics.
+fn desc_str(d: &[u8]) -> String {
+    let u32at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    let u16at = |o: usize| u16::from_le_bytes(d[o..o + 2].try_into().unwrap());
+    let u64at = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    format!("dim={} align={:#x} {}x{}x{} mips={} fmt={} samples={} layout={} flags={:#x}",
+        u32at(0), u64at(8), u64at(0x10), u32at(0x18), u16at(0x1c), u16at(0x1e), u32at(0x20), u32at(0x24), u32at(0x2c), u32at(0x30))
+}
+
+/// ID3D12Device::CreatePlacedResource (slot 29): (pHeap, HeapOffset, pDesc, InitialState,
+/// pClearValue, riid, ppv). Same Xbox→PC desc fixups as committed resources.
+unsafe extern "system" fn create_placed_resource(
+    this: *mut DeviceWrapper, heap: *mut c_void, offset: u64, pdesc: *const u8,
+    init_state: u32, pclear: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(29)) };
+    if pdesc.is_null() {
+        return unsafe { f(real, heap, offset, pdesc, init_state, pclear, riid, ppv) };
+    }
+    let mut d = unsafe { core::slice::from_raw_parts(pdesc, 0x38).to_vec() };
+    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
+    let hr = unsafe { f(real, heap, offset, d.as_ptr(), init_state, pclear, &IID_ID3D12RESOURCE, ppv) };
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if hr < 0 || N.fetch_add(1, Ordering::Relaxed) < 4 {
+        let orig = unsafe { core::slice::from_raw_parts(pdesc, 0x38) };
+        record("d3d12_xs", "CreatePlacedResource", &format!(
+            "heap={heap:p} off={offset:#x} state={init_state:#x} {} -> hr={hr:#010x}", desc_str(orig)));
+    }
+    hr
+}
+
 // Per-slot logging stubs for the Xbox device extensions (44+): capture slot +
 // caller RVA and return S_OK (most are hints like SetFrameIntervalX that the RHI
 // only checks for success). This reveals which Xbox device methods the game needs.
@@ -807,6 +887,8 @@ fn vtable() -> *const usize {
         v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
         v[55] = create_derived_pso_x as usize; // Xbox derived-PSO create (base PSO + state patches)
         v[62] = create_compute_pso_x as usize; // Xbox compute PSO create
+        v[28] = create_heap as usize; // CreateHeap (logged; Xbox-only flag bits masked on retry)
+        v[29] = create_placed_resource as usize; // CreatePlacedResource (desc flag fixups)
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
         v[8] = create_command_queue_x as usize; // PC-slot CreateCommandQueue: same desc; needs the Xbox-sized queue vtable too
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize

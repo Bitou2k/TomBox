@@ -145,7 +145,7 @@ fn ssrc_is_lit(field: u32) -> bool {
     field == 255
 }
 
-/// Decode a full ISA blob into instructions. Stops after `s_endpgm` or at end of input.
+/// Decode a full ISA blob into instructions (to the end of the input).
 pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
     let words: Vec<u32> = isa
         .chunks_exact(4)
@@ -165,12 +165,10 @@ pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
         let mnemonic = mnemonic_for(enc, op);
         let (dst, src, aux) = decode_operands(enc, &raw);
         let insn = Insn { offset: i * 4, dwords: total, enc, op, raw, mnemonic, dst, src, aux };
-        let is_endpgm = enc == Enc::Sopp && op == 0x01;
+        // Do not stop at `s_endpgm`: programs can end early on one path and continue
+        // on another. The caller passes exactly the program bytes.
         out.push(insn);
         i += total;
-        if is_endpgm {
-            break;
-        }
     }
     out
 }

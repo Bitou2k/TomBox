@@ -39,6 +39,7 @@ enum Res {
     Samp(u32),
     Uav(u32, u32), // slot, dim
     Buf(u32, bool), // slot, is_uav (structured buffer)
+    TBuf(u32, bool), // slot, is_uav (typed buffer)
 }
 
 const XYZW: [&str; 4] = ["x", "y", "z", "w"];
@@ -126,7 +127,10 @@ struct Emitter<'a> {
     samp: BTreeSet<u32>,
     uav: BTreeMap<u32, u32>,       // slot -> dim
     sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
+    tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
     is_cs: bool,
+    /// Registers read before written (entry ABI), from `live_in`.
+    live: Vec<String>,
     regs: BTreeSet<String>,
     body: String,
     tmp: usize,
@@ -151,7 +155,9 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         samp: BTreeSet::new(),
         uav: BTreeMap::new(),
         sbuf: BTreeMap::new(),
+        tbuf: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
+        live: Vec::new(),
         regs: BTreeSet::new(),
         body: String::new(),
         tmp: 0,
@@ -160,6 +166,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
     };
     em.resolve_resources()?;
     let live_in = em.live_in();
+    em.live = live_in.clone();
     em.emit_body(is_ps)?;
     let mut hlsl = em.finish(is_ps)?;
     hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
@@ -272,6 +279,12 @@ impl<'a> Emitter<'a> {
                         Some(1) => true,
                         other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
                     };
+                    if ins.mnemonic.contains("_format_") {
+                        // Typed buffer (Buffer<T> / RWBuffer<T>), addressed by element index.
+                        self.tbuf.insert((is_uav, slot));
+                        self.res.insert(idx, vec![Res::TBuf(slot, is_uav)]);
+                        continue;
+                    }
                     let ndw = Self::mubuf_dwords(&ins.mnemonic)
                         .ok_or_else(|| format!("mubuf op {} unsupported", ins.mnemonic))?;
                     let end = ins.aux.imm as u32 / 4 + ndw;
@@ -422,7 +435,12 @@ impl<'a> Emitter<'a> {
         let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
         let mut target: HashMap<usize, usize> = HashMap::new(); // forward: branch idx -> target idx
         let mut back: HashMap<usize, usize> = HashMap::new(); // backward: branch idx B -> header idx L
+        let n_insns = self.insns.len();
         for (i, ins) in self.insns.iter().enumerate() {
+            if ins.enc == Enc::Sopp && ins.op == 1 && i + 1 < n_insns {
+                target.insert(i, n_insns); // early s_endpgm -> end of program
+                continue;
+            }
             if ins.enc == Enc::Sopp && Self::branch_cond(ins.op).is_some() {
                 let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
                 let ti = *off2idx
@@ -600,6 +618,8 @@ impl<'a> Emitter<'a> {
                     7 => Some("(vcc_lo & 1u) != 0u".into()),
                     8 => Some("(exec_lo & 1u) == 0u".into()),
                     9 => Some("(exec_lo & 1u) != 0u".into()),
+                    // A non-final s_endpgm ends the program on this path: jump to the end label.
+                    1 if br.is_some() => Some("true".to_string()),
                     0 | 1 | 0x0a | 0x0c | 0x1f | 0x20 | 0x21 | 0x23 | 0x24 | 0x25 => None,
                     _ => return Err("unsupported SOPP".into()),
                 };
@@ -1009,6 +1029,51 @@ impl<'a> Emitter<'a> {
     /// immediate the byte offset inside the element. Dynamic offsets (OFFEN / SOFFSET
     /// register) are not handled yet and fail explicitly.
     fn emit_mubuf(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        if let Some(Res::TBuf(slot, is_uav)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
+            // Typed buffer. The element type is declared float4: the view format is not
+            // visible in the shader, so integer-format buffers are a known gap (TECHNICAL_DEBT).
+            let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
+            if offen || !idxen || ins.aux.imm != 0 || !matches!(ins.src[2], Opnd::ConstInt(0)) {
+                return Err("typed-buffer MUBUF with offset addressing unsupported".into());
+            }
+            let n = match ins.mnemonic.rsplit('_').next() {
+                Some("x") => 1u8,
+                Some("xy") => 2,
+                Some("xyz") => 3,
+                Some("xyzw") => 4,
+                _ => return Err("unsupported typed-buffer op".into()),
+            };
+            let index = r(&ins.src[0])?;
+            let vd = match ins.dst[0] {
+                Opnd::Vgpr(v) => v,
+                _ => return Err("bad vdata".into()),
+            };
+            let nm = if is_uav { format!("utb{slot}") } else { format!("stb{slot}") };
+            if ins.mnemonic.starts_with("buffer_store") {
+                if !is_uav {
+                    return Err("buffer_store_format to a non-UAV table".into());
+                }
+                let mut c = vec![];
+                for k in 0..4u8 {
+                    if k < n {
+                        let o = Opnd::Vgpr(vd + k);
+                        self.touch(&o);
+                        c.push(f(&o)?);
+                    } else {
+                        c.push("0.0".into());
+                    }
+                }
+                self.line(&format!("if (exec_lo & 1u) {nm}[{index}] = float4({});", c.join(", ")));
+            } else {
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("float4 t{t} = {nm}[{index}];"));
+                for k in 0..n {
+                    self.wv(&Opnd::Vgpr(vd + k), &format!("asuint(t{t}.{})", XYZW[k as usize]))?;
+                }
+            }
+            return Ok(());
+        }
         let (slot, is_uav) = match self.res.get(&idx).and_then(|v| v.first()) {
             Some(Res::Buf(s, u)) => (*s, *u),
             _ => return Err("unresolved buffer".into()),
@@ -1213,6 +1278,30 @@ impl<'a> Emitter<'a> {
             }
         }
         let v4 = format!("float4({})", comp.join(", "));
+        if is_ps && ins.aux.imm2 & 4 != 0 {
+            // Valid-mask export: lanes that are inactive here are killed (pixel discard).
+            self.line("if ((exec_lo & 1u) == 0u) discard;");
+        }
+        if is_ps && target == 9 {
+            return Ok(()); // null export (no colour written)
+        }
+        if is_ps && target == 8 {
+            // MRTZ: x = depth.
+            if en & 1 == 0 {
+                return Err("MRTZ export without depth (stencil/sample-mask only) unsupported".into());
+            }
+            if !self.ex.output_sig.iter().any(|e| matches!(e.sysval, 65 | 67 | 68)) {
+                return Err("depth export without an SV_Depth output".into());
+            }
+            self.line(&format!("if (exec_lo & 1u) o.od = {};", f(&ins.src[0])?));
+            return Ok(());
+        }
+        if !is_ps && (32..64).contains(&target) && (target - 32) as usize >= self.out_params.len() {
+            // Hardware needs at least one parameter export; with no matching output
+            // element nothing downstream can read it.
+            self.line("// (parameter export with no output-signature element: ignored)");
+            return Ok(());
+        }
         let (field, comps) = if is_ps {
             if target > 7 {
                 return Err(format!("PS export target {target} unsupported"));
@@ -1271,6 +1360,13 @@ impl<'a> Emitter<'a> {
             let _ = writeln!(h, "struct TbElem_{nm}{slot} {{ uint w[{}]; }};
 {ty}<TbElem_{nm}{slot}> {nm}{slot} : register({reg}{slot});", (*dwords).max(1));
         }
+        for (is_uav, slot) in &self.tbuf {
+            let _ = if *is_uav {
+                writeln!(h, "RWBuffer<float4> utb{slot} : register(u{slot});")
+            } else {
+                writeln!(h, "Buffer<float4> stb{slot} : register(t{slot});")
+            };
+        }
         for (slot, dim) in &self.uav {
             let ty = match dim {
                 1 => "RWTexture2D<float4>",
@@ -1315,9 +1411,21 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         let _ = writeln!(h, "}};\nstruct SOut {{");
         for e in &ex.output_sig {
             let (ty, _) = sig_type(e);
-            let _ = writeln!(h, "    {ty} o{} : {};", e.register, semantic(e));
+            if matches!(e.sysval, 65 | 67 | 68) {
+                let _ = writeln!(h, "    float od : {};", semantic(e).trim_end_matches('0'));
+            } else {
+                let _ = writeln!(h, "    {ty} o{} : {};", e.register, semantic(e));
+            }
         }
-        let _ = writeln!(h, "}};\nSOut main(SIn i) {{\n    SOut o = (SOut)0;");
+        let no_out = ex.output_sig.is_empty();
+        if no_out {
+            // No outputs (e.g. depth-only / kill-only pixel shader): HLSL forbids empty structs.
+            let cut = h.rfind("struct SOut {").unwrap_or(h.len());
+            h.truncate(cut);
+            let _ = writeln!(h, "void main(SIn i) {{");
+        } else {
+            let _ = writeln!(h, "}};\nSOut main(SIn i) {{\n    SOut o = (SOut)0;");
+        }
         let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
         // Vertex attributes arrive in v[4 + 4*register + component] after the fetch call.
         let mut init = String::new();
@@ -1343,9 +1451,23 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let decl: Vec<String> = self.regs.iter().map(|r| format!("{r} = 0u")).collect();
             let _ = writeln!(h, "    uint {};", decl.join(", "));
         }
+        if is_ps {
+            // PS entry ABI (observed): v0/v1 = perspective-centre barycentrics, then the
+            // fragment position x, y, z, 1/w in v2..v5 when the shader reads it.
+            if let Some(e) = ex.input_sig.iter().find(|e| e.sysval == 1) {
+                let p = format!("i.i{}", e.register);
+                let exprs = [format!("{p}.x"), format!("{p}.y"), format!("{p}.z"), format!("1.0 / {p}.w")];
+                for (k, expr) in exprs.iter().enumerate() {
+                    let v = format!("v{}", 2 + k);
+                    if self.live.contains(&v) {
+                        let _ = writeln!(init, "    {v} = asuint({expr});");
+                    }
+                }
+            }
+        }
         h.push_str(&init);
         h.push_str(&self.body);
-        h.push_str("    return o;\n}\n");
+        h.push_str(if no_out { "}\n" } else { "    return o;\n}\n" });
         Ok(h)
     }
 }
