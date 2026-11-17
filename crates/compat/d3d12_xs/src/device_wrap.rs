@@ -253,6 +253,163 @@ unsafe extern "system" fn get_descriptor_increment(this: *mut DeviceWrapper, hea
     sz
 }
 
+/// ID3D12Device::GetResourceAllocationInfo (slot 25) returns D3D12_RESOURCE_ALLOCATION_INFO
+/// {UINT64 SizeInBytes; UINT64 Alignment;} by value -> sret ABI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AllocInfo { size: u64, align: u64 }
+
+/// Intercept GetResourceAllocationInfo to see pResourceDescs (the crash is a null
+/// deref inside the real method), dump the desc, and avoid crashing on a null/bad
+/// desc. Rust's sret for a 16-byte return matches the PC ABI
+/// (rcx=retval, rdx=this, r8=visibleMask, r9=numDescs, stack=pResourceDescs).
+unsafe extern "system" fn get_resource_alloc_info(
+    this: *mut DeviceWrapper, visible_mask: u32, num_descs: u32, pdescs: *const u32,
+) -> AllocInfo {
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if pdescs.is_null() {
+        if n < 20 { record("d3d12_xs", "GetResourceAllocationInfo", &format!("numDescs={num_descs} pDescs=NULL -> default{{64KB,64KB}}")); }
+        return AllocInfo { size: 0x10000, align: 0x10000 };
+    }
+    // Copy and sanitize the desc(s): Xbox may leave SampleDesc.Count / DepthOrArraySize
+    // / MipLevels as 0, which are invalid on PC D3D12 and crash GetResourceAllocationInfo.
+    // D3D12_RESOURCE_DESC is 0x40 bytes: Dimension@0, Alignment@8, Width@16, Height@24,
+    // DepthOrArraySize@28(u16), MipLevels@30(u16), Format@32, SampleDesc{Count@36,Quality@40},
+    // Layout@44, Flags@48.
+    let count = num_descs.max(1) as usize;
+    // Zeroed, DESC1-sized (0x48) copies so a runtime reading past D3D12_RESOURCE_DESC
+    // sees zeros, not adjacent heap garbage.
+    let mut descs: Vec<u8> = vec![0u8; count * 0x48];
+    for i in 0..count {
+        let src = unsafe { core::slice::from_raw_parts(pdescs.cast::<u8>().add(i * 0x40), 0x40) };
+        descs[i * 0x48..i * 0x48 + 0x40].copy_from_slice(src);
+        let b = &mut descs[i * 0x48..];
+        let u16at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let u32at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o+8].try_into().unwrap());
+        let align = u64at(b, 8);
+        if align != 0 && align != 0x1000 && align != 0x10000 && align != 0x400000 {
+            b[8..16].copy_from_slice(&0u64.to_le_bytes()); // bad alignment -> 0 (let D3D12 pick)
+        }
+        if u16at(b, 28) == 0 { b[28] = 1; } // DepthOrArraySize 0 -> 1
+        if u16at(b, 30) == 0 { b[30] = 1; } // MipLevels 0 -> 1
+        if u32at(b, 36) == 0 { b[36] = 1; } // SampleDesc.Count 0 -> 1
+        if n < 8 && i == 0 {
+            record("d3d12_xs", "GetResourceAllocationInfo",
+                &format!("dim={} align={:#x} w={} h={} depthArr={} mips={} fmt={} sampleCount={} layout={} flags={:#x}",
+                    u32at(b, 0), align, u64at(b, 16), u32at(b, 24),
+                    u16at(b, 28), u16at(b, 30), u32at(b, 32), u32at(b, 36), u32at(b, 44), u32at(b, 48)));
+        }
+    }
+    // The real D3D12Core GetResourceAllocationInfo faults deep in its texture-tiling
+    // layout sub-function for the Xbox-origin texture descriptors (verified: valid
+    // device + fully-sanitized valid desc still crashes at vtbl+0x25829). Compute the
+    // info ourselves from the D3D12 64 KiB standard-swizzle tile model. We OVER-estimate
+    // (round each mip up to whole tiles) so the pool allocator never under-reserves.
+    let total = (0..count).map(|i| {
+        let b = &descs[i * 0x48..];
+        let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let dim = u32at(0);
+        let width = u64at(16).max(1);
+        let height = (u32at(24) as u64).max(1);
+        let arr = (u16at(28) as u64).max(1);
+        let mips = (u16at(30) as u64).max(1);
+        let samples = (u32at(36) as u64).max(1);
+        alloc_size_for(dim, width, height, arr, mips, u32at(32), samples)
+    }).max().unwrap_or(0x10000);
+    let align = if descs.len() >= 16 && u64::from_le_bytes(descs[8..16].try_into().unwrap()) == 0x1000 && total <= 0x10000 {
+        0x1000
+    } else {
+        0x10000
+    };
+    let info = AllocInfo { size: total, align };
+    if n < 8 {
+        record("d3d12_xs", "GetResourceAllocationInfo", &format!("COMPUTED size={:#x} align={:#x}", info.size, info.align));
+    }
+    let _ = (this, visible_mask);
+    info
+}
+
+/// Bytes per pixel for the common DXGI formats (block-compressed reported as their
+/// effective per-pixel cost so the tile estimate stays an over-estimate).
+fn format_bpp(fmt: u32) -> u64 {
+    match fmt {
+        1..=4 => 16,                   // R32G32B32A32
+        5..=8 => 12,                   // R32G32B32
+        9..=14 => 8,                   // R16G16B16A16
+        15..=22 => 8,                  // R32G32 / depth-stencil combos
+        70..=72 => 1,                  // BC1 (0.5 bpp, rounded up)
+        73..=78 => 1,                  // BC2/BC3
+        79..=84 => 1,                  // BC4/BC5
+        94..=99 => 1,                  // BC6H/BC7
+        54..=59 => 2,                  // R16
+        60..=65 => 1,                  // R8
+        _ => 4,                        // R8G8B8A8 / B8G8R8A8 / R10G10B10A2 / etc.
+    }
+}
+
+/// D3D12 64 KiB standard-swizzle tile size, over-estimated (whole tiles per mip).
+fn alloc_size_for(dim: u32, width: u64, height: u64, arr: u64, mips: u64, fmt: u32, samples: u64) -> u64 {
+    const TILE: u64 = 0x10000;
+    if dim <= 1 {
+        // Buffer: 64 KiB-aligned length.
+        return ((width + TILE - 1) & !(TILE - 1)).max(TILE);
+    }
+    let bpp = format_bpp(fmt);
+    // 64 KiB tile pixel extents by bpp (D3D12 standard-swizzle 2D tile shapes).
+    let (tw, th) = match bpp {
+        16 => (64u64, 64u64),
+        12 | 8 => (128, 64),
+        4 => (128, 128),
+        2 => (256, 128),
+        _ => (256, 256), // 1 bpp and BC (approx)
+    };
+    let mut tiles = 0u64;
+    let (mut w, mut h) = (width, height);
+    for _ in 0..mips {
+        let tx = (w + tw - 1) / tw;
+        let ty = (h + th - 1) / th;
+        tiles += (tx * ty).max(1);
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+    }
+    (tiles * arr * samples * TILE).max(TILE)
+}
+
+/// PC IID_ID3D12Resource = {696442be-a72e-4059-bc79-5b5c98040fad}
+static IID_ID3D12RESOURCE: Guid = Guid {
+    d1: 0x6964_42be, d2: 0xa72e, d3: 0x4059, d4: [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+};
+
+/// Intercept CreateCommittedResource (slot 27). Logs heap/desc/riid and, like the
+/// device/file IIDs, substitutes the PC ID3D12Resource IID so a mismatched Xbox
+/// resource IID doesn't make the real call return a null resource.
+/// Args (system ABI): rcx=this, rdx=pHeapProps, r8=HeapFlags, r9=pDesc, then
+/// stack: InitialState, pOptimizedClearValue, riid, ppvResource.
+unsafe extern "system" fn create_committed_resource(
+    this: *mut DeviceWrapper, pheap: *const u32, heap_flags: u32, pdesc: *const u32,
+    init_state: u32, pclear: *const c_void, riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    let real = unsafe { (*this).real };
+    let f: unsafe extern "system" fn(*mut c_void, *const u32, u32, *const u32, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(27)) };
+    let use_riid: *const Guid = &IID_ID3D12RESOURCE;
+    let hr = unsafe { f(real, pheap, heap_flags, pdesc, init_state, pclear, use_riid, ppv) };
+    static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 10 {
+        let htype = if pheap.is_null() { 0xffff_ffff } else { unsafe { *pheap } };
+        let (dim, w) = if pdesc.is_null() { (0xffff_ffff, 0) } else { unsafe { (*pdesc, *(pdesc.add(2) as *const u64)) } };
+        let orig_riid = if riid.is_null() { String::from("null") } else { guid_str(unsafe { &*riid }) };
+        let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+        record("d3d12_xs", "CreateCommittedResource",
+            &format!("heapType={htype} dim={dim} width={w} initState={init_state:#x} riid={orig_riid} -> hr={hr:#010x} res={out:p}"));
+    }
+    hr
+}
+
 // Forwarding thunk: this(rcx) -> this->real; jmp real->vtbl[slot].
 macro_rules! fwd {
     ($name:ident, $slot:expr) => {
@@ -268,12 +425,32 @@ macro_rules! fwd {
     };
 }
 
+// sret forwarding thunk: for methods returning a struct >8 bytes BY VALUE, the
+// x64 ABI puts the hidden return pointer in rcx and `this` in rdx. So we must
+// redirect rdx (this -> this->real), leaving rcx (the return buffer) untouched.
+// ID3D12Device::GetResourceAllocationInfo (25, returns 16B) and
+// GetCustomHeapProperties (26, returns 20B) are the two such device methods.
+macro_rules! fwd_sret {
+    ($name:ident, $slot:expr) => {
+        #[unsafe(naked)]
+        unsafe extern "system" fn $name() {
+            core::arch::naked_asm!(
+                "mov rdx, [rdx+8]",
+                "mov rax, [rdx]",
+                "jmp qword ptr [rax + {o}]",
+                o = const ($slot * 8usize),
+            );
+        }
+    };
+}
+
 // ID3D12Device methods 3..=43 (0,1,2 are IUnknown, handled above).
 fwd!(f3, 3); fwd!(f4, 4); fwd!(f5, 5); fwd!(f6, 6); fwd!(f7, 7); fwd!(f8, 8);
 fwd!(f9, 9); fwd!(f10, 10); fwd!(f11, 11); fwd!(f12, 12);
 /* 13 = check_feature_support, 14 = create_descriptor_heap */
 fwd!(f15, 15); fwd!(f16, 16); fwd!(f17, 17); fwd!(f18, 18); fwd!(f19, 19); fwd!(f20, 20);
-fwd!(f21, 21); fwd!(f22, 22); fwd!(f23, 23); fwd!(f24, 24); fwd!(f25, 25); fwd!(f26, 26);
+fwd!(f21, 21); fwd!(f22, 22); fwd!(f23, 23); fwd!(f24, 24);
+fwd_sret!(f25, 25); fwd_sret!(f26, 26); // return structs by value: `this` is in rdx
 fwd!(f27, 27); fwd!(f28, 28); fwd!(f29, 29); fwd!(f30, 30); fwd!(f31, 31); fwd!(f32, 32);
 fwd!(f33, 33); fwd!(f34, 34); fwd!(f35, 35); fwd!(f36, 36); fwd!(f37, 37); fwd!(f38, 38);
 fwd!(f39, 39); fwd!(f40, 40); fwd!(f41, 41); fwd!(f42, 42); fwd!(f43, 43);
@@ -307,6 +484,8 @@ fn vtable() -> *const usize {
         }
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
+        v[25] = get_resource_alloc_info as usize; // GetResourceAllocationInfo (null-safe)
+        v[27] = create_committed_resource as usize; // CreateCommittedResource (IID subst)
         v[73] = create_command_list_x as usize;  // Xbox command-list create
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     }) as *const usize

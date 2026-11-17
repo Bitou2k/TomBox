@@ -368,3 +368,32 @@ extracted — just the smallest paks (global, pakChunkEarly, pakchunk0). Missing
 pakchunk10-XSX.ucas (21 GB — the bulk of the game), pakchunk12/7/8/2/5/11, all
 Movies, 468 files total. Verified the 302 present files are byte-complete (no
 truncation). Extracting the missing 468 now (disk has 294 GB free).
+
+## 2026-11-16 — Full content + physical memory + resource/texture creation
+
+After extracting the full 26.9GB dump (was partially extracted), cleared a chain
+of real blockers past engine init into GPU resource creation:
+
+1. **XMemAllocatePhysicalPages / XMemMapPhysicalPages** (xmem.dll): were stubs
+   returning null -> fatal "AllocateTitlePhysicalPages failed" (Line 644).
+   Implemented commit-on-map emulation of Xbox 64KB title physical pages (grant
+   PFN tokens on allocate; VirtualAlloc-commit the reserved VA on map). The
+   transient memory allocator now initializes (1792 DRAM pages).
+2. **sret device thunks** (device_wrap): GetResourceAllocationInfo (25) and
+   GetCustomHeapProperties (26) return >8-byte structs by value, so `this` is in
+   rdx (rcx = hidden return ptr). The generic rcx-forwarding thunk null-derefed.
+   Added fwd_sret! thunks that redirect rdx.
+3. **CreateCommittedResource (27)**: intercepted to substitute PC IID_ID3D12Resource
+   (already matched, but robust) — real resources create (buffers hr=0).
+4. **GetResourceAllocationInfo (25)**: the real D3D12Core method faults deep in its
+   texture-tiling sub-function (vtbl+0x25829) for Xbox texture descs even after
+   full desc sanitization (valid device, valid 1x1 BGRA desc). Compute the info
+   ourselves from the D3D12 64KB standard-swizzle tile model, over-estimating so
+   the pool never under-reserves. Texture allocation crash cleared.
+
+### Current frontier: GPU device removal
+With CPU-side resource/texture creation working, a GPU operation during resource
+setup triggers DXGI device-removed ("GPU Crashed or D3D Device Removed", Line 656).
+Likely the unified-memory gap: Xbox places GPU resources on app physical pages
+(GPU-visible on console); our commit-on-map gives CPU VirtualAlloc memory the GPU
+can't access. Investigating.

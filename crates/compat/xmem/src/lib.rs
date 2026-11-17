@@ -10,6 +10,7 @@
 //! declaring a shim with fewer parameters than the real export is ABI-safe.
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU64, Ordering};
 use compat_common::record;
 
 const M: &str = "xmem";
@@ -19,8 +20,12 @@ extern "system" {
     fn HeapAlloc(heap: *mut c_void, flags: u32, bytes: usize) -> *mut c_void;
     fn HeapFree(heap: *mut c_void, flags: u32, mem: *mut c_void) -> i32;
     fn VirtualAlloc(addr: *mut c_void, size: usize, alloc_type: u32, protect: u32) -> *mut c_void;
+    fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
     fn GetLastError() -> u32;
 }
+const MEM_DECOMMIT: u32 = 0x0000_4000;
+/// Xbox title physical pages are 64 KiB.
+const XMEM_PAGE: usize = 0x1_0000;
 
 // Windows VirtualAlloc allocation-type bits. The Xbox `XMemVirtualAlloc`
 // allocation-type parameter is NOT bit-compatible with Windows: it carries
@@ -117,24 +122,67 @@ pub extern "system" fn XMemVirtualAlloc(
     p
 }
 
-// ---- Physical-page / unified-memory APIs: logged stubs (need graphics backend) ----
+// ---- Physical-page / unified-memory APIs ----
+//
+// Xbox titles manage physical 64 KiB pages explicitly: reserve a virtual range,
+// allocate physical pages (PFN array), then map pages into the range. PC has no
+// app-managed physical pages without AWE (which needs SeLockMemoryPrivilege), so
+// we emulate: XMemAllocatePhysicalPages grants pages and hands back opaque PFN
+// tokens; the real backing is committed when XMemMapPhysicalPages maps them into
+// the (already reserved) virtual range. This preserves the observable contract —
+// a mapped VA becomes real, writable memory — without real physical pages.
+//
+// Signature (reversed from FXboxCommonMultiPageAllocator call sites):
+//   int XMemAllocatePhysicalPages(UINT64 flags, SIZE_T* pNumPages, UINT64* pPageArray)
+//   -> nonzero on success, pPageArray filled with pNumPages PFN tokens.
+static NEXT_PFN: AtomicU64 = AtomicU64::new(0x1000);
 
 #[no_mangle]
-pub extern "system" fn XMemAllocatePhysicalPages(_flags: u32, size: usize, _attrs: u64) -> *mut c_void {
-    record(M, "XMemAllocatePhysicalPages", &format!("size={size} [STUB -> null]"));
-    core::ptr::null_mut()
+pub extern "system" fn XMemAllocatePhysicalPages(
+    flags: u64, p_num_pages: *mut usize, p_page_array: *mut u64,
+) -> i32 {
+    if p_num_pages.is_null() {
+        record(M, "XMemAllocatePhysicalPages", "pNumPages=null -> fail");
+        return 0;
+    }
+    let n = unsafe { *p_num_pages };
+    if !p_page_array.is_null() {
+        // Hand back unique, nonzero tokens; backing is deferred to map time.
+        let base = NEXT_PFN.fetch_add(n as u64, Ordering::Relaxed);
+        for i in 0..n {
+            unsafe { *p_page_array.add(i) = base + i as u64 };
+        }
+    }
+    record(M, "XMemAllocatePhysicalPages", &format!("flags={flags:#x} pages={n} -> OK"));
+    1
 }
 
 #[no_mangle]
-pub extern "system" fn XMemFreePhysicalPages(address: *mut c_void, _size: usize) -> i32 {
-    record(M, "XMemFreePhysicalPages", &format!("addr={address:p} [STUB]"));
+pub extern "system" fn XMemFreePhysicalPages(address: *mut c_void, _p: *mut u64) -> i32 {
+    record(M, "XMemFreePhysicalPages", &format!("addr={address:p}"));
     0
 }
 
+/// void* XMemMapPhysicalPages(void* va, SIZE_T numPages, UINT64* pageArray)
+/// Maps (commits) `numPages` 64 KiB pages at `va`. A null pageArray unmaps.
 #[no_mangle]
-pub extern "system" fn XMemMapPhysicalPages(_a: *mut c_void, _b: usize, _c: u32, _d: *mut c_void) -> *mut c_void {
-    record(M, "XMemMapPhysicalPages", "[STUB -> null]");
-    core::ptr::null_mut()
+pub extern "system" fn XMemMapPhysicalPages(
+    va: *mut c_void, num_pages: usize, page_array: *mut u64,
+) -> *mut c_void {
+    const MEM_COMMIT: u32 = 0x0000_1000;
+    let size = num_pages.max(1) * XMEM_PAGE;
+    if page_array.is_null() {
+        unsafe { VirtualFree(va, size, MEM_DECOMMIT) };
+        record(M, "XMemMapPhysicalPages", &format!("UNMAP va={va:p} pages={num_pages}"));
+        return va;
+    }
+    // Commit the (reserved) range so the mapped VA becomes real memory.
+    let p = unsafe { VirtualAlloc(va, size, MEM_COMMIT, PAGE_READWRITE) };
+    let err = if p.is_null() { unsafe { GetLastError() } } else { 0 };
+    record(M, "XMemMapPhysicalPages",
+        &format!("va={va:p} pages={num_pages} size={size:#x} -> {p:p}{}",
+            if p.is_null() { format!(" (err={err})") } else { String::new() }));
+    if p.is_null() { core::ptr::null_mut() } else { va }
 }
 
 #[no_mangle]
