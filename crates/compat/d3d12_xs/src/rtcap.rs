@@ -1,0 +1,377 @@
+//! Diagnostic render-target capture (off unless `TOMBOX_RTCAP=1`).
+//!
+//! Purpose: find *where* a frame goes wrong. Every render-target / depth texture the title
+//! creates is remembered; when the trigger file `%TEMP%\tombox_capture_now` exists at a
+//! `PresentX`, each one is read back and written to `%TEMP%\tombox_rtcap\<n>\` as a BMP
+//! preview plus one line of statistics (min / max / mean per channel, NaN / Inf counts) in
+//! `report.txt`.
+//!
+//! This is a development tool, not part of the compatibility surface:
+//!   * it holds a reference on every render target for the life of the process (leak);
+//!   * the copy assumes the state recorded from the title's own `ResourceBarrier` calls in
+//!     *recording* order, which can differ from execution order;
+//!   * only subresource 0 (mip 0, slice 0) of non-multisampled 2D textures is captured;
+//!   * targets are captured at end of frame, so pooled targets show their last use only.
+
+use core::ffi::c_void;
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
+use compat_common::record;
+
+#[repr(C)]
+struct Guid(u32, u16, u16, [u8; 8]);
+const IID_DEVICE: Guid = Guid(0x189819f1, 0x1db6, 0x4b57, [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7]);
+const IID_ALLOCATOR: Guid = Guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+const IID_GFX_LIST: Guid = Guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+const IID_FENCE: Guid = Guid(0x0a753dcf, 0xc4d8, 0x4b91, [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76]);
+const IID_RESOURCE: Guid = Guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+
+extern "system" {
+    fn Sleep(ms: u32);
+}
+
+unsafe fn vt(obj: *mut c_void) -> *const usize {
+    *(obj as *const *const usize)
+}
+macro_rules! vcall {
+    ($obj:expr, $slot:expr, fn($($at:ty),*) -> $rt:ty $(, $arg:expr)*) => {{
+        let f: unsafe extern "system" fn(*mut c_void $(, $at)*) -> $rt =
+            core::mem::transmute(*vt($obj).add($slot));
+        f($obj $(, $arg)*)
+    }};
+}
+
+pub fn enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("TOMBOX_RTCAP").map(|v| v == "1").unwrap_or(false))
+}
+
+struct Target {
+    res: usize,
+    desc: [u8; 0x38],
+    order: usize,
+}
+static TARGETS: Mutex<Vec<Target>> = Mutex::new(Vec::new());
+/// Last known state per resource (from creation, then the title's transition barriers).
+static STATES: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+/// Remember a freshly created render-target / depth texture (takes a reference).
+pub unsafe fn register(res: *mut c_void, desc: &[u8], init_state: u32) {
+    if !enabled() || res.is_null() || desc.len() < 0x38 {
+        return;
+    }
+    let dim = u32::from_le_bytes(desc[0..4].try_into().unwrap());
+    let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
+    if dim != 3 || flags & 3 == 0 {
+        return;
+    }
+    vcall!(res, 1, fn() -> u32);
+    let mut t = TARGETS.lock().unwrap();
+    let order = t.len();
+    t.push(Target { res: res as usize, desc: desc[..0x38].try_into().unwrap(), order });
+    STATES.lock().unwrap().get_or_insert_with(HashMap::new).insert(res as usize, init_state);
+}
+
+/// Record transition barriers issued by the title (D3D12_RESOURCE_BARRIER is 32 bytes).
+pub unsafe fn note_barriers(n: u32, p: *const u8) {
+    if !enabled() || p.is_null() {
+        return;
+    }
+    let mut g = STATES.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    for i in 0..n as usize {
+        let b = p.add(i * 32);
+        if core::ptr::read_unaligned(b as *const u32) != 0 {
+            continue; // not a transition
+        }
+        let res = core::ptr::read_unaligned(b.add(8) as *const usize);
+        let after = core::ptr::read_unaligned(b.add(24) as *const u32);
+        if let Some(s) = m.get_mut(&res) {
+            *s = after;
+        }
+    }
+}
+
+fn half(h: u16) -> f32 {
+    let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 0x1f, h & 0x3ff);
+    let v = if e == 0 {
+        (m as f32) * 2f32.powi(-24)
+    } else if e == 31 {
+        if m == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + m as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
+    };
+    if s == 1 { -v } else { v }
+}
+fn ufloat(bits: u32, mant_bits: u32) -> f32 {
+    let m = bits & ((1 << mant_bits) - 1);
+    let e = bits >> mant_bits;
+    if e == 0 {
+        (m as f32) / (1u32 << mant_bits) as f32 * 2f32.powi(-14)
+    } else if e == 31 {
+        if m == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + m as f32 / (1u32 << mant_bits) as f32) * 2f32.powi(e as i32 - 15)
+    }
+}
+
+/// Decode one pixel to up to four floats. Returns (channels, is_float_or_depth, bytes/pixel).
+fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
+    Some(match fmt {
+        1..=2 => (4, true, 16, "rgba32f"),
+        9..=10 => (4, true, 8, "rgba16f"),
+        11 => (4, false, 8, "rgba16"),
+        15..=16 => (2, true, 8, "rg32f"),
+        19..=22 => (1, true, 8, "d32s8"),
+        23..=24 => (4, false, 4, "rgb10a2"),
+        26 => (3, true, 4, "r11g11b10f"),
+        27..=29 => (4, false, 4, "rgba8"),
+        33..=34 => (2, true, 4, "rg16f"),
+        35 => (2, false, 4, "rg16"),
+        39..=41 => (1, true, 4, "r32f"),
+        44..=47 => (1, false, 4, "d24s8"),
+        48..=49 => (2, false, 2, "rg8"),
+        53..=54 => (1, true, 2, "r16f"),
+        55..=56 => (1, false, 2, "r16"),
+        60..=61 => (1, false, 1, "r8"),
+        87 | 90 | 91 => (4, false, 4, "bgra8"),
+        _ => return None,
+    })
+}
+
+fn decode(kind: &str, p: &[u8]) -> [f32; 4] {
+    let u16at = |o: usize| u16::from_le_bytes([p[o], p[o + 1]]);
+    let u32at = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+    let f32at = |o: usize| f32::from_bits(u32at(o));
+    match kind {
+        "rgba32f" => [f32at(0), f32at(4), f32at(8), f32at(12)],
+        "rgba16f" => [half(u16at(0)), half(u16at(2)), half(u16at(4)), half(u16at(6))],
+        "rgba16" => [u16at(0) as f32 / 65535.0, u16at(2) as f32 / 65535.0, u16at(4) as f32 / 65535.0, u16at(6) as f32 / 65535.0],
+        "rg32f" => [f32at(0), f32at(4), 0.0, 1.0],
+        "d32s8" | "r32f" => [f32at(0), 0.0, 0.0, 1.0],
+        "rgb10a2" => {
+            let v = u32at(0);
+            [(v & 1023) as f32 / 1023.0, ((v >> 10) & 1023) as f32 / 1023.0, ((v >> 20) & 1023) as f32 / 1023.0, (v >> 30) as f32 / 3.0]
+        }
+        "r11g11b10f" => {
+            let v = u32at(0);
+            [ufloat(v & 0x7ff, 6), ufloat((v >> 11) & 0x7ff, 6), ufloat(v >> 22, 5), 1.0]
+        }
+        "rgba8" => [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0, p[3] as f32 / 255.0],
+        "bgra8" => [p[2] as f32 / 255.0, p[1] as f32 / 255.0, p[0] as f32 / 255.0, p[3] as f32 / 255.0],
+        "rg16f" => [half(u16at(0)), half(u16at(2)), 0.0, 1.0],
+        "rg16" => [u16at(0) as f32 / 65535.0, u16at(2) as f32 / 65535.0, 0.0, 1.0],
+        "d24s8" => [(u32at(0) & 0xff_ffff) as f32 / 16777215.0, 0.0, 0.0, 1.0],
+        "rg8" => [p[0] as f32 / 255.0, p[1] as f32 / 255.0, 0.0, 1.0],
+        "r16f" => [half(u16at(0)), 0.0, 0.0, 1.0],
+        "r16" => [u16at(0) as f32 / 65535.0, 0.0, 0.0, 1.0],
+        _ => [p[0] as f32 / 255.0, 0.0, 0.0, 1.0],
+    }
+}
+
+fn write_bmp(path: &std::path::Path, w: usize, h: usize, rgb: &[u8]) {
+    let row = (w * 3 + 3) & !3;
+    let size = 54 + row * h;
+    let mut f = Vec::with_capacity(size);
+    f.extend_from_slice(b"BM");
+    f.extend_from_slice(&(size as u32).to_le_bytes());
+    f.extend_from_slice(&[0; 4]);
+    f.extend_from_slice(&54u32.to_le_bytes());
+    f.extend_from_slice(&40u32.to_le_bytes());
+    f.extend_from_slice(&(w as i32).to_le_bytes());
+    f.extend_from_slice(&(-(h as i32)).to_le_bytes()); // top-down
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f.extend_from_slice(&24u16.to_le_bytes());
+    f.extend_from_slice(&[0; 24]);
+    for y in 0..h {
+        for x in 0..w {
+            let p = &rgb[(y * w + x) * 3..];
+            f.extend_from_slice(&[p[2], p[1], p[0]]);
+        }
+        f.extend(std::iter::repeat(0).take(row - w * 3));
+    }
+    let _ = std::fs::write(path, f);
+}
+
+fn barrier(res: usize, before: u32, after: u32) -> [u64; 4] {
+    [0, res as u64, 0xffff_ffffu64 | ((before as u64) << 32), after as u64]
+}
+
+/// Called at PresentX. Captures when the trigger file exists.
+pub unsafe fn maybe_capture(queue: *mut c_void) {
+    if !enabled() {
+        return;
+    }
+    let trigger = std::env::temp_dir().join("tombox_capture_now");
+    if !trigger.exists() {
+        return;
+    }
+    let _ = std::fs::remove_file(&trigger);
+    static SEQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join("tombox_rtcap").join(format!("{seq}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let mut report = match std::fs::File::create(dir.join("report.txt")) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut device: *mut c_void = core::ptr::null_mut();
+    if vcall!(queue, 7, fn(*const Guid, *mut *mut c_void) -> i32, &IID_DEVICE, &mut device) < 0 {
+        return;
+    }
+    let mut alloc: *mut c_void = core::ptr::null_mut();
+    let mut list: *mut c_void = core::ptr::null_mut();
+    let mut fence: *mut c_void = core::ptr::null_mut();
+    if vcall!(device, 9, fn(u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut alloc) < 0
+        || vcall!(device, 12, fn(u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32,
+            0, 0, alloc, core::ptr::null_mut(), &IID_GFX_LIST, &mut list) < 0
+        || vcall!(device, 36, fn(u64, u32, *const Guid, *mut *mut c_void) -> i32, 0, 0, &IID_FENCE, &mut fence) < 0
+    {
+        let _ = writeln!(report, "could not create capture command objects");
+        return;
+    }
+    vcall!(list, 9, fn() -> i32);
+    let mut fence_value = 0u64;
+
+    let targets: Vec<(usize, [u8; 0x38], usize)> = TARGETS.lock().unwrap().iter().map(|t| (t.res, t.desc, t.order)).collect();
+    let states = STATES.lock().unwrap().clone().unwrap_or_default();
+    let _ = writeln!(report, "{} render-target/depth textures known", targets.len());
+    let mut done = 0;
+    for (res, d, order) in targets {
+        let u32at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let (w, h) = (u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()) as usize, u32at(0x18) as usize);
+        let (fmt, samples, flags) = (u32at(0x20), u32at(0x24), u32at(0x30));
+        let state = states.get(&res).copied().unwrap_or(0);
+        let head = format!("#{order:03} {w}x{h} fmt={fmt} flags={flags:#x} state={state:#x}");
+        let Some((ch, is_float, bpp, kind)) = layout(fmt) else {
+            let _ = writeln!(report, "{head}: format not decoded - skipped");
+            continue;
+        };
+        if samples != 1 || w == 0 || h == 0 {
+            let _ = writeln!(report, "{head}: multisampled/empty - skipped");
+            continue;
+        }
+        let r = res as *mut c_void;
+        let mut pc_desc = [0u8; 0x38];
+        vcall!(r, 10, fn(*mut u8) -> *mut u8, pc_desc.as_mut_ptr());
+        let mut fp = [0u8; 32];
+        let (mut rows, mut row_size, mut total) = (0u32, 0u64, 0u64);
+        vcall!(device, 38, fn(*const u8, u32, u32, u64, *mut [u8; 32], *mut u32, *mut u64, *mut u64) -> (),
+            pc_desc.as_ptr(), 0, 1, 0, &mut fp, &mut rows, &mut row_size, &mut total);
+        if total == 0 || total == u64::MAX {
+            let _ = writeln!(report, "{head}: no copyable footprint - skipped");
+            continue;
+        }
+        let pitch = u32::from_le_bytes(fp[0x18..0x1c].try_into().unwrap()) as usize;
+        // Readback buffer.
+        let heap: [u32; 5] = [3 /* READBACK */, 0, 0, 1, 1];
+        let mut bd = [0u8; 0x38];
+        bd[0..4].copy_from_slice(&1u32.to_le_bytes());
+        bd[0x10..0x18].copy_from_slice(&total.to_le_bytes());
+        bd[0x18..0x1c].copy_from_slice(&1u32.to_le_bytes());
+        bd[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+        bd[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+        bd[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        bd[0x2c..0x30].copy_from_slice(&1u32.to_le_bytes());
+        let mut buf: *mut c_void = core::ptr::null_mut();
+        let hr = vcall!(device, 27, fn(*const u32, u32, *const u8, u32, *const c_void, *const Guid, *mut *mut c_void) -> i32,
+            heap.as_ptr(), 0, bd.as_ptr(), 0x400, core::ptr::null(), &IID_RESOURCE, &mut buf);
+        if hr < 0 || buf.is_null() {
+            let _ = writeln!(report, "{head}: readback buffer failed hr={hr:#010x}");
+            continue;
+        }
+        const COPY_SOURCE: u32 = 0x800;
+        vcall!(alloc, 8, fn() -> i32);
+        vcall!(list, 10, fn(*mut c_void, *mut c_void) -> i32, alloc, core::ptr::null_mut());
+        if state != COPY_SOURCE {
+            let b = [barrier(res, state, COPY_SOURCE)];
+            vcall!(list, 26, fn(u32, *const [u64; 4]) -> (), 1, b.as_ptr());
+        }
+        let mut dst = [0u8; 48];
+        dst[0..8].copy_from_slice(&(buf as u64).to_le_bytes());
+        dst[8..12].copy_from_slice(&1u32.to_le_bytes());
+        dst[16..48].copy_from_slice(&fp);
+        let mut src = [0u8; 48];
+        src[0..8].copy_from_slice(&(res as u64).to_le_bytes());
+        vcall!(list, 16, fn(*const u8, u32, u32, u32, *const u8, *const c_void) -> (), dst.as_ptr(), 0, 0, 0, src.as_ptr(), core::ptr::null());
+        if state != COPY_SOURCE {
+            let b = [barrier(res, COPY_SOURCE, state)];
+            vcall!(list, 26, fn(u32, *const [u64; 4]) -> (), 1, b.as_ptr());
+        }
+        vcall!(list, 9, fn() -> i32);
+        let lists = [list];
+        vcall!(queue, 10, fn(u32, *const *mut c_void) -> (), 1, lists.as_ptr());
+        fence_value += 1;
+        vcall!(queue, 14, fn(*mut c_void, u64) -> i32, fence, fence_value);
+        let mut spins = 0;
+        while vcall!(fence, 8, fn() -> u64) < fence_value && spins < 5000 {
+            Sleep(1);
+            spins += 1;
+        }
+        let mut data: *mut u8 = core::ptr::null_mut();
+        let hr = vcall!(buf, 8, fn(u32, *const c_void, *mut *mut u8) -> i32, 0, core::ptr::null(), &mut data);
+        if hr < 0 || data.is_null() || spins >= 5000 {
+            let _ = writeln!(report, "{head}: readback map failed hr={hr:#010x} (waited {spins} ms)");
+            vcall!(buf, 2, fn() -> u32);
+            continue;
+        }
+        // Statistics + preview (downscaled to <= 960 wide).
+        let step = (w / 960).max(1);
+        let (pw, ph) = (w / step, h / step);
+        let mut rgb = vec![0u8; pw * ph * 3];
+        let (mut mn, mut mx, mut sum) = ([f32::MAX; 4], [f32::MIN; 4], [0f64; 4]);
+        let (mut nan, mut inf, mut big, mut n) = (0u64, 0u64, 0u64, 0u64);
+        let mut vals: Vec<[f32; 4]> = Vec::with_capacity(pw * ph);
+        for y in (0..h).step_by(step).take(ph) {
+            let row = core::slice::from_raw_parts(data.add(y * pitch), w * bpp);
+            for x in (0..w).step_by(step).take(pw) {
+                let v = decode(kind, &row[x * bpp..x * bpp + bpp]);
+                for c in 0..ch {
+                    if v[c].is_nan() {
+                        nan += 1;
+                    } else if v[c].is_infinite() {
+                        inf += 1;
+                    } else {
+                        mn[c] = mn[c].min(v[c]);
+                        mx[c] = mx[c].max(v[c]);
+                        sum[c] += v[c] as f64;
+                        if v[c].abs() > 100.0 {
+                            big += 1;
+                        }
+                    }
+                }
+                n += 1;
+                vals.push(v);
+            }
+        }
+        // Preview: floats are tone-mapped v/(1+v); single-channel targets are normalised.
+        let (lo, hi) = (mn[0], mx[0]);
+        for (i, v) in vals.iter().enumerate() {
+            let px = if ch == 1 {
+                let t = if hi > lo { (v[0] - lo) / (hi - lo) } else { 0.0 };
+                [t, t, t]
+            } else if is_float {
+                [v[0].max(0.0) / (1.0 + v[0].max(0.0)), v[1].max(0.0) / (1.0 + v[1].max(0.0)), v[2].max(0.0) / (1.0 + v[2].max(0.0))]
+            } else {
+                [v[0], v[1], v[2]]
+            };
+            for c in 0..3 {
+                let t = if px[c].is_finite() { px[c].clamp(0.0, 1.0) } else { 1.0 };
+                rgb[i * 3 + c] = (t.powf(if is_float && ch > 1 { 1.0 / 2.2 } else { 1.0 }) * 255.0) as u8;
+            }
+        }
+        write_bmp(&dir.join(format!("rt{order:03}_{w}x{h}_fmt{fmt}.bmp")), pw, ph, &rgb);
+        let stat = |c: usize| format!("[{:.4} .. {:.4} mean {:.4}]", mn[c], mx[c], sum[c] / n.max(1) as f64);
+        let chans: Vec<String> = (0..ch).map(stat).collect();
+        let _ = writeln!(report, "{head} {kind}: {} nan={nan} inf={inf} |v|>100: {big}", chans.join(" "));
+        vcall!(buf, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
+        vcall!(buf, 2, fn() -> u32);
+        done += 1;
+    }
+    vcall!(list, 2, fn() -> u32);
+    vcall!(alloc, 2, fn() -> u32);
+    vcall!(fence, 2, fn() -> u32);
+    record("d3d12_xs", "rtcap", &format!("captured {done} render targets into {}", dir.display()));
+}

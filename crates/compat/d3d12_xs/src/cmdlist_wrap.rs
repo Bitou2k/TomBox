@@ -120,6 +120,14 @@ macro_rules! make_probes {
             // floats in xmm1/xmm2 when its depth-bounds dirty flag is set.
             XBOX_VT[68].store(*REAL_VT_PTR.add(62), Ordering::Relaxed);
             XBOX_VT[83].store(copy_texture_region_x as usize, Ordering::Relaxed);
+            // Xbox 59 = ExecuteIndirect, same slot and argument order as PC:
+            // FD3D12CommandContext::RHIDispatchIndirectComputeShader (EXE+0x85145b) calls it as
+            // (pCommandSignature, 1, pArgumentBuffer, ArgumentBufferOffset, null, 0). Leaving it
+            // a no-op silently dropped every indirect dispatch/draw.
+            XBOX_VT[59].store(*REAL_VT_PTR.add(59), Ordering::Relaxed);
+            if crate::rtcap::enabled() {
+                XBOX_VT[26].store(resource_barrier_traced as usize, Ordering::Relaxed);
+            }
         }
     };
 }
@@ -134,6 +142,14 @@ make_probes!(
     (p116,116),(p117,117),(p118,118),(p119,119),(p120,120),(p121,121),(p122,122),(p123,123),(p124,124),
     (p125,125),(p126,126),(p127,127),
 );
+
+/// ResourceBarrier (slot 26, identical on Xbox and PC) with state tracking for the
+/// diagnostic render-target capture; installed only when the capture is enabled.
+unsafe extern "system" fn resource_barrier_traced(this: *mut c_void, n: u32, barriers: *const u8) {
+    crate::rtcap::note_barriers(n, barriers);
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = core::mem::transmute(*REAL_VT_PTR.add(26));
+    f(this, n, barriers)
+}
 
 /// Xbox slot 67: reached (by tail call) from `FD3D12CommandContext::FlushTextureCacheIfNeeded`
 /// (EXE+0x4e0718). The console GPU's texture cache has no PC counterpart, so there is

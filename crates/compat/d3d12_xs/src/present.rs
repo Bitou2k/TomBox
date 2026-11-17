@@ -314,6 +314,7 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
     }
     let src = *pp;
     crate::upload::pump(queue); // mirror placed-texture memory into the PC textures
+    crate::rtcap::maybe_capture(queue); // diagnostic render-target dump (TOMBOX_RTCAP=1 + trigger file)
     let mut guard = STATE.lock().unwrap();
     if guard.is_none() {
         match init(queue, src) {

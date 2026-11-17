@@ -442,6 +442,9 @@ unsafe extern "system" fn create_committed_resource(
         desc_copy.as_ptr() as *const u32
     };
     let hr = unsafe { f(real, pheap, heap_flags, desc_ptr, init_state, pclear, use_riid, ppv) };
+    if hr >= 0 && !ppv.is_null() && !pdesc.is_null() {
+        unsafe { crate::rtcap::register(*ppv, &desc_copy[..0x38], init_state) };
+    }
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     if hr < 0 && !pdesc.is_null() {
         let orig = unsafe { core::slice::from_raw_parts(pdesc as *const u8, 0x38) };
@@ -578,6 +581,18 @@ unsafe extern "system" fn create_gfx_pso_x(
             }
             record("d3d12_xs", "CreateGraphicsPSO_X", &s);
         }
+        // Diagnostic: output-merger formats of the first PSOs plus the (so far ignored)
+        // Xbox extension struct, to check whether formats live outside the PC-layout desc.
+        static FMTLOG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if FMTLOG.fetch_add(1, Ordering::Relaxed) < 60 {
+            let u32at = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+            let ext = if _pext.is_null() || _num_ext == 0 { String::from("none") } else {
+                unsafe { core::slice::from_raw_parts(_pext, 0x40) }.chunks(4).map(|c| format!("{:x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ")
+            };
+            record("d3d12_xs", "PSOFMT", &format!(
+                "base numRT={} rtv=[{} {} {} {}] dsv={} depthEnable={} depthWrite={} samples={} numExt={} ext[{}]",
+                u32at(0x240), u32at(0x244), u32at(0x248), u32at(0x24c), u32at(0x250), u32at(0x264), u32at(0x1f0), u32at(0x1f4), u32at(0x268), _num_ext, ext));
+        }
         let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
             unsafe { core::mem::transmute(*real_vtbl(real).add(10)) };
         let hr = unsafe { f(real, desc.as_ptr(), riid, ppv) };
@@ -680,7 +695,13 @@ unsafe extern "system" fn create_derived_pso_x(
                 1 => desc[0x1c4..0x1c4 + 0x2c].copy_from_slice(payload(0x2c)),
                 2 => desc[0x78..0x78 + 0x148].copy_from_slice(payload(0x148)),
                 3 => desc[0x1c0..0x1c4].copy_from_slice(payload(4)),
-                5 => {}
+                5 => {
+                    static T5: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+                    if T5.fetch_add(1, Ordering::Relaxed) < 40 {
+                        let hex = payload(0x30).chunks(4).map(|c| format!("{:x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ");
+                        record("d3d12_xs", "PSOFMT", &format!("derived tag5 payload[{hex}]"));
+                    }
+                }
                 other => {
                     if FAIL.fetch_add(1, Ordering::Relaxed) < 6 {
                         record("d3d12_xs", "CreateDerivedPSO_X", &format!("unknown patch tag {other} -> E_FAIL"));
@@ -688,6 +709,15 @@ unsafe extern "system" fn create_derived_pso_x(
                     return E_FAIL;
                 }
             }
+        }
+    }
+    {
+        static DL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        if DL.fetch_add(1, Ordering::Relaxed) < 60 {
+            let u32at = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+            record("d3d12_xs", "PSOFMT", &format!(
+                "derived tags=[{}] numRT={} rtv0={} dsv={} depthEnable={} depthWrite={} depthFunc={} stencil={}",
+                tags.trim(), u32at(0x240), u32at(0x244), u32at(0x264), u32at(0x1f0), u32at(0x1f4), u32at(0x1f8), u32at(0x1fc)));
         }
     }
     let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =

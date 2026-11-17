@@ -20,6 +20,7 @@ mod present;
 mod frame;
 mod placed;
 mod upload;
+mod rtcap;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
