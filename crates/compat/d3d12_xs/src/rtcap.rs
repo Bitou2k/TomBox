@@ -346,11 +346,15 @@ pub unsafe fn maybe_capture(queue: *mut c_void) {
                 vals.push(v);
             }
         }
-        // Preview: floats are tone-mapped v/(1+v); single-channel targets are normalised.
-        let (lo, hi) = (mn[0], mx[0]);
+        // Preview: floats are tone-mapped v/(1+v); single-channel targets (depth) are shown
+        // on a log scale between the smallest and largest positive value, because reversed-Z
+        // depth is tiny almost everywhere and a linear scale shows only the nearest pixel.
+        let hi = mx[0];
+        let lo_pos = vals.iter().map(|v| v[0]).filter(|x| x.is_finite() && *x > 0.0).fold(f32::MAX, f32::min);
+        let nonzero = vals.iter().filter(|v| v[0].is_finite() && v[0] != 0.0).count();
         for (i, v) in vals.iter().enumerate() {
             let px = if ch == 1 {
-                let t = if hi > lo { (v[0] - lo) / (hi - lo) } else { 0.0 };
+                let t = if v[0] > 0.0 && hi > lo_pos && lo_pos > 0.0 { 0.15 + 0.85 * (v[0] / lo_pos).ln() / (hi / lo_pos).ln() } else { 0.0 };
                 [t, t, t]
             } else if is_float {
                 [v[0].max(0.0) / (1.0 + v[0].max(0.0)), v[1].max(0.0) / (1.0 + v[1].max(0.0)), v[2].max(0.0) / (1.0 + v[2].max(0.0))]
@@ -365,7 +369,12 @@ pub unsafe fn maybe_capture(queue: *mut c_void) {
         write_bmp(&dir.join(format!("rt{order:03}_{w}x{h}_fmt{fmt}.bmp")), pw, ph, &rgb);
         let stat = |c: usize| format!("[{:.4} .. {:.4} mean {:.4}]", mn[c], mx[c], sum[c] / n.max(1) as f64);
         let chans: Vec<String> = (0..ch).map(stat).collect();
-        let _ = writeln!(report, "{head} {kind}: {} nan={nan} inf={inf} |v|>100: {big}", chans.join(" "));
+        let extra = if ch == 1 {
+            format!(" | nonzero {nonzero}/{n} smallest-positive {lo_pos:e} max {hi:e} mean {:e}", sum[0] / n.max(1) as f64)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(report, "{head} {kind}: {} nan={nan} inf={inf} |v|>100: {big}{extra}", chans.join(" "));
         vcall!(buf, 9, fn(u32, *const c_void) -> (), 0, core::ptr::null());
         vcall!(buf, 2, fn() -> u32);
         done += 1;

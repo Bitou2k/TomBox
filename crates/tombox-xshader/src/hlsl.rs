@@ -232,11 +232,19 @@ struct Emitter<'a> {
 /// `v_writelane_b32 vN, sX, <lane>` and brings them back with `v_readlane_b32 sY, vN, <lane>`
 /// (VOP3 0x361 / 0x360; fixture `fortnite_lobby_desc.dxbc`). The translator models one lane
 /// per VGPR, so each (VGPR, constant lane) slot is lowered to a virtual scalar register
-/// s128.. and the two instructions become plain `s_mov_b32`, which the descriptor dataflow
+/// s108.. and the two instructions become plain `s_mov_b32`, which the descriptor dataflow
 /// and the emitter already understand.
 ///
+/// The first 148 slots (in order of first write) become virtual SGPRs s108..s255 and take part in
+/// descriptor tracking; further slots become plain translator temporaries, which carry
+/// values but not descriptor identity (a descriptor parked there later fails explicitly
+/// as "not a descriptor").
+///
 /// Refused (explicit error): a non-constant lane index, a read of a slot that was never
-/// written, more than 120 slots, or a spill VGPR that is also used as an ordinary vector.
+/// written, or a spill VGPR that is also used as an ordinary vector.
+/// Translator temporaries from this index up are lane-spill slots (declared up front).
+const LANE_TEMP_BASE: u16 = 10_000;
+
 fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
     const READLANE: u32 = 0x360;
     const WRITELANE: u32 = 0x361;
@@ -244,7 +252,7 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
     if !insns.iter().any(is_lane) {
         return Ok(());
     }
-    let mut slots: BTreeMap<(u8, i64), u8> = BTreeMap::new();
+    let mut slots: BTreeMap<(u8, i64), Opnd> = BTreeMap::new();
     let mut spill_vregs: BTreeSet<u8> = BTreeSet::new();
     for ins in insns.iter_mut() {
         if !is_lane(ins) {
@@ -263,17 +271,14 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
             let slot = match slots.get(&(v, lane)) {
                 Some(s) => *s,
                 None => {
-                    if next >= 120 {
-                        return Err(format!("v_writelane at {at:#x}: too many lane spill slots"));
-                    }
-                    let s = 128 + next as u8;
+                    let s = if next < 148 { Opnd::Sgpr(108 + next as u8) } else { Opnd::Temp(LANE_TEMP_BASE + next as u16) };
                     slots.insert((v, lane), s);
                     s
                 }
             };
             spill_vregs.insert(v);
             let value = ins.src.first().cloned().ok_or_else(|| format!("v_writelane at {at:#x}: no source"))?;
-            ins.dst = vec![Opnd::Sgpr(slot)];
+            ins.dst = vec![slot];
             ins.src = vec![value];
         } else {
             // The destination field of v_readlane names an SGPR (decoded generically as a VGPR).
@@ -288,7 +293,7 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
                 return Err(format!("v_readlane at {at:#x}: v{v} lane {lane} read before any v_writelane"));
             };
             ins.dst = vec![Opnd::Sgpr(d)];
-            ins.src = vec![Opnd::Sgpr(slot)];
+            ins.src = vec![slot];
         }
         ins.enc = Enc::Sop1;
         ins.op = 0x03;
@@ -348,6 +353,16 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         ps_attrs: distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0 && e.rw_mask != 0)),
         out_params: distinct_regs(ex.output_sig.iter().filter(|e| e.sysval == 0)),
     };
+    // Lane-spill slots beyond the tracked range are function-scope temporaries.
+    for ins in &em.insns {
+        for o in ins.dst.iter().chain(ins.src.iter()) {
+            if let Opnd::Temp(n) = o {
+                if *n >= LANE_TEMP_BASE {
+                    em.regs.insert(format!("tb_s{n}"));
+                }
+            }
+        }
+    }
     em.resolve_resources()?;
     let live_in = em.live_in();
     em.live = live_in.clone();
