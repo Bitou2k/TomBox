@@ -111,3 +111,17 @@ Honest ledger. Updated continuously.
   host while expecting another name; untested.
 - Literal-IP destinations other than loopback / the redirect host's addresses are refused,
   including LAN addresses.
+
+## Shader translator (2026-11-17, offline pass)
+
+- "Translates" and "compiles" are established for the archive (sweep pending completion);
+  **semantic correctness is not**. No translated shader has been compared against reference
+  output.
+- Structured-buffer accesses with a run-time byte offset assume the declared element size
+  equals the view's stride.
+- Optimistic descriptor join: a register holding a descriptor on one incoming path and
+  unknown on the other is treated as the descriptor.
+- Wave reductions map to `WaveActiveMin/Max`; host wave composition differs from the
+  console's 64-lane waves (as HLSL permits). FXC fallback cannot compile these.
+- Image atomics other than add/umax, and reductions other than f32 min/max, are refused.
+- DXC-compiled graphics pipelines are untested in the game.

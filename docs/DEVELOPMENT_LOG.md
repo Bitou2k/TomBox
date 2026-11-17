@@ -679,3 +679,31 @@ Input note: the title reads raw mouse deltas (real PC GameInput) and accumulates
 3840x2160 space, so the in-game cursor moves at 1/3 window scale and is unrelated to the OS
 cursor position; `tools/dev/mouse.ps1` sends relative moves. Proper window-to-title input
 mapping is not implemented. No audio.
+
+## 2026-11-17 (offline) — DXC, and every shader translating
+
+**Compiler switch.** FXC needs minutes for some generated compute shaders (and an in-process
+D3DCompile cannot be cancelled), which is what tripped the engine watchdog. DXC compiles the
+same HLSL in about a second. `tombox-xshader::dxc` wraps `dxcompiler.dll` (+ `dxil.dll` for
+validation/signing); `d3d12_xs` uses it when available (`TOMBOX_SHADER_COMPILER=fxc` forces
+FXC). `xpso` creates a real compute pipeline state from translated DXIL plus the container's
+own RTS0 root signature: 3/3 compute fixtures accepted by D3D12 on this machine.
+**Not yet verified:** graphics pipelines, and the DXC path inside the running game.
+
+**Translation coverage** (`xscan`, translate only): 105,506 of 105,506 unique shaders
+(was 105,429). Added: one-of-N buffer/cbuffer descriptors (guarded copies selected at run
+time); optimistic join for descriptors/table pointers known on one path only; structured
+buffer addressing with OFFEN and/or IDXEN (flat addressing over the declared element size);
+f16 K ops, f16 VOP3 abs/neg/clamp modifiers (previously dropped silently for VOP3-encoded
+f16 ops — a correctness bug, fixed); sub-word LDS; image atomics add/umax on `<uint>` UAV
+textures; wave reductions → `WaveActiveMin/Max` (SM6 only); code-table lookups whose address
+passes through a VGPR; LDS vertex records indexed by output register; GS table base s22;
+return from a GS-chained VS.
+
+Inferred, not documented (see code comments): DPP operand codes 233/250, SOP1 0x29, MIMG
+0x11/0x17 names, optimistic join rule.
+
+**Compile sweep** (`xscan --compile 1 --jobs 4`, below-normal priority, fills the shared
+cache): in progress. Failures found so far and fixed: high half of a 64-bit scalar move not
+declared (3 shaders), position input needs centroid interpolation with conservative depth
+(3 shaders).

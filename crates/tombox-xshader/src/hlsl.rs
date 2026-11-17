@@ -1561,6 +1561,8 @@ impl<'a> Emitter<'a> {
                 let opname = m.trim_start_matches("s_").trim_end_matches("_b32").trim_end_matches("_b64");
                 if let Some(lo) = bit(opname, &a, &b) {
                     if is64 {
+                        self.touch(&hi(&s[0]));
+                        self.touch(&hi(&s[1]));
                         let (ah, bh) = (r(&hi(&s[0]))?, r(&hi(&s[1]))?);
                         let hi_e = bit(opname, &ah, &bh).unwrap();
                         let t = self.tmp;
@@ -1637,6 +1639,7 @@ impl<'a> Emitter<'a> {
                         self.ws(&d, &format!("({cur} | (1u << (({a}) & 31u)))"))
                     }
                     "s_mov_b64" | "s_wqm_b64" => {
+                        self.touch(&hi(&s[0]));
                         let ah = r(&hi(&s[0]))?;
                         let t = self.tmp;
                         self.tmp += 1;
@@ -3516,8 +3519,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                     continue;
                 }
                 let (ty, _) = sig_type(e);
+                // DXIL validation: with a conservative depth output (SV_DepthLessEqual /
+                // SV_DepthGreaterEqual) the position input must be centroid-interpolated.
+                let cons_depth = ex.output_sig.iter().any(|o| {
+                    let s = semantic(o);
+                    s.starts_with("SV_DepthLessEqual") || s.starts_with("SV_DepthGreaterEqual")
+                });
                 let interp = if !is_ps {
                     ""
+                } else if e.sysval == 1 && cons_depth {
+                    "linear noperspective centroid "
                 } else if e.comp_type != 3 {
                     "nointerpolation "
                 } else if e.name.contains("_centroid") {

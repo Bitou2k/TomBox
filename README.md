@@ -24,8 +24,8 @@ no CPU emulation and no recompilation of game code. The work is at the platform 
   events, derived pipeline states, …), each reconstructed from the game's own call sites.
 - **Shaders (`tombox-xshader`)**: the build ships no DXIL. Its shaders are precompiled
   AMD RDNA2 machine code inside the DXBC containers. The translator disassembles that
-  code and emits HLSL, which is compiled at run time with the Microsoft FXC compiler and
-  cached on disk.
+  code and emits HLSL, which is compiled at run time with Microsoft's DXC compiler (shader
+  model 6 DXIL; FXC as fallback) and cached on disk.
 - **Textures**: on console a texture lives at a game-chosen address in unified memory, in
   a tiled layout. The runtime mirrors that memory into PC textures every frame, using the
   texture-layout library (`xg_xs.dll`) from the dump itself to compute the layout.
@@ -49,8 +49,9 @@ Verified on one machine (Windows 11, x64) with the Fortnite build above:
 | Login against a private backend (network redirect + local Xbox user) | works |
 | Game-mode select, settings menus | render correctly |
 | Battle Royale lobby | loads; UI correct, **3D scene wrong** |
-| Shader translation (translate only, whole game archive) | 104,298 of 105,506 unique shaders (98.9%) |
-| Shader translation + FXC compile | checked only for the 46 fixtures in `analysis/shaders/` and the shaders hit while running |
+| Shader translation (translate only, whole game archive) | 105,506 of 105,506 unique shaders |
+| Translated shaders compile (DXC) | whole-archive sweep in progress; see `docs/DEVELOPMENT_LOG.md` for the current count. Compiling is not the same as rendering correctly |
+| DXC output accepted by Direct3D 12 | checked for 3 compute fixtures (`xpso`); not yet run in the game |
 | Mouse | works (see limitations) |
 | Audio | none |
 | Gameplay / matches | not attempted |
@@ -59,9 +60,9 @@ Verified on one machine (Windows 11, x64) with the Fortnite build above:
 
 - **3D rendering is incorrect.** In the lobby the depth buffer stays empty, so lighting
   blows out (white character, no backdrop). Cause not yet identified.
-- **An untranslatable shader is fatal.** If the game requests one of the ~1,200 shaders the
-  translator cannot handle yet, pipeline creation fails and the engine exits.
-- **First-time shader compiles are slow** (up to ~40 s for the largest compute shaders) and
+- **A shader that fails to compile is fatal.** Every shader now translates, but if the
+  generated HLSL for one does not compile, pipeline creation fails and the engine exits.
+- **First-time shader compiles are slow** (FXC took up to minutes; DXC about a second, not yet measured in the game) and
   can trip the engine's stall watchdog the first time a screen is opened. Compiled shaders
   are cached, so a given shader stalls at most once.
 - **Approximations in translated shaders**: texture lookups inside shader loops always use
@@ -83,8 +84,8 @@ The full list of unverified assumptions is in `docs/TECHNICAL_DEBT.md`.
 
 - Windows 10/11 x64 with a Direct3D 12 GPU.
 - Microsoft Gaming Services installed (provides `xgameruntime.dll`).
-- Rust toolchain (`x86_64-pc-windows-msvc`); Windows SDK (`d3dcompiler_47.dll`, and
-  `fxc.exe` for the shader fixture script).
+- Rust toolchain (`x86_64-pc-windows-msvc`); Windows SDK (`dxcompiler.dll` + `dxil.dll`, found automatically or via `TOMBOX_DXC_DIR`;
+  `d3dcompiler_47.dll` as fallback).
 - Your own legally obtained, already-decrypted dump of the game. **No game files are
   provided here**, and the scripts assume the layout below.
 
