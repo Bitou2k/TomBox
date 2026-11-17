@@ -1485,10 +1485,15 @@ impl<'a> Emitter<'a> {
             if target > 7 {
                 return Err(format!("PS export target {target} unsupported"));
             }
+            // MRT export k feeds the k-th declared SV_Target (outputs are compacted:
+            // a shader writing SV_Target0 and SV_Target4 exports MRT 0 and MRT 1).
             let ei = osig
                 .iter()
-                .position(|e| e.sysval == 64 && e.index == target)
-                .ok_or_else(|| format!("no SV_Target{target} in output signature"))?;
+                .enumerate()
+                .filter(|(_, e)| e.sysval == 64)
+                .nth(target as usize)
+                .map(|(i, _)| i)
+                .ok_or_else(|| format!("MRT export {target} has no SV_Target output element"))?;
             assigns.push((ei, "xyzw"[..sig_type(&osig[ei]).1].to_string()));
         } else if (12..=15).contains(&target) {
             if target != 12 {

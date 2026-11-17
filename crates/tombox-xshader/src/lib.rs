@@ -170,9 +170,25 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     // partially understood, so locate the stream robustly by scanning for the zlib
     // header (0x78 0x9c / 0x78 0xda / 0x78 0x01); inflate self-terminates. Pick the
     // first blob that inflates to an FSSM container.
-    let fssm = find_and_inflate_fssm(xdat)?;
-
-    let (isa, isa_off) = locate_isa(&fssm)?;
+    //
+    // A shader can carry several FSSM programs (observed on vertex shaders: one variant
+    // that leaves through `s_setpc_b64` — a hardware-pipeline continuation form using LDS
+    // and a barrier — and one standalone program ending in `s_endpgm`). The standalone
+    // variant is the one that maps onto a PC pipeline stage, so take the first FSSM whose
+    // ISA section contains `s_endpgm`.
+    let variants = find_and_inflate_fssm(xdat)?;
+    let mut chosen = None;
+    let mut last_err = String::from("no FSSM program found");
+    for v in variants {
+        match locate_isa(&v) {
+            Ok((isa, off)) => {
+                chosen = Some((v, isa, off));
+                break;
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    let (fssm, isa, isa_off) = chosen.ok_or(last_err)?;
     let isa_preamble = {
         let mut p = [0u32; 4];
         if isa_off >= 16 {
@@ -205,21 +221,23 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     })
 }
 
-/// Scan a blob for zlib streams and return the first that inflates to an `FSSM` container.
-fn find_and_inflate_fssm(xdat: &[u8]) -> Result<Vec<u8>, String> {
+/// Scan a blob for zlib streams and return every one that inflates to an `FSSM` container
+/// (in file order).
+fn find_and_inflate_fssm(xdat: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let mut last_err = String::from("no zlib stream found in XDAT");
+    let mut found = Vec::new();
     let mut i = 8; // past "XDAT" + version
     while i + 2 < xdat.len() {
         if xdat[i] == 0x78 && matches!(xdat[i + 1], 0x01 | 0x9c | 0xda) {
             match miniz_oxide::inflate::decompress_to_vec_zlib(&xdat[i..]) {
-                Ok(out) if out.len() >= 8 && &out[0..4] == b"FSSM" => return Ok(out),
+                Ok(out) if out.len() >= 8 && &out[0..4] == b"FSSM" => found.push(out),
                 Ok(out) => last_err = format!("inflated {} bytes but magic={:?}", out.len(), &out[0..4.min(out.len())]),
                 Err(e) => last_err = format!("inflate at {i:#x} failed: {e:?}"),
             }
         }
         i += 1;
     }
-    Err(last_err)
+    if found.is_empty() { Err(last_err) } else { Ok(found) }
 }
 
 /// Locate the RDNA2 ISA section inside an FSSM blob.
