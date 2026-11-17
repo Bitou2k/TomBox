@@ -46,3 +46,33 @@ Honest ledger. Updated continuously.
 - No real Python interpreter (Store alias stub only).
 - `cmake`/`ninja`/standalone `clang`/`dumpbin` not on PATH (MSVC toolset present under
   VS 2026 but not in the default shell environment).
+
+## Network isolation (2026-11-17)
+
+* **Incident:** once the title's online subsystems started (first reached on 2026-11-17 when
+  shader translation got the game past pipeline creation), the title issued real WinHTTP
+  requests that succeeded — at least analytics to `datarouter.ol.epicgames.com`. That
+  violated the project rule against contacting Epic production services. Runs before the
+  guard below (a handful, a few minutes each) had network access.
+* **Mitigation:** `compat-common::net_guard` now patches, inside the title process, the
+  Winsock name-resolution/connect/sendto entry points and WinHTTP connect/open/send so they
+  fail locally (installed on the first compat-layer call, i.e. before the online subsystem
+  starts; verified: "Unable to create WinHttp Connection, failing request").
+* **Known gaps:** `ConnectEx` to a literal IP is not intercepted; isolation is in-process
+  only (no OS firewall rule — the session is not elevated). A proper sandbox (AppContainer
+  without network capability, or a firewall rule) would be stronger.
+
+## Audio
+
+* `acphal`: `IAcpHal` is an inert object (no SHAPE DSP): XMA voices never decode. No audio.
+
+## Shader translator (tombox-xshader) — unverified assumptions
+
+* Typed buffers are declared `float4` (or `uint` when used atomically); the real view format
+  is not visible to the shader.
+* Indexed constant-buffer arrays assume a 16-byte element stride.
+* Compute thread-group id registers are assumed to follow the user-data SGPRs.
+* PS entry ABI assumes perspective-centre barycentrics in v0/v1 and position in v2..v5.
+* `v_readfirstlane` / `v_mbcnt` / `s_bcnt1(exec)` are translated under a one-lane-per-
+  invocation model (exact only when the compiler used them for wave-level bookkeeping).
+* Translated output has not yet been validated against rendered pixels.

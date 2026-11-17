@@ -23,7 +23,18 @@ fn log_path() -> &'static std::path::PathBuf {
 }
 
 /// Record a call from `module` (e.g. "xmem") to `func` with a short `detail`.
+pub mod net_guard;
+
+/// Log a compat-layer event. The first call from each compat DLL also installs the
+/// in-process network guard (see `net_guard`), which happens before the title's online
+/// subsystems start because the allocator/runtime shims log during early startup.
 pub fn record(module: &str, func: &str, detail: &str) {
+    net_guard::ensure();
+    record_raw(module, func, detail);
+}
+
+/// Log without triggering the network guard (used by the guard itself).
+pub fn record_raw(module: &str, func: &str, detail: &str) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
