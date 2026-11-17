@@ -35,7 +35,32 @@ pub enum Enc {
     Unknown,
 }
 
-/// One decoded instruction (length-accurate; operand decode is best-effort for now).
+/// A decoded operand. RDNA2 vector (VGPR) operands are per-lane, which maps directly onto
+/// a per-thread HLSL variable; scalar (SGPR) operands are wave-uniform. Special registers
+/// and inline constants are modeled explicitly so the translator never has to re-parse bits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Opnd {
+    Sgpr(u8),
+    Vgpr(u8),
+    VccLo,
+    VccHi,
+    ExecLo,
+    ExecHi,
+    M0,
+    Scc,
+    Null,
+    /// Inline integer constant (the -16..64 and 0 encodings).
+    ConstInt(i64),
+    /// Inline float constant (0.5, 1.0, 2.0, 4.0 and negatives, 1/2pi).
+    ConstF32(f32),
+    /// Trailing 32-bit literal.
+    Literal(u32),
+    /// An operand code we don't model yet (preserved, not guessed).
+    Raw(u16),
+}
+
+/// One decoded instruction: length-accurate, with structured destination + source operands
+/// where the encoding is understood. Unknown opcodes keep `ops` empty rather than guessing.
 #[derive(Debug, Clone)]
 pub struct Insn {
     /// Byte offset within the ISA blob.
@@ -49,6 +74,23 @@ pub struct Insn {
     pub raw: Vec<u32>,
     /// Mnemonic when known, else a format tag like "vop3<0x1c7>".
     pub mnemonic: String,
+    /// Destination operand(s). Most ALU ops have exactly one.
+    pub dst: Vec<Opnd>,
+    /// Source operands in encoding order.
+    pub src: Vec<Opnd>,
+    /// For memory/export/interp: extra fields the translator needs (offset, dmask, target…).
+    pub aux: InsnAux,
+}
+
+/// Encoding-specific extra fields kept out of the generic operand list.
+#[derive(Debug, Clone, Default)]
+pub struct InsnAux {
+    /// EXP target (0-63), DS/MUBUF offset, SMEM offset, etc. — meaning per encoding.
+    pub imm: i64,
+    /// EXP enable mask / MIMG dmask / interp attribute channel.
+    pub mask: u8,
+    /// Secondary immediate (e.g. VINTRP attr#, SMEM soffset code).
+    pub imm2: i64,
 }
 
 /// Classify the encoding from the first dword. Order matters (most-specific first).
@@ -119,7 +161,8 @@ pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
         let raw: Vec<u32> = words[i..i + total].to_vec();
         let op = opcode_field(enc, w);
         let mnemonic = mnemonic_for(enc, op);
-        let insn = Insn { offset: i * 4, dwords: total, enc, op, raw, mnemonic };
+        let (dst, src, aux) = decode_operands(enc, &raw);
+        let insn = Insn { offset: i * 4, dwords: total, enc, op, raw, mnemonic, dst, src, aux };
         let is_endpgm = enc == Enc::Sopp && op == 0x01;
         out.push(insn);
         i += total;
@@ -128,6 +171,158 @@ pub fn disassemble(isa: &[u8]) -> Vec<Insn> {
         }
     }
     out
+}
+
+/// Human-readable operand string (for disassembly / debugging).
+pub fn opnd_str(o: &Opnd) -> String {
+    match o {
+        Opnd::Sgpr(n) => format!("s{n}"),
+        Opnd::Vgpr(n) => format!("v{n}"),
+        Opnd::VccLo => "vcc_lo".into(),
+        Opnd::VccHi => "vcc_hi".into(),
+        Opnd::ExecLo => "exec_lo".into(),
+        Opnd::ExecHi => "exec_hi".into(),
+        Opnd::M0 => "m0".into(),
+        Opnd::Scc => "scc".into(),
+        Opnd::Null => "null".into(),
+        Opnd::ConstInt(v) => format!("{v}"),
+        Opnd::ConstF32(v) => format!("{v:?}"),
+        Opnd::Literal(v) => format!("0x{v:x}"),
+        Opnd::Raw(c) => format!("<op{c}>"),
+    }
+}
+
+/// Decode an 8-bit scalar source/dest operand code (SSRC/SDST), per the RDNA2 ISA table.
+fn ssrc8(code: u16, lit: Option<u32>) -> Opnd {
+    match code {
+        0..=105 => Opnd::Sgpr(code as u8),
+        106 => Opnd::VccLo,
+        107 => Opnd::VccHi,
+        124 => Opnd::M0,
+        125 => Opnd::Null,
+        126 => Opnd::ExecLo,
+        127 => Opnd::ExecHi,
+        128 => Opnd::ConstInt(0),
+        129..=192 => Opnd::ConstInt(code as i64 - 128), // 1..64
+        193..=208 => Opnd::ConstInt(-(code as i64 - 192)), // -1..-16
+        240 => Opnd::ConstF32(0.5),
+        241 => Opnd::ConstF32(-0.5),
+        242 => Opnd::ConstF32(1.0),
+        243 => Opnd::ConstF32(-1.0),
+        244 => Opnd::ConstF32(2.0),
+        245 => Opnd::ConstF32(-2.0),
+        246 => Opnd::ConstF32(4.0),
+        247 => Opnd::ConstF32(-4.0),
+        248 => Opnd::ConstF32(std::f32::consts::FRAC_1_PI * 0.5), // 1/(2*pi)
+        253 => Opnd::Scc,
+        255 => Opnd::Literal(lit.unwrap_or(0)),
+        other => Opnd::Raw(other),
+    }
+}
+
+/// Decode a 9-bit source code (VOP src0 / VOP3 sources): 256+ selects a VGPR.
+fn src9(code: u16, lit: Option<u32>) -> Opnd {
+    if code >= 256 {
+        Opnd::Vgpr((code - 256) as u8)
+    } else {
+        ssrc8(code, lit)
+    }
+}
+
+/// Decode destination + source operands and encoding-specific aux fields.
+/// Only the understood encodings are filled; others return empties (never guessed).
+fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
+    let w = raw[0];
+    let lit = raw.get(1).copied(); // trailing literal (if the length decode added one)
+    let mut aux = InsnAux::default();
+    let sgpr_pair = |base: u16| Opnd::Sgpr(base as u8); // base of an SGPR range
+    match enc {
+        Enc::Sop2 => {
+            let sdst = (w >> 16) & 0x7f;
+            let ssrc1 = (w >> 8) & 0xff;
+            let ssrc0 = w & 0xff;
+            (vec![ssrc8(sdst as u16, None)],
+             vec![ssrc8(ssrc0 as u16, lit), ssrc8(ssrc1 as u16, lit)], aux)
+        }
+        Enc::Sop1 => {
+            let sdst = (w >> 16) & 0x7f;
+            let ssrc0 = w & 0xff;
+            (vec![ssrc8(sdst as u16, None)], vec![ssrc8(ssrc0 as u16, lit)], aux)
+        }
+        Enc::Sopk => {
+            let sdst = (w >> 16) & 0x7f;
+            aux.imm = ((w & 0xffff) as i16) as i64; // sign-extended SIMM16
+            (vec![ssrc8(sdst as u16, None)], vec![], aux)
+        }
+        Enc::Sopc => {
+            let ssrc1 = (w >> 8) & 0xff;
+            let ssrc0 = w & 0xff;
+            (vec![Opnd::Scc], vec![ssrc8(ssrc0 as u16, lit), ssrc8(ssrc1 as u16, lit)], aux)
+        }
+        Enc::Sopp => {
+            aux.imm = ((w & 0xffff) as i16) as i64;
+            (vec![], vec![], aux)
+        }
+        Enc::Smem => {
+            let sdata = (w >> 6) & 0x7f;
+            let sbase = (w & 0x3f) * 2; // SBASE is an even-aligned SGPR pair, stored /2
+            aux.imm = (lit.unwrap_or(raw.get(1).copied().unwrap_or(0)) & 0x1f_ffff) as i64;
+            if let Some(d1) = raw.get(1) {
+                aux.imm = (d1 & 0x1f_ffff) as i64; // 21-bit OFFSET in dword1
+            }
+            (vec![ssrc8(sdata as u16, None)], vec![sgpr_pair(sbase as u16)], aux)
+        }
+        Enc::Vop2 => {
+            let vdst = (w >> 17) & 0xff;
+            let vsrc1 = (w >> 9) & 0xff;
+            let src0 = w & 0x1ff;
+            (vec![Opnd::Vgpr(vdst as u8)],
+             vec![src9(src0 as u16, lit), Opnd::Vgpr(vsrc1 as u8)], aux)
+        }
+        Enc::Vop1 => {
+            let vdst = (w >> 17) & 0xff;
+            let src0 = w & 0x1ff;
+            (vec![Opnd::Vgpr(vdst as u8)], vec![src9(src0 as u16, lit)], aux)
+        }
+        Enc::Vopc => {
+            let vsrc1 = (w >> 9) & 0xff;
+            let src0 = w & 0x1ff;
+            (vec![Opnd::VccLo], vec![src9(src0 as u16, lit), Opnd::Vgpr(vsrc1 as u8)], aux)
+        }
+        Enc::Vop3 => {
+            let vdst = w & 0xff;
+            let d1 = raw.get(1).copied().unwrap_or(0);
+            let s0 = d1 & 0x1ff;
+            let s1 = (d1 >> 9) & 0x1ff;
+            let s2 = (d1 >> 18) & 0x1ff;
+            (vec![Opnd::Vgpr(vdst as u8)],
+             vec![src9(s0 as u16, None), src9(s1 as u16, None), src9(s2 as u16, None)], aux)
+        }
+        Enc::Vinterp => {
+            let vdst = (w >> 18) & 0xff;
+            let attr = (w >> 10) & 0x3f;
+            let chan = (w >> 8) & 0x3;
+            let vsrc = w & 0xff;
+            aux.imm = attr as i64;
+            aux.imm2 = chan as i64;
+            (vec![Opnd::Vgpr(vdst as u8)], vec![Opnd::Vgpr(vsrc as u8)], aux)
+        }
+        Enc::Exp => {
+            let en = (w & 0xf) as u8;
+            let target = (w >> 4) & 0x3f;
+            aux.imm = target as i64;
+            aux.mask = en;
+            let d1 = raw.get(1).copied().unwrap_or(0);
+            let s = vec![
+                Opnd::Vgpr((d1 & 0xff) as u8),
+                Opnd::Vgpr(((d1 >> 8) & 0xff) as u8),
+                Opnd::Vgpr(((d1 >> 16) & 0xff) as u8),
+                Opnd::Vgpr(((d1 >> 24) & 0xff) as u8),
+            ];
+            (vec![], s, aux)
+        }
+        _ => (vec![], vec![], aux),
+    }
 }
 
 /// Base length (dwords) for an encoding, plus whether an inline literal source is present.

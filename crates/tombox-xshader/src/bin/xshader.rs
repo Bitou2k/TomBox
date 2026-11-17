@@ -78,12 +78,33 @@ fn main() -> ExitCode {
     let mut ended = false;
     for ins in &insns {
         let raw: Vec<String> = ins.raw.iter().map(|w| format!("{w:08x}")).collect();
+        use tombox_xshader::rdna2::opnd_str;
+        let dsts: Vec<String> = ins.dst.iter().map(opnd_str).collect();
+        let srcs: Vec<String> = ins.src.iter().map(opnd_str).collect();
+        let mut ops = String::new();
+        if !dsts.is_empty() {
+            ops.push_str(&dsts.join(","));
+        }
+        if !srcs.is_empty() {
+            if !ops.is_empty() {
+                ops.push_str(", ");
+            }
+            ops.push_str(&srcs.join(", "));
+        }
+        let aux = match ins.enc {
+            tombox_xshader::rdna2::Enc::Exp => format!(" [target={} en={:#06b}]", ins.aux.imm, ins.aux.mask),
+            tombox_xshader::rdna2::Enc::Vinterp => format!(" [attr{}.{}]", ins.aux.imm, ins.aux.imm2),
+            tombox_xshader::rdna2::Enc::Smem => format!(" [off={:#x}]", ins.aux.imm),
+            tombox_xshader::rdna2::Enc::Sopp | tombox_xshader::rdna2::Enc::Sopk => format!(" [imm={}]", ins.aux.imm),
+            _ => String::new(),
+        };
         println!(
-            "  {:#06x}: {:<20} {:<8} {}",
+            "  {:#06x}: {:<20} {:<16} {} {}",
             ins.offset,
             raw.join(" "),
-            format!("{:?}", ins.enc).to_lowercase(),
-            ins.mnemonic
+            ins.mnemonic,
+            ops,
+            aux
         );
         consumed += ins.dwords * 4;
         if ins.mnemonic == "s_endpgm" {

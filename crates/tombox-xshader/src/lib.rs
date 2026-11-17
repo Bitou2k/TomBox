@@ -216,7 +216,10 @@ fn locate_isa(fssm: &[u8]) -> Result<(Vec<u8>, usize), String> {
         if off >= 0x40 && size >= 8 && off + size <= fssm.len() {
             let sect = &fssm[off..off + size];
             if range_contains_endpgm(sect) {
-                return Ok((trim_to_endpgm(sect), off));
+                // The ISA section begins with a 16-byte preamble (dword0 = code offset,
+                // dwords 1..3 = 0) before the executable RDNA2 code. Skip it when present.
+                let (code, code_off) = strip_isa_preamble(sect, off);
+                return Ok((trim_to_endpgm(code), code_off));
             }
         }
     }
@@ -241,6 +244,20 @@ fn locate_isa(fssm: &[u8]) -> Result<(Vec<u8>, usize), String> {
         start -= 4;
     }
     Ok((fssm[start..end].to_vec(), start))
+}
+
+/// Strip the 16-byte ISA-section preamble (dword0 = code offset, dwords 1..3 zero) that
+/// precedes the executable RDNA2 code. Returns the code slice and its absolute FSSM offset.
+fn strip_isa_preamble(sect: &[u8], sect_off: usize) -> (&[u8], usize) {
+    if sect.len() >= 16 {
+        let d1 = u32::from_le_bytes([sect[4], sect[5], sect[6], sect[7]]);
+        let d2 = u32::from_le_bytes([sect[8], sect[9], sect[10], sect[11]]);
+        let d3 = u32::from_le_bytes([sect[12], sect[13], sect[14], sect[15]]);
+        if d1 == 0 && d2 == 0 && d3 == 0 {
+            return (&sect[16..], sect_off + 16);
+        }
+    }
+    (sect, sect_off)
 }
 
 fn range_contains_endpgm(sect: &[u8]) -> bool {
