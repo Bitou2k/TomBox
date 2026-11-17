@@ -587,7 +587,14 @@ pub fn ensure() {
             crate::record_raw("net_guard", "disabled", "TOMBOX_ALLOW_NETWORK=1 — title network access NOT restricted");
             return;
         }
-        let host = std::env::var("TOMBOX_NET_REDIRECT").ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+        // Redirect host: environment first, else a `net_redirect=<host>` line in `tombox.cfg`
+        // next to the title executable (so a plain double-click launch gets the same policy).
+        let from_cfg = || -> Option<String> {
+            let exe = std::env::current_exe().ok()?;
+            let text = std::fs::read_to_string(exe.parent()?.join("tombox.cfg")).ok()?;
+            text.lines().find_map(|l| l.trim().strip_prefix("net_redirect=").map(|v| v.trim().to_string()))
+        };
+        let host = std::env::var("TOMBOX_NET_REDIRECT").ok().or_else(from_cfg).map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
         match host {
             Some(h) if h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') => {
                 let mut ansi = h.clone().into_bytes();
