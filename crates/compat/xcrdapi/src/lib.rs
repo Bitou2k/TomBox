@@ -113,9 +113,16 @@ unsafe extern "system" fn enqueue_shim(this: *mut c_void, preq: *const u8) {
     }
     let x = unsafe { core::slice::from_raw_parts(preq, 0x40) };
     let rd = |o: usize| u64::from_le_bytes(x[o..o + 8].try_into().unwrap());
-    let (dst_buf, _dst_size, src_file, src_off, src_size) =
-        (rd(0x08), rd(0x18), rd(0x20), rd(0x28), rd(0x30));
+    let (options, dst_buf, dst_size, src_file, src_off, src_size) =
+        (rd(0x00), rd(0x08), rd(0x18), rd(0x20), rd(0x28), rd(0x30));
     let _ = this;
+    // Options byte 0 = CompressionFormat (0=None). If nonzero, Xbox DirectStorage
+    // hardware-decompresses during the read; our raw read would leave it compressed.
+    let compression = (options & 0xFF) as u8;
+    if ENQUEUE_DUMPS.load(Ordering::Relaxed) < 8 {
+        record(M, "EnqueueRequest.opt",
+            &format!("options={options:#x} compression={compression} src_size={src_size:#x} dst_size={dst_size:#x}"));
+    }
 
     // Service the read directly from the OS file we opened in OpenFile. (The real
     // DStorageCore read path faults on these requests; the game's Submit still

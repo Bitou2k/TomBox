@@ -464,3 +464,26 @@ DirectStorage to decompress (CompressionFormat in the request) and our self-serv
 reads must zlib-inflate, or the engine's own decompress step is being skipped. All
 DirectStorage self-service reads verified complete/non-zero (not the cause of bad
 data elsewhere).
+
+## 2026-11-16 — ContainerHeader decompression/routing (precise localization)
+
+Deepened the package-store crash analysis:
+- The source buffer handed to the FContainerHeader deserializer is zlib-compressed
+  (78 9c) and memory-mapped (0x7ff4_xxxx_xxxx).
+- Our 4 DirectStorage reads are all uncompressed plaintext (verified: readable
+  strings, CompressionFormat=0, src==dst size) -> NOT the cause.
+- FCompression::UncompressMemory IS called with zlib (78 9c) data during load, so
+  the zlib path works. ScatterBlock's synchronous UncompressMemory (0x5c0789) is
+  NOT hit before the crash; decompression goes via another caller
+  (FDecompressAsyncTask).
+- Conclusion: the ContainerHeader's *decompressed output is not routed to the
+  deserializer* — the lambda's captured buffer ([this+0x18]) still points at the
+  compressed source. It's a read-callback buffer-plumbing difference, not a missing
+  decompressor.
+
+NEXT: add log-and-continue (single-step replant) support to mdbg (cfw_handle
+already does the trap-flag dance) so every UncompressMemory call + result + caller
+can be logged; then find where the ContainerHeader read hands the compressed source
+to the callback instead of the decompressed buffer. Chunk type = 0x0A
+(ContainerHeader), read via FIoDispatcherImpl::ReadWithCallback from
+FPackageStore::LoadContainers.
