@@ -443,3 +443,24 @@ An async task lambda crashes (AV read null) in the FPackageId->FPackageStoreEntr
 map build (TMapBase::FindOrAddImpl) — the entries buffer [rbp+0xA0] is null.
 Post-content-load engine init; needs tracing where that buffer is set up (likely a
 stubbed Xbox path returning null, or an IoStore package-store format detail).
+
+## 2026-11-16 — Post-content crash: container header not decompressed
+
+Traced the package-store build crash (async lambda in FPackageStore::LoadContainers,
+deserializing FContainerHeader). Root cause identified precisely via a crash-frame
+dump: the source buffer handed to the FMemoryReaderView contains ZLIB-COMPRESSED
+data (magic 0x78 0x9c), and the game deserializes it raw -> first bytes read as a
+package id/count -> null entries array -> AV read null. (The size field is fine at
+0x10000; an earlier read of the 40-bit size looked wrong but the byte at +0x18 is 0.)
+
+The buffer is memory-mapped (0x7ff4_xxxx_xxxx), NOT one of our 4 DirectStorage dest
+buffers, so it comes from a read path (FIoDispatcherImpl::ReadWithCallback) where the
+chunk's decompression isn't applied on PC. On Xbox this chunk is decompressed
+(hardware decompression via the Velocity Architecture / DirectStorage) before
+deserialization.
+
+NEXT: trace the container-header read/decompress path; either the engine expects
+DirectStorage to decompress (CompressionFormat in the request) and our self-serviced
+reads must zlib-inflate, or the engine's own decompress step is being skipped. All
+DirectStorage self-service reads verified complete/non-zero (not the cause of bad
+data elsewhere).

@@ -130,9 +130,15 @@ unsafe extern "system" fn enqueue_shim(this: *mut c_void, preq: *const u8) {
             ov[20..24].copy_from_slice(&(((src_off >> 32) as u32)).to_le_bytes()); // OffsetHigh
             let mut got: u32 = 0;
             let ok = unsafe { ReadFile(h, dst_buf as *mut u8, src_size as u32, &mut got, ov.as_mut_ptr()) };
-            if n < 3 {
+            // Flag any problem read: failed, short, or all-zero destination.
+            let zero = got >= 8 && unsafe { *(dst_buf as *const u64) } == 0
+                && unsafe { *((dst_buf + 8) as *const u64) } == 0;
+            let bad = ok == 0 || got != src_size as u32 || zero;
+            if bad || n < 3 {
+                let d0 = if got >= 8 { unsafe { *(dst_buf as *const u64) } } else { 0 };
                 record(M, "EnqueueRequest",
-                    &format!("read file={src_file:#x} off={src_off:#x} size={src_size:#x} -> dst={dst_buf:#x} ok={} got={got:#x}", ok != 0));
+                    &format!("{}read off={src_off:#x} size={src_size:#x} got={got:#x} ok={} data0={d0:#018x}",
+                        if bad { "BAD " } else { "" }, ok != 0));
             }
         }
         _ => {
