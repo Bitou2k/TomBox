@@ -326,7 +326,9 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
         }
         Enc::Vop3 => {
             let vdst = w & 0xff;
-            let op = (w >> 16) & 0x3ff;
+            // VOP3P (prefix 0b110011) has a 7-bit opcode; it is kept apart from VOP3's
+            // 10-bit opcodes by adding 0x400.
+            let op = if w >> 26 == 0b110011 { 0x400 | ((w >> 16) & 0x7f) } else { (w >> 16) & 0x3ff };
             let d1 = raw.get(1).copied().unwrap_or(0);
             let l3 = raw.get(2).copied();
             let s0 = d1 & 0x1ff;
@@ -464,6 +466,7 @@ fn opcode_field(enc: Enc, w: u32) -> u32 {
         Enc::Vop2 => (w >> 25) & 0x3f,
         Enc::Vop1 => (w >> 9) & 0xff,
         Enc::Vopc => (w >> 17) & 0xff,
+        Enc::Vop3 if w >> 26 == 0b110011 => 0x400 | ((w >> 16) & 0x7f),
         Enc::Vop3 => (w >> 16) & 0x3ff,
         Enc::Mimg => ((w >> 18) & 0x7f) | ((w & 1) << 7),
         Enc::Mubuf => (w >> 18) & 0xff,

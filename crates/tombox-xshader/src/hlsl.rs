@@ -350,7 +350,13 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         regs: BTreeSet::new(),
         body: String::new(),
         tmp: 0,
-        ps_attrs: distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0 && e.rw_mask != 0)),
+        // PS attribute slot k = the k-th input *register* that carries an interpolant and is
+        // read. A register counts as read if any element packed into it is read — including
+        // a system value sharing it (observed: PARTICLE_RANDOM unread + SV_IsFrontFace read
+        // in the same register still occupies an attribute slot; d26fd88ff8712f9e).
+        ps_attrs: distinct_regs(ex.input_sig.iter().filter(|e| {
+            e.sysval == 0 && ex.input_sig.iter().any(|o| o.register == e.register && o.rw_mask != 0)
+        })),
         out_params: distinct_regs(ex.output_sig.iter().filter(|e| e.sysval == 0)),
     };
     // Lane-spill slots beyond the tracked range are function-scope temporaries.
@@ -513,6 +519,14 @@ impl<'a> Emitter<'a> {
         }
         (self.res, self.cb_size, self.tex, self.samp, self.samp_cmp, self.uav, self.sbuf, self.tbuf, self.tbuf_uint) = saved;
 
+        // TB_DFDEBUG=<sgpr>: print that register's symbol at every block entry (diagnostics).
+        if let Some(reg) = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u8>().ok()) {
+            for (b, r) in ranges.iter().enumerate() {
+                let s = states[b].as_ref().map(|(sym, wr)| (sym.get(&reg).copied(), wr.contains(&reg)));
+                eprintln!("block {b} @{:#x}..: s{reg} = {s:?} succs={:?}", self.insns[r.start].offset, succs[b]);
+            }
+            eprintln!("first analysis error: {first_err:?}");
+        }
         self.msel.clear();
         self.dsel_loads.clear();
         self.dsel_moves.clear();
@@ -573,7 +587,16 @@ impl<'a> Emitter<'a> {
         range: std::ops::Range<usize>,
     ) -> Result<(), String> {
         let insns = self.insns.clone();
+        let dbg_reg = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u8>().ok());
+        let mut dbg_prev: Option<Sym> = dbg_reg.and_then(|r| sym.get(&r).copied());
         for idx in range {
+            if let Some(r) = dbg_reg {
+                let cur = sym.get(&r).copied();
+                if cur != dbg_prev && idx > 0 {
+                    eprintln!("  s{r}: {dbg_prev:?} -> {cur:?} by {:#x} {}", insns[idx - 1].offset, insns[idx - 1].mnemonic);
+                }
+                dbg_prev = cur;
+            }
             let ins = &insns[idx];
             let sg = |o: &Opnd| if let Opnd::Sgpr(n) = o { Some(*n) } else { None };
             match ins.enc {
@@ -617,14 +640,24 @@ impl<'a> Emitter<'a> {
                                     }
                                     sym.insert(d + k, v);
                                 }
-                                None => {
-                                    sym.remove(&(d + k));
-                                }
+                                None => match s {
+                                    // A never-written user SGPR is a root table pointer (see
+                                    // s_mov_b32); a 64-bit copy carries it in the low half.
+                                    Some(s) if k == 0 && !written.contains(&s) => {
+                                        sym.insert(d, Sym::Table(s));
+                                    }
+                                    _ => {
+                                        sym.remove(&(d + k));
+                                    }
+                                },
                             }
                             written.insert(d + k);
                         }
                     }
                 }
+                // s_setreg_* program a hardware mode register; the encoding's register
+                // field is not an SGPR destination.
+                Enc::Sopk if ins.mnemonic.starts_with("s_setreg") => {}
                 Enc::Sop1 if ins.mnemonic == "s_getpc_b64" => {
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         sym.insert(d, Sym::Code);
@@ -922,7 +955,13 @@ impl<'a> Emitter<'a> {
     ///   Loops must be properly nested, have one back-edge per header, and must not be
     ///   entered from outside except through the header — otherwise `Err`.
     fn emit_body(&mut self, is_ps: bool) -> Result<(), String> {
-        let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+        let mut off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+        // A branch to the address just past the last instruction leaves the program (same as
+        // reaching the final s_endpgm).
+        if let Some(l) = self.insns.last() {
+            off2idx.insert(l.offset + l.dwords * 4, self.insns.len());
+        }
+        let prog_end = self.insns.last().map_or(0, |l| l.offset + l.dwords * 4);
         let mut target: HashMap<usize, usize> = HashMap::new(); // forward: branch idx -> target idx
         let mut back: HashMap<usize, usize> = HashMap::new(); // backward: branch idx B -> header idx L
         let n_insns = self.insns.len();
@@ -933,9 +972,13 @@ impl<'a> Emitter<'a> {
             }
             if ins.enc == Enc::Sopp && Self::branch_cond(ins.op).is_some() {
                 let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
-                let ti = *off2idx
-                    .get(&(t as usize))
-                    .ok_or_else(|| format!("branch at {:#x} targets mid-instruction {t:#x}", ins.offset))?;
+                let ti = if t >= 0 && t as usize >= prog_end {
+                        self.insns.len() // at or beyond the end of the program (s_code_end padding): exit
+                    } else {
+                        *off2idx
+                            .get(&(t as usize))
+                            .ok_or_else(|| format!("branch at {:#x} targets mid-instruction {t:#x}", ins.offset))?
+                    };
                 if ti <= i {
                     back.insert(i, ti);
                 } else {
@@ -1055,7 +1098,11 @@ impl<'a> Emitter<'a> {
     /// shader then fails to compile rather than silently changing meaning.)
     fn emit_body_dispatch(&mut self, is_ps: bool) -> Result<(), String> {
         let n = self.insns.len();
-        let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+        let mut off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
+        if let Some(l) = self.insns.last() {
+            off2idx.insert(l.offset + l.dwords * 4, n);
+        }
+        let prog_end = self.insns.last().map_or(0, |l| l.offset + l.dwords * 4);
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
         leaders.insert(0);
         let mut tgt: HashMap<usize, usize> = HashMap::new();
@@ -1065,9 +1112,13 @@ impl<'a> Emitter<'a> {
             }
             if Self::branch_cond(ins.op).is_some() {
                 let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
-                let ti = *off2idx
-                    .get(&(t as usize))
-                    .ok_or_else(|| format!("branch at {:#x} targets mid-instruction {t:#x}", ins.offset))?;
+                let ti = if t >= 0 && t as usize >= prog_end {
+                        self.insns.len() // at or beyond the end of the program (s_code_end padding): exit
+                    } else {
+                        *off2idx
+                            .get(&(t as usize))
+                            .ok_or_else(|| format!("branch at {:#x} targets mid-instruction {t:#x}", ins.offset))?
+                    };
                 tgt.insert(i, ti);
                 leaders.insert(ti);
                 leaders.insert(i + 1);
@@ -1725,6 +1776,35 @@ impl<'a> Emitter<'a> {
         if m == "v_nop" {
             return Ok(());
         }
+        if m == "v_fma_mix_f32" {
+            // VOP3P: D = S0 * S1 + S2 where each source is either a full float or a half
+            // float taken from the low/high 16 bits of its register and widened:
+            //   OPSEL_HI bit i (dword1[28:27], dword0[14] for i = 2) = 0 -> 32-bit float,
+            //                                                         1 -> 16-bit float;
+            //   OPSEL bit i (dword0[13:11]) picks the high half when the source is 16-bit;
+            //   NEG bit i (dword1[31:29]) negates, NEG_HI bit i (dword0[10:8]) takes |x|.
+            let (w0, w1) = (ins.raw[0], ins.raw.get(1).copied().unwrap_or(0));
+            let opsel = (w0 >> 11) & 7;
+            let opsel_hi = ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2);
+            let (neg, abs) = ((w1 >> 29) & 7, (w0 >> 8) & 7);
+            let mut v = Vec::new();
+            for i in 0..3 {
+                let x = r(&s[i])?;
+                let mut e = if (opsel_hi >> i) & 1 != 0 {
+                    if (opsel >> i) & 1 != 0 { format!("f16tof32(({x}) >> 16)") } else { format!("f16tof32(({x}) & 0xffffu)") }
+                } else {
+                    format!("asfloat({x})")
+                };
+                if (abs >> i) & 1 != 0 {
+                    e = format!("abs({e})");
+                }
+                if (neg >> i) & 1 != 0 {
+                    e = format!("(-{e})");
+                }
+                v.push(e);
+            }
+            return self.wv(&d, &format!("asuint({} * {} + {})", v[0], v[1], v[2]));
+        }
         // Compares (VOPC, and VOP3 with a scalar mask destination).
         if m.starts_with("v_cmp_") {
             let c = if m == "v_cmp_class_f32" {
@@ -2321,15 +2401,19 @@ impl<'a> Emitter<'a> {
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         let rs = self.res.get(&idx).cloned().ok_or("unresolved image")?;
         // Texel-addressed ops (no sampler): image_load / image_store, on SRVs or UAVs.
-        if matches!(ins.mnemonic.as_str(), "image_load" | "image_store") {
+        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store") {
+            let with_mip = ins.mnemonic == "image_load_mip";
             let (slot, dim, is_uav) = match rs.first() {
                 Some(Res::Tex(t, d)) => (*t, *d, false),
                 Some(Res::Uav(t, d)) => (*t, *d, true),
                 _ => return Err("unresolved image".into()),
             };
             let ncoord = match dim {
-                1 => 2,
-                2 | 5 => 3,
+                0 => 1,     // 1D
+                1 => 2,     // 2D
+                2 | 5 => 3, // 3D / 2D array
+                4 => 2,     // 1D array
+                6 => 2,     // 2D multisampled (the next component is the sample index)
                 _ => return Err(format!("image dim {dim} unsupported for load/store")),
             };
             let nsa = ins.aux.imm2 as usize;
@@ -2371,10 +2455,28 @@ impl<'a> Emitter<'a> {
             } else {
                 let t = self.tmp;
                 self.tmp += 1;
-                let e = if is_uav {
+                // image_load_mip carries the mip level as one more address component.
+                let mip = if with_mip {
+                    let o = if nsa > 0 { ins.src[ncoord] } else { Opnd::Vgpr(first + ncoord as u8) };
+                    self.touch(&o);
+                    format!("(int){}", r(&o)?)
+                } else {
+                    "0".to_string()
+                };
+                let e = if dim == 6 {
+                    if is_uav {
+                        return Err("multisampled UAV load unsupported".into());
+                    }
+                    let o = if nsa > 0 { ins.src[ncoord] } else { Opnd::Vgpr(first + ncoord as u8) };
+                    self.touch(&o);
+                    format!("tex{slot}.Load(int2({}), (int){})", c.iter().map(|x| format!("(int){x}")).collect::<Vec<_>>().join(", "), r(&o)?)
+                } else if is_uav {
+                    if with_mip {
+                        return Err("image_load_mip on a UAV unsupported".into());
+                    }
                     format!("uav{slot}[uint{ncoord}({})]", c.join(", "))
                 } else {
-                    format!("tex{slot}.Load(int{}({}, 0))", ncoord + 1, c.iter().map(|x| format!("(int){x}")).collect::<Vec<_>>().join(", "))
+                    format!("tex{slot}.Load(int{}({}, {mip}))", ncoord + 1, c.iter().map(|x| format!("(int){x}")).collect::<Vec<_>>().join(", "))
                 };
                 self.line(&format!("float4 t{t} = {e};"));
                 let mut n = 0u8;
@@ -2718,6 +2820,7 @@ impl<'a> Emitter<'a> {
                 2 => "Texture3D<float4>",
                 3 => "TextureCube<float4>",
                 5 => "Texture2DArray<float4>",
+                6 => "Texture2DMS<float4>",
                 _ => return Err(format!("texture dim {dim} unsupported")),
             };
             let _ = writeln!(h, "{ty} tex{slot} : register(t{slot});");

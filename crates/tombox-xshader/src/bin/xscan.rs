@@ -1,7 +1,11 @@
 //! xscan: run the extractor + RDNA2→HLSL translator over every Xbox shader container found
 //! in a file (e.g. a .pak holding a ShaderArchive) and report coverage.
 //!
-//! Usage: xscan <file> [--examples <dir>] [--limit <n>]
+//! Usage: xscan <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1]
+//!
+//! `--compile 1` also compiles every translated shader with FXC (D3DCompile) and stores the
+//! bytecode in the runtime shader cache, so a full sweep both proves the HLSL compiles and
+//! pre-warms the cache the game reads.
 //!
 //! Finds `DXBC` containers by magic + validated header, de-duplicates by content hash,
 //! translates each, and prints per-stage totals plus a histogram of failure reasons
@@ -9,6 +13,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use tombox_xshader::{extract, hlsl, Stage};
 
 fn fnv1a(b: &[u8]) -> u64 {
@@ -180,19 +186,135 @@ fn find_archives(data: &[u8]) -> Vec<Archive> {
     out
 }
 
+// ---- optional FXC compile (Windows) -------------------------------------------------------------
+
+#[cfg(windows)]
+mod fxc {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+    extern "system" {
+        fn LoadLibraryA(n: *const u8) -> *mut c_void;
+        fn GetProcAddress(h: *mut c_void, n: *const u8) -> *mut c_void;
+    }
+    type D3DCompileFn = unsafe extern "system" fn(
+        *const c_void, usize, *const u8, *const c_void, *mut c_void, *const u8, *const u8, u32, u32,
+        *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    fn func() -> Option<D3DCompileFn> {
+        static F: OnceLock<usize> = OnceLock::new();
+        let p = *F.get_or_init(|| unsafe {
+            let h = LoadLibraryA(b"d3dcompiler_47.dll\0".as_ptr());
+            if h.is_null() { 0 } else { GetProcAddress(h, b"D3DCompile\0".as_ptr()) as usize }
+        });
+        if p == 0 { None } else { Some(unsafe { std::mem::transmute::<usize, D3DCompileFn>(p) }) }
+    }
+    unsafe fn take(blob: *mut c_void) -> Vec<u8> {
+        if blob.is_null() {
+            return Vec::new();
+        }
+        let vt = *(blob as *const *const usize);
+        let ptr: unsafe extern "system" fn(*mut c_void) -> *const u8 = std::mem::transmute(*vt.add(3));
+        let len: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(*vt.add(4));
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+        let v = std::slice::from_raw_parts(ptr(blob), len(blob)).to_vec();
+        rel(blob);
+        v
+    }
+    pub fn compile(hlsl: &str, profile: &str) -> Result<Vec<u8>, String> {
+        let f = func().ok_or("d3dcompiler_47.dll unavailable")?;
+        let target = format!("{profile}\0");
+        let (mut code, mut errs) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let hr = unsafe {
+            f(hlsl.as_ptr() as *const c_void, hlsl.len(), b"tombox\0".as_ptr(), std::ptr::null(), std::ptr::null_mut(),
+                b"main\0".as_ptr(), target.as_ptr(), 0, 0, &mut code, &mut errs)
+        };
+        let err = String::from_utf8_lossy(&unsafe { take(errs) }).into_owned();
+        let bytes = unsafe { take(code) };
+        if hr < 0 || bytes.is_empty() {
+            // First "error" line is the cause; warnings precede it.
+            let line = err.lines().find(|l| l.contains("error")).unwrap_or(err.lines().next().unwrap_or("")).to_string();
+            let msg = line.split("): ").nth(1).unwrap_or(&line).to_string();
+            return Err(format!("fxc: {msg}"));
+        }
+        Ok(bytes)
+    }
+}
+#[cfg(not(windows))]
+mod fxc {
+    pub fn compile(_hlsl: &str, _profile: &str) -> Result<Vec<u8>, String> {
+        Err("fxc: compile mode needs Windows".into())
+    }
+}
+
+/// Same key and directory as the runtime's compiled-shader cache (d3d12_xs/shader_xlat.rs),
+/// so a compile sweep pre-warms the cache the game uses.
+fn cache_path(hlsl: &str, profile: &str) -> std::path::PathBuf {
+    let key = fnv1a(hlsl.as_bytes()) ^ fnv1a(profile.as_bytes()).rotate_left(17);
+    std::env::temp_dir().join("tombox_shader_cache").join("by_hlsl").join(format!("{key:016x}.cso"))
+}
+
+fn stage_name(s: &Stage) -> &'static str {
+    match s {
+        Stage::Vertex => "VS",
+        Stage::Pixel => "PS",
+        Stage::Compute => "CS",
+        Stage::Geometry => "GS",
+        Stage::Hull => "HS",
+        Stage::Domain => "DS",
+        Stage::Mesh => "MS",
+        Stage::Amplification => "AS",
+        Stage::Unknown(_) => "??",
+    }
+}
+
+/// Translate (and optionally compile) one container. Returns (stage, result, compiled_now).
+fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
+    let r = std::panic::catch_unwind(|| match extract(blob) {
+        Err(e) => (String::from("?"), Err(format!("extract: {e}")), false),
+        Ok(ex) => {
+            let st = stage_name(&ex.stage).to_string();
+            match hlsl::translate(&ex) {
+                Err(e) => (st, Err(e), false),
+                Ok(t) if !compile => {
+                    let _ = t;
+                    (st, Ok(()), false)
+                }
+                Ok(t) => {
+                    let path = cache_path(&t.hlsl, t.profile);
+                    if path.exists() {
+                        return (st, Ok(()), false);
+                    }
+                    match fxc::compile(&t.hlsl, t.profile) {
+                        Ok(code) => {
+                            let _ = std::fs::write(&path, code);
+                            (st, Ok(()), true)
+                        }
+                        Err(e) => (st, Err(e), true),
+                    }
+                }
+            }
+        }
+    });
+    r.unwrap_or_else(|_| (String::from("?"), Err("PANIC in translator".to_string()), false))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>]", args[0]);
+        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1]", args[0]);
         return ExitCode::FAILURE;
     }
     let mut examples: Option<String> = None;
     let mut limit = usize::MAX;
+    let mut jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut compile = false;
     let mut i = 2;
     while i + 1 < args.len() {
         match args[i].as_str() {
             "--examples" => examples = Some(args[i + 1].clone()),
             "--limit" => limit = args[i + 1].parse().unwrap_or(usize::MAX),
+            "--jobs" => jobs = args[i + 1].parse().unwrap_or(jobs).max(1),
+            "--compile" => compile = args[i + 1] == "1",
             other => eprintln!("warning: ignoring {other}"),
         }
         i += 2;
@@ -207,10 +329,9 @@ fn main() -> ExitCode {
     if let Some(d) = &examples {
         let _ = std::fs::create_dir_all(d);
     }
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut found = 0usize;
-    let mut by_stage: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // stage -> (ok, fail)
-    let mut errors: BTreeMap<String, (usize, u64)> = BTreeMap::new(); // reason -> (count, example hash)
+    if compile {
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("tombox_shader_cache").join("by_hlsl"));
+    }
     // Gather candidate blobs: UE shader-archive entries (LZ4 blocks) if the file holds
     // an archive, otherwise raw DXBC containers found by magic.
     let mut blobs: Vec<Vec<u8>> = Vec::new();
@@ -231,72 +352,87 @@ fn main() -> ExitCode {
     } else {
         blobs.push(data.clone());
     }
+    // Unique containers.
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut found = 0usize;
+    let mut work: Vec<(u64, &[u8])> = Vec::new();
     for buf in &blobs {
-      let data = &buf[..];
-      let mut p = 0usize;
-      while p + 32 <= data.len() && seen.len() < limit {
-        if &data[p..p + 4] != b"DXBC" {
-            p += 1;
-            continue;
-        }
-        let total = u32::from_le_bytes(data[p + 24..p + 28].try_into().unwrap()) as usize;
-        let nchunks = u32::from_le_bytes(data[p + 28..p + 32].try_into().unwrap()) as usize;
-        if total < 64 || total > 0x40_0000 || p + total > data.len() || nchunks == 0 || nchunks > 32 {
-            p += 4;
-            continue;
-        }
-        let blob = &data[p..p + total];
-        found += 1;
-        p += total;
-        let h = fnv1a(blob);
-        if !seen.insert(h) {
-            continue;
-        }
-        let res = std::panic::catch_unwind(|| match extract(blob) {
-            Err(e) => (String::from("?"), Err(format!("extract: {e}"))),
-            Ok(ex) => {
-                let st = match ex.stage {
-                    Stage::Vertex => "VS",
-                    Stage::Pixel => "PS",
-                    Stage::Compute => "CS",
-                    Stage::Geometry => "GS",
-                    Stage::Hull => "HS",
-                    Stage::Domain => "DS",
-                    Stage::Mesh => "MS",
-                    Stage::Amplification => "AS",
-                    Stage::Unknown(_) => "??",
-                };
-                (st.to_string(), hlsl::translate(&ex).map(|_| ()))
+        let data = &buf[..];
+        let mut p = 0usize;
+        while p + 32 <= data.len() && seen.len() < limit {
+            if &data[p..p + 4] != b"DXBC" {
+                p += 1;
+                continue;
             }
-        })
-        .unwrap_or_else(|_| (String::from("?"), Err("PANIC in translator".to_string())));
-        let e = by_stage.entry(res.0).or_insert((0, 0));
-        match res.1 {
-            Ok(()) => e.0 += 1,
-            Err(msg) => {
-                e.1 += 1;
-                let key = normalise(&msg);
-                let ent = errors.entry(key).or_insert((0, h));
-                if ent.0 == 0 {
-                    if let Some(d) = &examples {
-                        let _ = std::fs::write(format!("{d}/{h:016x}.dxbc"), blob);
+            let total = u32::from_le_bytes(data[p + 24..p + 28].try_into().unwrap()) as usize;
+            let nchunks = u32::from_le_bytes(data[p + 28..p + 32].try_into().unwrap()) as usize;
+            if total < 64 || total > 0x40_0000 || p + total > data.len() || nchunks == 0 || nchunks > 32 {
+                p += 4;
+                continue;
+            }
+            let blob = &data[p..p + total];
+            found += 1;
+            p += total;
+            let h = fnv1a(blob);
+            if seen.insert(h) {
+                work.push((h, blob));
+            }
+        }
+    }
+    // Translate (and compile) in parallel.
+    type Tally = (BTreeMap<String, (usize, usize)>, BTreeMap<String, (usize, u64)>, usize);
+    let tally: Mutex<Tally> = Mutex::new((BTreeMap::new(), BTreeMap::new(), 0));
+    let next = AtomicUsize::new(0);
+    let started = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= work.len() {
+                    break;
+                }
+                let (h, blob) = work[i];
+                let (stage, res, compiled) = process(blob, compile);
+                let mut t = tally.lock().unwrap();
+                if compiled {
+                    t.2 += 1;
+                }
+                let e = t.0.entry(stage).or_insert((0, 0));
+                match res {
+                    Ok(()) => e.0 += 1,
+                    Err(msg) => {
+                        e.1 += 1;
+                        let key = normalise(&msg);
+                        let ent = t.1.entry(key).or_insert((0, h));
+                        if ent.0 < 3 {
+                            if let Some(d) = &examples {
+                                let _ = std::fs::write(format!("{d}/{h:016x}.dxbc"), blob);
+                            }
+                        }
+                        ent.0 += 1;
                     }
                 }
-                ent.0 += 1;
-            }
+                drop(t);
+                if (i + 1) % 5000 == 0 {
+                    eprintln!("  {}/{} ({:.0} s)", i + 1, work.len(), started.elapsed().as_secs_f64());
+                }
+            });
         }
-      }
-    }
+    });
+    let (by_stage, errors, compiled_now) = tally.into_inner().unwrap();
     let (ok, fail) = by_stage.values().fold((0, 0), |a, v| (a.0 + v.0, a.1 + v.1));
-    println!("containers found: {found}   unique: {}   translated: {ok}   failed: {fail}   ({:.1}% ok)",
-        seen.len(), 100.0 * ok as f64 / (ok + fail).max(1) as f64);
+    println!("containers found: {found}   unique: {}   {}: {ok}   failed: {fail}   ({:.2}% ok)",
+        seen.len(), if compile { "translated+compiled" } else { "translated" }, 100.0 * ok as f64 / (ok + fail).max(1) as f64);
+    if compile {
+        println!("  compiled in this run: {compiled_now} (the rest came from the cache)");
+    }
     for (st, (o, f)) in &by_stage {
         println!("  {st}: ok={o} fail={f}");
     }
     let mut v: Vec<_> = errors.into_iter().collect();
     v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     println!("--- failure reasons ({} distinct) ---", v.len());
-    for (reason, (count, ex)) in v.iter().take(60) {
+    for (reason, (count, ex)) in v.iter().take(80) {
         println!("{count:>7}  {reason}   [e.g. {ex:016x}]");
     }
     ExitCode::SUCCESS

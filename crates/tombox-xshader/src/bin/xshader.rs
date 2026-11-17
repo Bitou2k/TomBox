@@ -76,7 +76,7 @@ fn main() -> ExitCode {
     // Structured RDNA2 decode (length-accurate), self-validated by landing on s_endpgm.
     for (tag, sig) in [("in ", &ex.input_sig), ("out", &ex.output_sig)] {
         for e in sig.iter() {
-            println!("  sig {tag}: {}{} reg={} mask={:#06b} sysval={} type={}", e.name, e.index, e.register, e.mask, e.sysval, e.comp_type);
+            println!("  sig {tag}: {}{} reg={} mask={:#06b} sysval={} type={} rw={:#06b}", e.name, e.index, e.register, e.mask, e.sysval, e.comp_type, e.rw_mask);
         }
     }
     for r in &ex.resources {
