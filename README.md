@@ -1,79 +1,177 @@
-# TomBox — Xbox Series X|S Compatibility Runtime (research)
+# TomBox — Xbox Series X|S compatibility runtime (research)
 
-An investigation into loading and running user-provided, already-dumped/decrypted
-**Xbox Series X|S** game builds on conventional Windows x64 PC hardware.
+An attempt to run user-provided, already-dumped/decrypted **Xbox Series X|S** game builds
+natively on Windows x64. The first and only test target is
+**Fortnite Xbox Series X|S 2.0.1461.7919** (v14.50).
 
-> **Status: early reconnaissance + tooling.** No game runs yet. This repository
-> currently contains a working, tested PE/COFF analysis toolkit and the research
-> record. Nothing here claims Fortnite boots. Claims are labelled by evidence
-> level (see `docs/COMPATIBILITY.md`).
+> **Status (2026-11-17): boots to the lobby; not playable.**
+> The real game executable runs natively, logs in against a private backend, and reaches
+> the Battle Royale lobby. The 2D interface renders correctly. The 3D scene does **not**
+> render correctly yet, there is no audio, and input is only partly usable. See
+> [What works](#what-works) and [Known problems](#known-problems) — nothing beyond those
+> lists is claimed.
 
-First test target: **Fortnite Xbox Series X|S — version 2.0.1461.7919**.
+## How it works
 
-## Why this might be more tractable than classic emulation
+The Series X|S CPU is x86-64, so the game's code runs directly on the host CPU: there is
+no CPU emulation and no recompilation of game code. The work is at the platform boundary.
 
-The Xbox Series X|S CPU is **AMD Zen 2, x86-64** — the same instruction set as the
-host PC. Game code is native x64; there is **no CPU to emulate**. The real work is
-compatibility at three boundaries:
+- **Executable**: the game's PE is started as an ordinary Windows process. Its Xbox-only
+  DLL imports are satisfied by small compatibility DLLs placed next to it.
+- **Graphics (`d3d12_xs`)**: wraps a real PC Direct3D 12 device and presents the Xbox
+  D3D12.x interface the game expects — different vtable layouts, Xbox-only device,
+  command-list and queue methods (`CreatePlacedResourceX`, `PresentX`, frame-pacing
+  events, derived pipeline states, …), each reconstructed from the game's own call sites.
+- **Shaders (`tombox-xshader`)**: the build ships no DXIL. Its shaders are precompiled
+  AMD RDNA2 machine code inside the DXBC containers. The translator disassembles that
+  code and emits HLSL, which is compiled at run time with the Microsoft FXC compiler and
+  cached on disk.
+- **Textures**: on console a texture lives at a game-chosen address in unified memory, in
+  a tiled layout. The runtime mirrors that memory into PC textures every frame, using the
+  texture-layout library (`xg_xs.dll`) from the dump itself to compute the layout.
+- **Platform services**: the game runs against Microsoft's PC `xgameruntime.dll`
+  (Gaming Services). Where that cannot serve an unregistered title, local replacements
+  are hooked in: a single offline Xbox user and an empty Microsoft Store that owns nothing.
+- **Network policy (`compat-common::net_guard`)**: by default every DNS lookup, socket
+  connect and WinHTTP connection made by the game fails locally. Optionally all traffic
+  is redirected to one host of your choosing (your own backend). It never talks to Epic.
 
-1. **OS / platform APIs** — the game imports Xbox GameOS + GDK runtime DLLs
-   (e.g. `xgameruntime`) that do not exist on desktop Windows.
-2. **Graphics** — the game targets **Direct3D 12.x** (the Xbox console variant of
-   D3D12), not PC D3D12, and its shaders are not necessarily plain DXBC/DXIL.
-3. **Packaging / filesystem** — content layout and path assumptions differ.
+Details and evidence are in `docs/` (see [Documentation](#documentation)).
 
-This is the same class of problem the PS5 project *AnyPS5* solves (PS5 is also x64);
-we study its architecture for transferable engineering, not PlayStation internals.
+## What works
 
-## Current verified capabilities
+Verified on one machine (Windows 11, x64) with the Fortnite build above:
 
-- `tombox-pe`: a zero-dependency, bounds-checked PE32+ parser. Parses COFF/optional
-  headers, sections, data directories, imports, delay-imports, exports, base
-  relocations, and TLS. **Never panics on malformed input** (fuzz/truncation tested).
-- `pe-inspect`: a CLI that emits a human report or JSON, and heuristically flags
-  likely Xbox/GDK modules in a binary's dependency list.
-- Verified against real Windows PE32+ binaries (kernel32.dll: 1671 exports incl.
-  `CreateFileW`; our own build: 10 import modules / 91 functions).
+| Area | State |
+|---|---|
+| Process start, engine init, asset loading from the dump | works |
+| Title screen, login screen, text, 2D UI | renders correctly |
+| Login against a private backend (network redirect + local Xbox user) | works |
+| Game-mode select, settings menus | render correctly |
+| Battle Royale lobby | loads; UI correct, **3D scene wrong** |
+| Shader translation (translate only, whole game archive) | 104,298 of 105,506 unique shaders (98.9%) |
+| Shader translation + FXC compile | checked only for the 46 fixtures in `analysis/shaders/` and the shaders hit while running |
+| Mouse | works (see limitations) |
+| Audio | none |
+| Gameplay / matches | not attempted |
+
+## Known problems
+
+- **3D rendering is incorrect.** In the lobby the depth buffer stays empty, so lighting
+  blows out (white character, no backdrop). Cause not yet identified.
+- **An untranslatable shader is fatal.** If the game requests one of the ~1,200 shaders the
+  translator cannot handle yet, pipeline creation fails and the engine exits.
+- **First-time shader compiles are slow** (up to ~40 s for the largest compute shaders) and
+  can trip the engine's stall watchdog the first time a screen is opened. Compiled shaders
+  are cached, so a given shader stalls at most once.
+- **Approximations in translated shaders**: texture lookups inside shader loops always use
+  the sharpest mip; typed buffers are assumed to hold floats unless used atomically.
+- **Texture mirroring is polling-based**: changes are detected by hashing game memory each
+  frame; mips the game has not streamed in yet are left undefined.
+- **Window**: the image is stretched to the window, so resizing it to a non-16:9 shape
+  distorts the picture. The game still thinks it is driving a 3840×2160 display.
+- **No audio, no controller mapping work, no save data.**
+- **Several pieces are specific to this exact Fortnite build**: the local Xbox user and
+  store hooks locate game functions through that build's symbol table and refuse to
+  install on any other executable.
+- Other user-related platform calls (cloud saves, system dialogs) still go to Microsoft's
+  runtime and fail.
+
+The full list of unverified assumptions is in `docs/TECHNICAL_DEBT.md`.
+
+## Requirements
+
+- Windows 10/11 x64 with a Direct3D 12 GPU.
+- Microsoft Gaming Services installed (provides `xgameruntime.dll`).
+- Rust toolchain (`x86_64-pc-windows-msvc`); Windows SDK (`d3dcompiler_47.dll`, and
+  `fxc.exe` for the shader fixture script).
+- Your own legally obtained, already-decrypted dump of the game. **No game files are
+  provided here**, and the scripts assume the layout below.
 
 ## Build
 
-Requires a Rust toolchain (tested: `rustc 1.99.1`, `x86_64-pc-windows-msvc`).
-
 ```
 cargo build --release
-cargo test
-./target/release/pe-inspect <path-to-pe> [--json] [--imports] [--max N]
+cargo test --release
 ```
 
-## Supported host platforms
-
-- Windows x64 (primary, developed here).
-- Core parser is portable Rust; host-specific runtime code (later) will sit behind
-  explicit interfaces so Linux can be evaluated.
-
-## Current limitations
-
-- No loader, no runtime, no graphics layer yet.
-- The supplied 25.5 GB build is still downloading at the time of writing; analysis
-  of the *actual* executable has not yet begun.
-- Deep Xbox-internal specifics (D3D12.x differences, shader microcode, GameOS
-  syscalls) are NDA-gated and will be established from binary evidence, not guessed.
-
-## Layout
+The compatibility DLLs must be built with a static CRT:
 
 ```
-input/original/    # the original downloaded archive, preserved unchanged
-input/extracted/   # extracted build (kept out of any future VCS)
-analysis/          # generated inspection output (JSON, reports)
-crates/            # Rust workspace (tombox-pe, tombox-cli)
-docs/              # ARCHITECTURE, XBOX_RESEARCH, FORTNITE_ANALYSIS, COMPATIBILITY,
-                   # TECHNICAL_DEBT, DEVELOPMENT_LOG, DECISIONS
-refs/              # third-party reference source (AnyPS5) — study only
+set RUSTFLAGS=-C target-feature=+crt-static
+cargo build --release -p d3d12_xs -p xmem -p xcrdapi -p acphal -p dxcompiler_xs -p mfplat
 ```
 
-## Legal / scope
+## Running the game
 
-Authorized interoperability research. Works only with binaries the user is
-authorized to analyze. No console-security circumvention, no connection to Fortnite
-production services, no anti-cheat/entitlement bypass. Game data is kept out of
-source control and is not redistributed.
+There is no installer or launcher yet; this is the manual procedure the development
+scripts automate (`tools/dev/iter.sh`, which contains machine-specific paths).
+
+1. Extract the dump to `input/extracted/` (game files end up under `input/extracted/Mount/`).
+2. Map that folder to drive `G:` — the game expects its filesystem root there:
+   `subst G: <repo>\input\extracted\Mount`
+3. Copy the built `acphal.dll`, `d3d12_xs.dll`, `dxcompiler_xs.dll`, `mfplat.dll`,
+   `xcrdapi.dll` and `xmem.dll` from `target/release/` into
+   `G:\FortniteGame\Binaries\XSX\`.
+4. Copy the **real** `xg_xs.dll` from the dump (`EmbeddedXvd/Windows/System32/`) into the
+   same folder. Do not use the stub crate of the same name; texture layouts depend on the
+   real library.
+5. Optional: create `G:\FortniteGame\Binaries\XSX\tombox.cfg`:
+
+   ```
+   net_redirect=<your backend host>   # omit to block all network access
+   gamertag=<name>                    # local offline user (default TomBoxPlayer)
+   xuid=<decimal id>
+   xbl_token=<token string your backend expects>
+   ```
+6. Run `G:\FortniteGame\Binaries\XSX\FortniteClient-XSX-Shipping.exe`.
+
+Logs: compatibility-layer calls go to `%TEMP%\tombox_compat.log` (or `%TOMBOX_LOG%`).
+The game itself only logs through the debugger channel; `tools/dev/mdbg.rs` is a small
+tracer that captures it.
+
+Useful environment variables: `TOMBOX_NET_REDIRECT` (same as `net_redirect`),
+`TOMBOX_D3D12_DEBUG=1` (Direct3D validation layer), `TOMBOX_RTCAP=1` (diagnostic
+render-target capture, triggered by creating `%TEMP%\tombox_capture_now`),
+`TOMBOX_OWN_WINDOW=1` (present into a separate window instead of the game's).
+
+## Repository layout
+
+```
+crates/tombox-pe         PE32+ parser (bounds-checked, fuzz/truncation tested)
+crates/tombox-cli        pe-inspect and other analysis CLIs
+crates/tombox-archive    safe archive inspection/extraction
+crates/tombox-disasm     x86-64 disassembler front end with symbol resolution
+crates/tombox-loader     early loader experiments (not used to run the game)
+crates/tombox-xshader    RDNA2 shader extraction, disassembly and HLSL translation
+crates/compat/*          the compatibility DLLs (d3d12_xs, xmem, xcrdapi, acphal, …)
+                         and compat-common (logging, network policy, local user/store)
+tools/dev/               development scripts and the tracer (not part of the runtime)
+analysis/                shader test fixtures, evidence screenshots, inspection output
+docs/                    research and engineering record
+input/                   your dump (git-ignored, never committed)
+```
+
+## Documentation
+
+- `docs/ARCHITECTURE.md` — execution model and subsystem boundaries
+- `docs/XBOX_RESEARCH.md` — platform findings and references
+- `docs/FORTNITE_ANALYSIS.md` — the target build: inventory, modules, dependencies
+- `docs/COMPATIBILITY.md` — API matrix and feature status
+- `docs/TECHNICAL_DEBT.md` — unverified assumptions, known bugs, risks
+- `docs/DEVELOPMENT_LOG.md` — chronological log with commands, results and evidence
+- `docs/DECISIONS.md` — architecture decision records
+
+`ARCHITECTURE.md`, `XBOX_RESEARCH.md` and `COMPATIBILITY.md` lag behind the code; the
+development log and technical-debt file are current.
+
+## Scope and legal
+
+Interoperability research on binaries the user is authorised to analyse.
+
+- No console-security circumvention, key extraction or package decryption.
+- No connection to Epic or Fortnite production services: network access is blocked unless
+  explicitly redirected to a server you operate.
+- The local Xbox user is an offline placeholder, not an Xbox Live account, and the local
+  store grants no entitlements. No anti-cheat code is touched.
+- Game executables and assets are not distributed with this project.
