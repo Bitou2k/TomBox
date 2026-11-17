@@ -325,6 +325,31 @@ fn trim_to_endpgm(sect: &[u8]) -> Vec<u8> {
     // A program may contain early `s_endpgm`s (e.g. a pixel-kill path) with more code
     // after them, so the program ends at the LAST `s_endpgm` before the `s_code_end`
     // padding, not the first one.
+    //
+    // Preferred rule: decode instruction by instruction, tracking the furthest forward
+    // branch target; the program ends at the first `s_endpgm` at or beyond it (data that
+    // merely looks like `s_endpgm` can follow the real end). Fallback: last raw match.
+    let code_end = {
+        let mut p = 0;
+        while p + 4 <= sect.len() {
+            if u32::from_le_bytes([sect[p], sect[p + 1], sect[p + 2], sect[p + 3]]) == S_CODE_END {
+                break;
+            }
+            p += 4;
+        }
+        p
+    };
+    let mut max_target = 0i64;
+    for ins in rdna2::disassemble(&sect[..code_end]) {
+        if ins.enc != rdna2::Enc::Sopp {
+            continue;
+        }
+        if matches!(ins.op, 2 | 4..=9) {
+            max_target = max_target.max(ins.offset as i64 + 4 + ins.aux.imm * 4);
+        } else if ins.op == 1 && ins.offset as i64 >= max_target {
+            return sect[..ins.offset + 4].to_vec();
+        }
+    }
     let mut last_end = None;
     let mut p = 0;
     while p + 4 <= sect.len() {
