@@ -19,3 +19,7 @@ path = "src/bin/xscan.rs"
 
 [dependencies]
 miniz_oxide = "0.8"
+
+[[bin]]
+name = "xpso"
+path = "src/bin/xpso.rs"

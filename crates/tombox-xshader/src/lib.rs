@@ -14,6 +14,8 @@
 //! RDNA2 markers before use, so a wrong guess fails loudly rather than yielding garbage.
 
 pub mod hlsl;
+#[cfg(windows)]
+pub mod dxc;
 pub mod meta;
 pub mod rdna2;
 

@@ -68,7 +68,9 @@ const XYZW: [&str; 4] = ["x", "y", "z", "w"];
 /// face-local S/T, face index 0..5 = +X,-X,+Y,-Y,+Z,-Z). Hardware cube sampling takes
 /// (s, t, face) with s,t = sc/|ma| + 1.5 (so each is in [1, 2]); `tb_cube_dir` inverts that
 /// to the direction vector HLSL TextureCube sampling expects.
-const CUBE_HELPERS: &str = r#"bool tb_cmp_class(uint b, uint mask) { uint e = (b >> 23) & 0xffu; uint m = b & 0x7fffffu; bool neg = (b >> 31) != 0u; uint c; if (e == 0xffu) { c = (m != 0u) ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (neg ? 2u : 9u); } else if (e == 0u) { c = (m == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u); } else { c = neg ? 3u : 8u; } return ((mask >> c) & 1u) != 0u; }uint tb_bfe_i32(uint a, uint b) { uint o = b & 31u, w = (b >> 16) & 127u; if (w == 0u) return 0u; if (w + o >= 32u) return asuint(asint(a) >> o); return asuint(asint(a << (32u - w - o)) >> (32u - w)); }uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
+const CUBE_HELPERS: &str = r#"uint tb_perm_byte(uint hi, uint lo, uint sel) { if (sel >= 13u) return 0xffu; if (sel == 12u) return 0u; if (sel == 11u) return (hi >> 31) * 0xffu; if (sel == 10u) return ((hi >> 15) & 1u) * 0xffu; if (sel == 9u) return (lo >> 31) * 0xffu; if (sel == 8u) return ((lo >> 15) & 1u) * 0xffu; return sel >= 4u ? ((hi >> ((sel - 4u) * 8u)) & 0xffu) : ((lo >> (sel * 8u)) & 0xffu); }
+uint tb_perm(uint hi, uint lo, uint sel) { return tb_perm_byte(hi, lo, sel & 0xffu) | (tb_perm_byte(hi, lo, (sel >> 8) & 0xffu) << 8) | (tb_perm_byte(hi, lo, (sel >> 16) & 0xffu) << 16) | (tb_perm_byte(hi, lo, sel >> 24) << 24); }
+bool tb_cmp_class(uint b, uint mask) { uint e = (b >> 23) & 0xffu; uint m = b & 0x7fffffu; bool neg = (b >> 31) != 0u; uint c; if (e == 0xffu) { c = (m != 0u) ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (neg ? 2u : 9u); } else if (e == 0u) { c = (m == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u); } else { c = neg ? 3u : 8u; } return ((mask >> c) & 1u) != 0u; }uint tb_bfe_i32(uint a, uint b) { uint o = b & 31u, w = (b >> 16) & 127u; if (w == 0u) return 0u; if (w + o >= 32u) return asuint(asint(a) >> o); return asuint(asint(a << (32u - w - o)) >> (32u - w)); }uint tb_mulhi_u32(uint a, uint b) { uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16; uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1; uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu); return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }
 uint tb_mulhi_i32(uint a, uint b) { uint h = tb_mulhi_u32(a, b); if (asint(a) < 0) h -= b; if (asint(b) < 0) h -= a; return h; }
 float tb_cubema(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return 2.0 * z; if (ay >= ax) return 2.0 * y; return 2.0 * x; }
 float tb_cubesc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? -x : x; if (ay >= ax) return x; return x < 0.0 ? z : -z; }
@@ -204,6 +206,8 @@ struct Emitter<'a> {
     uses_lds: bool,
     /// Shader reads constant tables embedded in its code section.
     uses_code: bool,
+    /// The program uses register-relative moves: VGPRs live in the `tb_v` array.
+    vreg_array: bool,
     /// Interned candidate lists `(table, offset)` for `Sym::Multi`.
     multi_sets: Vec<Vec<(u8, u32)>>,
     /// Image ops whose texture and/or sampler is one of several descriptors.
@@ -336,6 +340,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         is_gs: ex.stage == Stage::Geometry,
         uses_lds: false,
         uses_code: false,
+        vreg_array: false,
         multi_sets: Vec::new(),
         msel: HashMap::new(),
         dsel_loads: HashMap::new(),
@@ -354,6 +359,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         })),
         out_params: distinct_regs(ex.output_sig.iter().filter(|e| e.sysval == 0)),
     };
+    em.vreg_array = em.insns.iter().any(|i| i.mnemonic.starts_with("v_movrel"));
     // Lane-spill slots beyond the tracked range are function-scope temporaries.
     for ins in &em.insns {
         for o in ins.dst.iter().chain(ins.src.iter()) {
@@ -384,7 +390,17 @@ impl<'a> Emitter<'a> {
     /// 4 for compute (observed: PS s8/s9/s10 = params 0/1/2, VS s12 = param 4, CS s5/s7 =
     /// params 1/3). `None` when the root signature is unavailable or the SGPR is not a table.
     fn table_kind(&self, sgpr: u8) -> Option<u32> {
-        let base = if self.is_cs { 4 } else { 8 };
+        // Root descriptor-table pointers arrive in consecutive user SGPRs: from s4 in compute
+        // shaders and s8 in the other stages. Vertex shaders compiled to feed a geometry
+        // shader ("MainForGS") start with `s_swappc_b64 s12, s12` and receive them from s19
+        // 7 registers after the swapped PC register pair instead (observed: `s_swappc_b64
+        // s12, s12` -> SRV table s19, CBV s20 in a55400ccab602283; `s_swappc_b64 s4, s4` ->
+        // SRV s11, CBV s12 in 4d318a496eebf6d3).
+        let chained = self.insns.iter().take(16).find(|i| i.mnemonic == "s_swappc_b64").and_then(|i| match i.dst.first() {
+            Some(Opnd::Sgpr(n)) => Some(*n as usize + 7),
+            _ => None,
+        });
+        let base = if self.is_cs { 4 } else { chained.unwrap_or(8) };
         let idx = (sgpr as usize).checked_sub(base)?;
         match &self.ex.root_sig.as_ref()?.params.get(idx)?.kind {
             crate::meta::RootParamKind::Table(r) if r.len() == 1 && r[0].base_register == 0 => Some(r[0].range_type),
@@ -1206,6 +1222,15 @@ impl<'a> Emitter<'a> {
         let (cc, ty) = (parts[2], parts[3]);
         let (x, y) = match ty {
             "f32" => (f(a)?, f(b)?),
+            "f16" => {
+                let h = |o: &Opnd| -> Result<String, String> {
+                    Ok(match o {
+                        Opnd::ConstF32(_) => f(o)?,
+                        _ => format!("f16tof32(({}) & 0xffffu)", r(o)?),
+                    })
+                };
+                (h(a)?, h(b)?)
+            }
             "i32" => (format!("asint({})", r(a)?), format!("asint({})", r(b)?)),
             "u32" => (r(a)?, r(b)?),
             other => return Err(format!("compare type {other} unsupported")),
@@ -1416,6 +1441,17 @@ impl<'a> Emitter<'a> {
                 let a = r(&s[0])?;
                 match m {
                     "s_mov_b32" | "s_wqm_b32" => self.ws(&d, &a),
+                    // D[S0[4:0]] = 0 / 1
+                    "s_bitset0_b32" => {
+                        self.touch(&d);
+                        let cur = r(&d)?;
+                        self.ws(&d, &format!("({cur} & ~(1u << (({a}) & 31u)))"))
+                    }
+                    "s_bitset1_b32" => {
+                        self.touch(&d);
+                        let cur = r(&d)?;
+                        self.ws(&d, &format!("({cur} | (1u << (({a}) & 31u)))"))
+                    }
                     "s_mov_b64" | "s_wqm_b64" => {
                         let ah = r(&hi(&s[0]))?;
                         let t = self.tmp;
@@ -1637,6 +1673,57 @@ impl<'a> Emitter<'a> {
                 }
                 Ok(())
             }
+            Enc::Ds
+                if !self.is_gs
+                    && !self.is_cs
+                    && self.ex.stage == Stage::Vertex
+                    && matches!(m, "ds_write_b32" | "ds_write2_b32" | "ds_write_b64" | "ds_write2_b64") =>
+            {
+                // A vertex shader chained in front of a geometry shader hands its outputs over
+                // through LDS instead of parameter exports: the vertex record is the output
+                // registers back to back, 4 dwords each (observed in a55400ccab602283: dwords
+                // 0..3 = TEXCOORD6.xyzw, 4..6 = TEXCOORD8.xyz, matching the output signature).
+                // The address register is this vertex's record base and is not needed.
+                let off = ins.aux.imm as u32;
+                let vg = |o: &Opnd, k: u8| match o {
+                    Opnd::Vgpr(n) => Ok(Opnd::Vgpr(n + k)),
+                    _ => Err("LDS output write with a non-VGPR source".to_string()),
+                };
+                // (byte offset, source register) per written dword.
+                let writes: Vec<(u32, Opnd)> = match m {
+                    "ds_write_b32" => vec![(off & 0xffff, s[1])],
+                    "ds_write2_b32" => vec![((off & 0xff) * 4, s[1]), (((off >> 8) & 0xff) * 4, s[2])],
+                    "ds_write_b64" => vec![(off & 0xffff, s[1]), ((off & 0xffff) + 4, vg(&s[1], 1)?)],
+                    _ => vec![
+                        ((off & 0xff) * 8, s[1]),
+                        ((off & 0xff) * 8 + 4, vg(&s[1], 1)?),
+                        (((off >> 8) & 0xff) * 8, s[2]),
+                        (((off >> 8) & 0xff) * 8 + 4, vg(&s[2], 1)?),
+                    ],
+                };
+                let osig = self.ex.output_sig.clone();
+                for (byte, src) in writes {
+                    let dw = (byte / 4) as usize;
+                    let reg = *self.out_params.get(dw / 4).ok_or_else(|| format!("LDS output dword {dw} is beyond the output signature"))?;
+                    let comp = dw % 4;
+                    self.touch(&src);
+                    let mut hit = false;
+                    for (ei, e) in osig.iter().enumerate() {
+                        if e.sysval == 0 && e.register == reg && (e.mask >> comp) & 1 != 0 {
+                            let idx = (0..comp).filter(|c| (e.mask >> c) & 1 != 0).count();
+                            let (ty, n) = sig_type(e);
+                            let field = if n == 1 { format!("o.o{ei}") } else { format!("o.o{ei}.{}", XYZW[idx]) };
+                            let val = if ty.starts_with("float") { f(&src)? } else if ty.starts_with("int") { format!("asint({})", r(&src)?) } else { r(&src)? };
+                            self.line(&format!("if (exec_lo & 1u) {field} = {val};"));
+                            hit = true;
+                        }
+                    }
+                    if !hit {
+                        self.line(&format!("// (LDS output dword {dw} has no output-signature component: ignored)"));
+                    }
+                }
+                Ok(())
+            }
             Enc::Ds if self.is_gs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
                 self.emit_gs_lds(ins)
             }
@@ -1776,7 +1863,137 @@ impl<'a> Emitter<'a> {
         if m == "v_nop" {
             return Ok(());
         }
-        if m == "v_fma_mix_f32" {
+        // ---- half-float arithmetic: operands are f16 in the low 16 bits (inline float
+        // constants denote the half-float of that value); the result is written as f16.
+        let h16 = |o: &Opnd| -> Result<String, String> {
+            Ok(match o {
+                Opnd::ConstF32(_) => f(o)?,
+                _ => format!("f16tof32(({}) & 0xffffu)", r(o)?),
+            })
+        };
+        if matches!(m.as_str(), "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_max_f16" | "v_min_f16") {
+            let (a, b) = (h16(&s[0])?, h16(&s[1])?);
+            let e = match m.as_str() {
+                "v_add_f16" => format!("{a} + {b}"),
+                "v_sub_f16" => format!("{a} - {b}"),
+                "v_subrev_f16" => format!("{b} - {a}"),
+                "v_mul_f16" => format!("{a} * {b}"),
+                "v_max_f16" => format!("max({a}, {b})"),
+                _ => format!("min({a}, {b})"),
+            };
+            return self.wv(&d, &format!("f32tof16({e})"));
+        }
+        if matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
+            let a = h16(&s[0])?;
+            let e = match m.as_str() {
+                "v_rcp_f16" => format!("1.0 / {a}"),
+                "v_sqrt_f16" => format!("sqrt({a})"),
+                "v_rsq_f16" => format!("rsqrt({a})"),
+                "v_floor_f16" => format!("floor({a})"),
+                "v_ceil_f16" => format!("ceil({a})"),
+                "v_trunc_f16" => format!("trunc({a})"),
+                "v_rndne_f16" => format!("round({a})"),
+                _ => format!("frac({a})"),
+            };
+            return self.wv(&d, &format!("f32tof16({e})"));
+        }
+        if m == "v_cvt_f16_u16" {
+            return self.wv(&d, &format!("f32tof16((float)(({}) & 0xffffu))", r(&s[0])?));
+        }
+        if m == "v_cvt_f16_i16" {
+            return self.wv(&d, &format!("f32tof16((float)(asint(({}) << 16) >> 16))", r(&s[0])?));
+        }
+        if m == "v_cvt_u16_f16" {
+            return self.wv(&d, &format!("((uint)clamp({}, 0.0, 65535.0))", h16(&s[0])?));
+        }
+        if m == "v_cvt_i16_f16" {
+            return self.wv(&d, &format!("(asuint((int)clamp({}, -32768.0, 32767.0)) & 0xffffu)", h16(&s[0])?));
+        }
+        if m == "v_mac_f16" {
+            self.touch(&d);
+            let e = format!("{} * {} + {}", h16(&s[0])?, h16(&s[1])?, h16(&d)?);
+            return self.wv(&d, &format!("f32tof16({e})"));
+        }
+        if m == "v_fma_f16" {
+            let e = format!("{} * {} + {}", h16(&s[0])?, h16(&s[1])?, h16(&s[2])?);
+            return self.wv(&d, &format!("f32tof16({e})"));
+        }
+        if matches!(m.as_str(), "v_pk_fma_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_min_f16" | "v_pk_max_f16") {
+            // Packed half-float ops (VOP3P): two f16 lanes per register. For the low result,
+            // OPSEL bit i (dword0[13:11]) picks the low/high half of source i and NEG bit i
+            // (dword1[31:29]) negates it; for the high result OPSEL_HI (dword1[28:27],
+            // dword0[14]) and NEG_HI (dword0[10:8]) do the same.
+            let (w0, w1) = (ins.raw[0], ins.raw.get(1).copied().unwrap_or(0));
+            let nsrc = if m == "v_pk_fma_f16" { 3 } else { 2 };
+            let sel = [(w0 >> 11) & 7, ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2)];
+            let neg = [(w1 >> 29) & 7, (w0 >> 8) & 7];
+            let mut halves = Vec::new();
+            for h in 0..2 {
+                let mut v = Vec::new();
+                for i in 0..nsrc {
+                    let x = match &s[i] {
+                        o @ Opnd::ConstF32(_) => format!("f32tof16({})", f(o)?),
+                        o => r(o)?,
+                    };
+                    let mut e = if (sel[h] >> i) & 1 != 0 { format!("f16tof32(({x}) >> 16)") } else { format!("f16tof32(({x}) & 0xffffu)") };
+                    if (neg[h] >> i) & 1 != 0 {
+                        e = format!("(-{e})");
+                    }
+                    v.push(e);
+                }
+                halves.push(match m.as_str() {
+                    "v_pk_fma_f16" => format!("{} * {} + {}", v[0], v[1], v[2]),
+                    "v_pk_add_f16" => format!("{} + {}", v[0], v[1]),
+                    "v_pk_mul_f16" => format!("{} * {}", v[0], v[1]),
+                    "v_pk_min_f16" => format!("min({}, {})", v[0], v[1]),
+                    _ => format!("max({}, {})", v[0], v[1]),
+                });
+            }
+            return self.wv(&d, &format!("(f32tof16({}) | (f32tof16({}) << 16))", halves[0], halves[1]));
+        }
+        if matches!(m.as_str(), "v_min3_f16" | "v_max3_f16" | "v_med3_f16") {
+            let (a, b, c) = (h16(&s[0])?, h16(&s[1])?, h16(&s[2])?);
+            let e = match m.as_str() {
+                "v_min3_f16" => format!("min(min({a}, {b}), {c})"),
+                "v_max3_f16" => format!("max(max({a}, {b}), {c})"),
+                _ => format!("max(min({a}, {b}), min(max({a}, {b}), {c}))"),
+            };
+            return self.wv(&d, &format!("f32tof16({e})"));
+        }
+        if m == "v_bcnt_u32_b32" {
+            return self.wv(&d, &format!("(countbits({}) + {})", r(&s[0])?, r(&s[1])?));
+        }
+        if m == "v_bfm_b32" {
+            return self.wv(&d, &format!("(((1u << (({}) & 31u)) - 1u) << (({}) & 31u))", r(&s[0])?, r(&s[1])?));
+        }
+        if m == "v_perm_b32" {
+            return self.wv(&d, &format!("tb_perm({}, {}, {})", r(&s[0])?, r(&s[1])?, r(&s[2])?));
+        }
+        if m == "v_bfe_i32" {
+            // Sign-extended bit field: offset = S1[4:0], width = S2[4:0].
+            let (a, o, w) = (r(&s[0])?, r(&s[1])?, r(&s[2])?);
+            return self.wv(&d, &format!(
+                "((({w}) & 31u) == 0u ? 0u : asuint(asint(({a}) << ((32u - (({w}) & 31u) - (({o}) & 31u)) & 31u)) >> ((32u - (({w}) & 31u)) & 31u)))"));
+        }
+        if matches!(m.as_str(), "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32") {
+            // Register-relative moves: the source and/or destination VGPR number is offset by
+            // M0 at run time (local arrays kept in registers). Lowered to a chain over every
+            // VGPR the program uses.
+            let (Opnd::Vgpr(dn), Opnd::Vgpr(sn)) = (d, s[0]) else {
+                return Err("register-relative move with a non-VGPR operand".into());
+            };
+            if !self.vreg_array {
+                return Err("register-relative move outside VGPR-array mode".into());
+            }
+            let t = self.tmp;
+            self.tmp += 1;
+            let src = if m == "v_movreld_b32" { format!("tb_v[{sn}]") } else { format!("tb_v[({sn}u + m0) & 255u]") };
+            self.line(&format!("uint t{t} = {src};"));
+            let dst = if m == "v_movrels_b32" { format!("tb_v[{dn}]") } else { format!("tb_v[({dn}u + m0) & 255u]") };
+            self.line(&format!("if (exec_lo & 1u) {dst} = t{t};"));
+            return Ok(());
+        }
+        if matches!(m.as_str(), "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16") {
             // VOP3P: D = S0 * S1 + S2 where each source is either a full float or a half
             // float taken from the low/high 16 bits of its register and widened:
             //   OPSEL_HI bit i (dword1[28:27], dword0[14] for i = 2) = 0 -> 32-bit float,
@@ -1803,7 +2020,19 @@ impl<'a> Emitter<'a> {
                 }
                 v.push(e);
             }
-            return self.wv(&d, &format!("asuint({} * {} + {})", v[0], v[1], v[2]));
+            let e = format!("{} * {} + {}", v[0], v[1], v[2]);
+            return match m.as_str() {
+                "v_fma_mix_f32" => self.wv(&d, &format!("asuint({e})")),
+                // The f16 result replaces one half of the destination; the other half is kept.
+                "v_fma_mixlo_f16" => {
+                    self.touch(&d);
+                    self.wv(&d, &format!("(({}) & 0xffff0000u) | f32tof16({e})", r(&d)?))
+                }
+                _ => {
+                    self.touch(&d);
+                    self.wv(&d, &format!("(({}) & 0xffffu) | (f32tof16({e}) << 16)", r(&d)?))
+                }
+            };
         }
         // Compares (VOPC, and VOP3 with a scalar mask destination).
         if m.starts_with("v_cmp_") {
@@ -1865,8 +2094,9 @@ impl<'a> Emitter<'a> {
             // SDWA: operate on a selected byte/word of each source. Materialise the selected
             // values into temporaries, then translate the instruction as usual.
             let is_cmp = ins.enc == Enc::Vopc;
-            if !is_cmp && (sd >> 8) & 7 != 6 {
-                return Err("SDWA with a partial destination select is unsupported".into());
+            let dst_sel = if is_cmp { 6 } else { (sd >> 8) & 7 };
+            if dst_sel == 7 {
+                return Err("SDWA destination select 7 is reserved".into());
             }
             if sd & 0x3030_0000 != 0 {
                 return Err("SDWA float neg/abs modifiers are unsupported".into());
@@ -1898,7 +2128,30 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("uint tb_s{t} = {e};"));
                 c.src[i] = Opnd::Temp(t as u16);
             }
-            return self.emit_vec(&c);
+            if dst_sel == 6 {
+                return self.emit_vec(&c);
+            }
+            // Partial destination: compute into a temporary, then place the selected
+            // byte/word into the register. DST_UNUSED (bits 12:11): 0 = pad with zeros,
+            // 1 = sign-extend upwards, 2 = keep the other bits of the destination.
+            let (bits, lsb) = if dst_sel <= 3 { (8u32, dst_sel * 8) } else { (16, (dst_sel - 4) * 16) };
+            let mask = (1u32 << bits) - 1;
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint tb_s{t} = 0u;"));
+            c.dst = vec![Opnd::Temp(t as u16)];
+            self.emit_vec(&c)?;
+            let val = format!("(tb_s{t} & {mask:#x}u)");
+            let e = match (sd >> 11) & 3 {
+                0 => format!("({val} << {lsb})"),
+                1 => format!("asuint(asint({val} << {}) >> {})", 32 - bits, 32 - bits - lsb),
+                2 => {
+                    self.touch(&d);
+                    format!("((({}) & {:#x}u) | ({val} << {lsb}))", r(&d)?, !(mask << lsb))
+                }
+                _ => return Err("SDWA DST_UNUSED 3 is reserved".into()),
+            };
+            return self.wv(&d, &e);
         }
         if matches!(m.as_str(), "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64") {
             // 64-bit vector shifts: value and result are register pairs (lo, hi).
@@ -2804,6 +3057,26 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Declarations of every register variable the body uses. Shaders with
+    /// register-relative moves keep their VGPRs in one array (`tb_v`), with each `vN` name
+    /// defined as an element of it, so `VGPR[n + M0]` is a plain dynamic index.
+    fn reg_decls(&self) -> String {
+        let is_v = |r: &str| r.len() > 1 && r.starts_with('v') && r[1..].bytes().all(|b| b.is_ascii_digit());
+        let mut out = String::new();
+        let scalars: Vec<String> =
+            self.regs.iter().filter(|r| !(self.vreg_array && is_v(r))).map(|r| format!("{r} = 0u")).collect();
+        if !scalars.is_empty() {
+            out.push_str(&format!("    uint {};", scalars.join(", ")));
+        }
+        if self.vreg_array {
+            out.push_str("\n    uint tb_v[256] = (uint[256])0;");
+            for n in 0..256 {
+                out.push_str(&format!("\n#define v{n} tb_v[{n}]"));
+            }
+        }
+        out
+    }
+
     fn finish(&mut self, is_ps: bool) -> Result<String, String> {
         let ex = self.ex;
         let mut h = String::new();
@@ -2891,8 +3164,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             for k in 0..3 {
                 self.regs.insert(format!("s{}", g + k));
             }
-            let decl: Vec<String> = self.regs.iter().map(|r| format!("{r} = 0u")).collect();
-            let _ = writeln!(h, "    uint {};", decl.join(", "));
+            let _ = writeln!(h, "{}", self.reg_decls());
             let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
             let _ = writeln!(h, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
             h.push_str(&self.body);
@@ -3002,8 +3274,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             }
         }
         if !self.regs.is_empty() {
-            let decl: Vec<String> = self.regs.iter().map(|r| format!("{r} = 0u")).collect();
-            let _ = writeln!(h, "    uint {};", decl.join(", "));
+            let _ = writeln!(h, "{}", self.reg_decls());
         }
         if is_ps && self.uses_quad {
             let _ = writeln!(init, "    uint tb_quad = ((uint){pos_field}.x & 1u) | (((uint){pos_field}.y & 1u) << 1);");

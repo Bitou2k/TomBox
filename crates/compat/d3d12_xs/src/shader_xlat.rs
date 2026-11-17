@@ -1,7 +1,7 @@
 //! Runtime shader translation for PSO creation.
 //!
 //! Xbox shader blob (DXBC wrapper → XDAT → zlib → FSSM → RDNA2) → HLSL (tombox-xshader)
-//! → `D3DCompile` (d3dcompiler_47.dll, SM5 DXBC which D3D12 accepts) → cached bytecode.
+//! → DXC (`dxcompiler.dll`, SM6 DXIL; FXC/`D3DCompile` SM5 DXBC as fallback) → cached bytecode.
 //! Each unique shader is translated once per process (keyed by an FNV-1a hash of its
 //! bytes). Failures are cached too and reported with the reason; failing shaders are
 //! dumped to `%TEMP%\tombox_shaders` so coverage can be extended offline with `xshader`.
@@ -127,8 +127,18 @@ fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
         dump_failure(hash, blob, None, &e);
         format!("translate: {e}")
     })?;
-    let key = fnv1a(t.hlsl.as_bytes()) ^ fnv1a(t.profile.as_bytes()).rotate_left(17);
-    let cached = disk_cache_dir().map(|d| d.join(format!("{key:016x}.cso")));
+    // Compiler: DXC (SM6 DXIL) when dxcompiler.dll + dxil.dll are available, otherwise FXC
+    // (SM5 DXBC). FXC needs minutes for some of the generated compute shaders; DXC about a
+    // second. `TOMBOX_SHADER_COMPILER=fxc` forces the old path.
+    let use_dxc = tombox_xshader::dxc::available()
+        && std::env::var("TOMBOX_SHADER_COMPILER").map(|v| v != "fxc").unwrap_or(true);
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    ANNOUNCED.call_once(|| {
+        record("d3d12_xs", "shader_xlat", if use_dxc { "compiler: DXC (shader model 6.0, DXIL)" } else { "compiler: FXC (shader model 5, DXBC) - DXC not available or disabled" });
+    });
+    let profile = if use_dxc { tombox_xshader::dxc::profile_for(t.profile) } else { t.profile.to_string() };
+    let _ = disk_cache_dir(); // creates the cache directory
+    let cached = Some(tombox_xshader::dxc::cache_path(&t.hlsl, &profile));
     if let Some(p) = &cached {
         if let Ok(v) = std::fs::read(p) {
             if !v.is_empty() {
@@ -143,7 +153,7 @@ fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
     let inflight = dir.join(format!("inflight_{hash:016x}.dxbc"));
     let _ = std::fs::write(&inflight, blob);
     let t0 = std::time::Instant::now();
-    let r = compile(&t.hlsl, t.profile);
+    let r = if use_dxc { tombox_xshader::dxc::compile(&t.hlsl, &profile) } else { compile(&t.hlsl, &profile) };
     let _ = std::fs::remove_file(&inflight);
     let ms = t0.elapsed().as_millis();
     if ms > 1500 {

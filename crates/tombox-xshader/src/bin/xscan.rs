@@ -3,7 +3,8 @@
 //!
 //! Usage: xscan <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1]
 //!
-//! `--compile 1` also compiles every translated shader with FXC (D3DCompile) and stores the
+//! `--compile 1` also compiles every translated shader (DXC by default, `--compiler fxc` for
+//! fxc.exe; 4 jobs at below-normal priority unless `--jobs` is given) and stores the
 //! bytecode in the runtime shader cache, so a full sweep both proves the HLSL compiles and
 //! pre-warms the cache the game reads.
 //!
@@ -246,6 +247,67 @@ mod fxc {
     }
 }
 
+/// Compile with `fxc.exe` in a child process that is killed after `limit` seconds: an
+/// in-process D3DCompile cannot be cancelled, and some generated shaders take minutes.
+/// Returns Ok(seconds) or Err(reason).
+fn fxc_child(hlsl: &str, profile: &str, out: &std::path::Path, limit: u64) -> Result<f64, String> {
+    use std::process::{Command, Stdio};
+    static FXC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let exe = FXC.get_or_init(|| {
+        std::env::var("FXC").unwrap_or_else(|_| r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe".to_string())
+    });
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join("tombox_sweep_tmp");
+    let _ = std::fs::create_dir_all(&dir);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let src = dir.join(format!("{}_{id}.hlsl", std::process::id()));
+    let tmp_out = dir.join(format!("{}_{id}.cso", std::process::id()));
+    std::fs::write(&src, hlsl).map_err(|e| format!("fxc: cannot write temp file: {e}"))?;
+    let t0 = std::time::Instant::now();
+    let mut child = Command::new(exe)
+        .args(["/nologo", "/T", profile, "/E", "main", "/Fo"])
+        .arg(&tmp_out)
+        .arg(&src)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("fxc: cannot start {exe}: {e}"))?;
+    // Drain stderr on a helper thread so a chatty compiler cannot block on a full pipe.
+    let mut stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(e) = stderr.as_mut() {
+            let _ = std::io::Read::read_to_string(e, &mut s);
+        }
+        s
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if t0.elapsed().as_secs() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => return Err(format!("fxc: wait failed: {e}")),
+        }
+    };
+    let err = reader.join().unwrap_or_default();
+    let secs = t0.elapsed().as_secs_f64();
+    let _ = std::fs::remove_file(&src);
+    let res = match status {
+        None => Err(format!("fxc: timeout after {limit} s")),
+        Some(_) if tmp_out.exists() => std::fs::rename(&tmp_out, out).map(|_| secs).map_err(|e| format!("fxc: cannot store result: {e}")),
+        Some(_) => {
+            let line = err.lines().find(|l| l.contains("error")).unwrap_or(err.lines().next().unwrap_or("no output")).to_string();
+            Err(format!("fxc: {}", line.split("): ").nth(1).unwrap_or(&line)))
+        }
+    };
+    let _ = std::fs::remove_file(&tmp_out);
+    res
+}
+
 /// Same key and directory as the runtime's compiled-shader cache (d3d12_xs/shader_xlat.rs),
 /// so a compile sweep pre-warms the cache the game uses.
 fn cache_path(hlsl: &str, profile: &str) -> std::path::PathBuf {
@@ -267,6 +329,12 @@ fn stage_name(s: &Stage) -> &'static str {
     }
 }
 
+/// Slowest compiles seen in this run: (seconds, hash, HLSL lines).
+static SLOW: Mutex<Vec<(f64, u64, usize)>> = Mutex::new(Vec::new());
+static LIMIT: AtomicUsize = AtomicUsize::new(120);
+/// 1 = compile with fxc.exe (SM5 DXBC) instead of the default DXC (SM6 DXIL).
+static USE_FXC: AtomicUsize = AtomicUsize::new(0);
+
 /// Translate (and optionally compile) one container. Returns (stage, result, compiled_now).
 fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
     let r = std::panic::catch_unwind(|| match extract(blob) {
@@ -279,14 +347,37 @@ fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
                     let _ = t;
                     (st, Ok(()), false)
                 }
-                Ok(t) => {
+                Ok(t) if USE_FXC.load(Ordering::Relaxed) != 0 => {
                     let path = cache_path(&t.hlsl, t.profile);
                     if path.exists() {
                         return (st, Ok(()), false);
                     }
-                    match fxc::compile(&t.hlsl, t.profile) {
+                    let _ = fxc::compile; // in-process FXC kept for reference; FXC runs as a killable child
+                    match fxc_child(&t.hlsl, t.profile, &path, LIMIT.load(Ordering::Relaxed) as u64) {
+                        Ok(secs) => {
+                            if secs > 5.0 {
+                                SLOW.lock().unwrap().push((secs, fnv1a(blob), t.hlsl.lines().count()));
+                            }
+                            (st, Ok(()), true)
+                        }
+                        Err(e) => (st, Err(e), true),
+                    }
+                }
+                Ok(t) => {
+                    // Default: DXC (shader model 6.0), in process.
+                    let profile = tombox_xshader::dxc::profile_for(t.profile);
+                    let path = tombox_xshader::dxc::cache_path(&t.hlsl, &profile);
+                    if path.exists() {
+                        return (st, Ok(()), false);
+                    }
+                    let t0 = std::time::Instant::now();
+                    match tombox_xshader::dxc::compile(&t.hlsl, &profile) {
                         Ok(code) => {
                             let _ = std::fs::write(&path, code);
+                            let secs = t0.elapsed().as_secs_f64();
+                            if secs > 5.0 {
+                                SLOW.lock().unwrap().push((secs, fnv1a(blob), t.hlsl.lines().count()));
+                            }
                             (st, Ok(()), true)
                         }
                         Err(e) => (st, Err(e), true),
@@ -315,6 +406,8 @@ fn main() -> ExitCode {
             "--limit" => limit = args[i + 1].parse().unwrap_or(usize::MAX),
             "--jobs" => jobs = args[i + 1].parse().unwrap_or(jobs).max(1),
             "--compile" => compile = args[i + 1] == "1",
+            "--fxc-limit" => LIMIT.store(args[i + 1].parse().unwrap_or(120), Ordering::Relaxed),
+            "--compiler" => USE_FXC.store((args[i + 1] == "fxc") as usize, Ordering::Relaxed),
             other => eprintln!("warning: ignoring {other}"),
         }
         i += 2;
@@ -331,6 +424,18 @@ fn main() -> ExitCode {
     }
     if compile {
         let _ = std::fs::create_dir_all(std::env::temp_dir().join("tombox_shader_cache").join("by_hlsl"));
+        // A full sweep runs for a long time on someone's desktop: stay out of the way.
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn SetPriorityClass(h: *mut std::ffi::c_void, class: u32) -> i32;
+            }
+            SetPriorityClass(GetCurrentProcess(), 0x4000); // BELOW_NORMAL_PRIORITY_CLASS
+        }
+        if !args.iter().any(|a| a == "--jobs") {
+            jobs = jobs.min(4);
+        }
     }
     // Gather candidate blobs: UE shader-archive entries (LZ4 blocks) if the file holds
     // an archive, otherwise raw DXBC containers found by magic.
@@ -431,6 +536,14 @@ fn main() -> ExitCode {
     }
     let mut v: Vec<_> = errors.into_iter().collect();
     v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let mut slow = SLOW.lock().unwrap().clone();
+    slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    if !slow.is_empty() {
+        println!("--- {} compiles took more than 5 s; slowest ---", slow.len());
+        for (secs, h, lines) in slow.iter().take(25) {
+            println!("{secs:>8.1} s  {h:016x}  {lines} HLSL lines");
+        }
+    }
     println!("--- failure reasons ({} distinct) ---", v.len());
     for (reason, (count, ex)) in v.iter().take(80) {
         println!("{count:>7}  {reason}   [e.g. {ex:016x}]");

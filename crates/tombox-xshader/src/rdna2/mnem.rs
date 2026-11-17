@@ -16,6 +16,8 @@ pub fn vop2(op: u32) -> Option<&'static str> {
         0x28 => "v_add_co_ci_u32", 0x29 => "v_sub_co_ci_u32", 0x2a => "v_subrev_co_ci_u32",
         0x2b => "v_fmac_f32", 0x2c => "v_fmamk_f32", 0x2d => "v_fmaak_f32",
         0x2f => "v_pack_b32_f16",
+        0x32 => "v_add_f16", 0x33 => "v_sub_f16", 0x34 => "v_subrev_f16", 0x35 => "v_mul_f16",
+        0x36 => "v_mac_f16", 0x39 => "v_max_f16", 0x3a => "v_min_f16",
         _ => return None,
     })
 }
@@ -33,6 +35,10 @@ pub fn vop1(op: u32) -> Option<&'static str> {
         0x2b => "v_rcp_iflag_f32", 0x2e => "v_rsq_f32", 0x33 => "v_sqrt_f32", 0x35 => "v_sin_f32",
         0x36 => "v_cos_f32", 0x37 => "v_not_b32", 0x38 => "v_bfrev_b32", 0x39 => "v_ffbh_u32",
         0x3a => "v_ffbl_b32", 0x3b => "v_ffbh_i32", 0x65 => "v_swap_b32",
+        0x42 => "v_movreld_b32", 0x43 => "v_movrels_b32", 0x44 => "v_movrelsd_b32",
+        0x50 => "v_cvt_f16_u16", 0x51 => "v_cvt_f16_i16", 0x52 => "v_cvt_u16_f16", 0x53 => "v_cvt_i16_f16",
+        0x54 => "v_rcp_f16", 0x55 => "v_sqrt_f16", 0x56 => "v_rsq_f16", 0x5b => "v_floor_f16",
+        0x5c => "v_ceil_f16", 0x5d => "v_trunc_f16", 0x5e => "v_rndne_f16", 0x5f => "v_fract_f16",
         _ => return None,
     })
 }
@@ -43,6 +49,12 @@ pub fn vopc(op: u32) -> Option<&'static str> {
         "v_cmp_lg_f32", "v_cmp_ge_f32", "v_cmp_o_f32", "v_cmp_u_f32", "v_cmp_nge_f32",
         "v_cmp_nlg_f32", "v_cmp_ngt_f32", "v_cmp_nle_f32", "v_cmp_neq_f32", "v_cmp_nlt_f32",
         "v_cmp_tru_f32",
+    ];
+    const H: [&str; 16] = [
+        "v_cmp_f_f16", "v_cmp_lt_f16", "v_cmp_eq_f16", "v_cmp_le_f16", "v_cmp_gt_f16",
+        "v_cmp_lg_f16", "v_cmp_ge_f16", "v_cmp_o_f16", "v_cmp_u_f16", "v_cmp_nge_f16",
+        "v_cmp_nlg_f16", "v_cmp_ngt_f16", "v_cmp_nle_f16", "v_cmp_neq_f16", "v_cmp_nlt_f16",
+        "v_cmp_tru_f16",
     ];
     const I: [&str; 8] = [
         "v_cmp_f_i32", "v_cmp_lt_i32", "v_cmp_eq_i32", "v_cmp_le_i32", "v_cmp_gt_i32",
@@ -57,6 +69,7 @@ pub fn vopc(op: u32) -> Option<&'static str> {
         0x80..=0x87 => I[(op - 0x80) as usize],
         0xc0..=0xc7 => U[(op - 0xc0) as usize],
         0x88 => "v_cmp_class_f32",
+        0xc8..=0xd7 => H[(op - 0xc8) as usize],
         _ => return None,
     })
 }
@@ -83,7 +96,11 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x178 => "v_xor3_b32", 0x345 => "v_xad_u32", 0x346 => "v_lshl_add_u32", 0x347 => "v_add_lshl_u32",
         0x36d => "v_add3_u32", 0x36f => "v_lshl_or_b32", 0x371 => "v_and_or_b32", 0x372 => "v_or3_b32",
         0x30f => "v_add_co_u32", 0x310 => "v_sub_co_u32", 0x319 => "v_subrev_co_u32",
-        0x360 => "v_readlane_b32", 0x361 => "v_writelane_b32",
+        0x344 => "v_perm_b32", 0x351 => "v_min3_f16", 0x354 => "v_max3_f16", 0x357 => "v_med3_f16",
+        0x360 => "v_readlane_b32", 0x361 => "v_writelane_b32", 0x363 => "v_bfm_b32", 0x364 => "v_bcnt_u32_b32",
+        0x34b => "v_fma_f16",
+        0x40e => "v_pk_fma_f16", 0x40f => "v_pk_add_f16", 0x410 => "v_pk_mul_f16", 0x411 => "v_pk_min_f16", 0x412 => "v_pk_max_f16",
+        0x421 => "v_fma_mixlo_f16", 0x422 => "v_fma_mixhi_f16",
         0x420 => "v_fma_mix_f32", // VOP3P opcode 0x20 (see rdna2.rs: VOP3P opcodes are offset by 0x400)
         0x362 => "v_ldexp_f32", 0x365 => "v_mbcnt_lo_u32_b32", 0x366 => "v_mbcnt_hi_u32_b32",
         0x2ff => "v_lshlrev_b64", 0x300 => "v_lshrrev_b64", 0x301 => "v_ashrrev_i64",
@@ -116,6 +133,7 @@ pub fn sop1(op: u32) -> Option<&'static str> {
         0x07 => "s_not_b32", 0x08 => "s_not_b64", 0x09 => "s_wqm_b32", 0x0a => "s_wqm_b64",
         0x0b => "s_brev_b32", 0x0f => "s_bcnt1_i32_b32", 0x10 => "s_bcnt1_i32_b64", 0x13 => "s_ff1_i32_b32",
         0x15 => "s_flbit_i32_b32", 0x19 => "s_sext_i32_i8", 0x1a => "s_sext_i32_i16",
+        0x1b => "s_bitset0_b32", 0x1d => "s_bitset1_b32",
         0x1f => "s_getpc_b64", 0x20 => "s_setpc_b64", 0x21 => "s_swappc_b64",
         0x24 => "s_and_saveexec_b64", 0x25 => "s_or_saveexec_b64", 0x26 => "s_xor_saveexec_b64",
         0x27 => "s_andn2_saveexec_b64", 0x28 => "s_orn2_saveexec_b64",
@@ -240,6 +258,7 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
             0x37 => Some("ds_read2_b32"),
             0x38 => Some("ds_read2st64_b32"),
             0x0f => Some("ds_write2st64_b32"),
+            0x4d => Some("ds_write_b64"), 0x4e => Some("ds_write2_b64"),
             _ => None,
         },
         Enc::Vinterp => Some(match op {
