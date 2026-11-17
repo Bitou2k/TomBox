@@ -68,8 +68,31 @@ static PC_IID_IDSTORAGEQUEUE: [u8; 16] = [
     0x8e, 0xa5, 0x69, 0x04, 0x21, 0x37, 0xf4, 0x9b, // Data4
 ];
 
+/// PC `IID_IDStorageStatusArray` = {82397587-7cd5-453b-a02e-31379bd64656}, LE.
+static PC_IID_IDSTORAGESTATUSARRAY: [u8; 16] = [
+    0x87, 0x75, 0x39, 0x82, // Data1 = 0x82397587
+    0xd5, 0x7c, // Data2 = 0x7CD5
+    0x3b, 0x45, // Data3 = 0x453B
+    0xa0, 0x2e, 0x31, 0x37, 0x9b, 0xd6, 0x46, 0x56, // Data4
+];
+
 static ORIG_OPENFILE: AtomicUsize = AtomicUsize::new(0);
 static ORIG_CREATEQUEUE: AtomicUsize = AtomicUsize::new(0);
+static ORIG_CREATESTATUS: AtomicUsize = AtomicUsize::new(0);
+
+/// Factory slot 5 = CreateStatusArray(this, UINT32 capacity, const CHAR* name,
+/// REFIID riid, void** ppv). Substitute the PC IDStorageStatusArray IID so the
+/// completion-tracking status array isn't null (EnqueueStatus fail-fasts otherwise).
+unsafe extern "system" fn create_status_array_shim(
+    this: *mut c_void, capacity: u32, name: *const u8, _riid: *const c_void, ppv: *mut *mut c_void,
+) -> i32 {
+    let orig: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const c_void, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(ORIG_CREATESTATUS.load(Ordering::Relaxed)) };
+    let hr = unsafe { orig(this, capacity, name, PC_IID_IDSTORAGESTATUSARRAY.as_ptr() as *const c_void, ppv) };
+    let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+    record(M, "CreateStatusArray", &format!("cap={capacity} (PC IID) -> hr={hr:#010x} arr={out:p}"));
+    hr
+}
 static ENQUEUE_DUMPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static ORIG_ENQUEUE: AtomicUsize = AtomicUsize::new(0);
 static LAST_OPENED_FILE: AtomicUsize = AtomicUsize::new(0);
@@ -185,17 +208,19 @@ fn patch_factory(factory: *mut c_void) {
     }
     unsafe {
         let vtbl = *(factory as *const *mut usize);
-        // slot 3 = CreateQueue, slot 4 = OpenFile.
+        // slot 3 = CreateQueue, slot 4 = OpenFile, slot 5 = CreateStatusArray.
         ORIG_CREATEQUEUE.store(*vtbl.add(3), Ordering::Relaxed);
         ORIG_OPENFILE.store(*vtbl.add(4), Ordering::Relaxed);
+        ORIG_CREATESTATUS.store(*vtbl.add(5), Ordering::Relaxed);
         let addr = vtbl.add(3) as *mut c_void;
         let mut old: u32 = 0;
-        if VirtualProtect(addr, 16, PAGE_READWRITE, &mut old) != 0 {
+        if VirtualProtect(addr, 24, PAGE_READWRITE, &mut old) != 0 {
             *vtbl.add(3) = create_queue_shim as usize;
             *vtbl.add(4) = open_file_shim as usize;
+            *vtbl.add(5) = create_status_array_shim as usize;
             let mut tmp: u32 = 0;
-            VirtualProtect(addr, 16, old, &mut tmp);
-            record(M, "patch_factory", &format!("vtable {vtbl:p} slots 3/4 (CreateQueue/OpenFile) -> IID-substituting shims"));
+            VirtualProtect(addr, 24, old, &mut tmp);
+            record(M, "patch_factory", &format!("vtable {vtbl:p} slots 3/4/5 (CreateQueue/OpenFile/CreateStatusArray) -> IID shims"));
         }
     }
 }
