@@ -130,3 +130,49 @@ All times UTC. This log is append-only and records what was actually done, run, 
 
 ### Next
 - Await user's next-missing-DLL + the compat log (call order) → implement earliest-called Xbox API for real; D3D12 device creation is the expected wall (needs the graphics backend).
+
+## 2026-11-16 — Session 2 cont.: boots to GDK runtime init (major milestone)
+
+### Milestone reached: the real game runs its own engine code
+After the compat DLLs + two xmem fixes, `FortniteClient-XSX-Shipping.exe` loads
+natively and executes its own startup code. Verified via a purpose-built debug
+tracer (scratchpad `mdbg.rs`: DEBUG_ONLY_THIS_PROCESS loop capturing
+OutputDebugString, exceptions, exit-sink stack).
+
+### Two real bugs found + fixed from runtime evidence (not guesses)
+1. `XMemVirtualAlloc` passed Xbox allocation-type bits (0x20000000) to Windows
+   `VirtualAlloc` → read as MEM_LARGE_PAGES → ERROR_INVALID_PARAMETER → null →
+   UE memory init failed. Fix: mask to Windows-valid alloc-type bits.
+2. `XMemVirtualAlloc` committed pages as PAGE_NOACCESS (Xbox prot value 0x1 passed
+   through) → game wrote to committed page → ACCESS_VIOLATION (confirmed via
+   minidump + disasm: `mov [rax],r15`, rax = our returned pointer). Fix: committed
+   pages get READWRITE (EXECUTE_READWRITE if execute requested); reserve stays NOACCESS.
+
+### Current wall: Xbox GDK runtime (XGameRuntime) init → clean exit(1)
+OutputDebugString trace shows the GDK runtime bootstrapping its service objects
+(`SErrorImpl`, `SUsersImpl`, `SGameImpl`, `SUserDeviceAssociationsImpl`,
+`SMultiplayerNetworkingImpl`, `SSystemImpl`, `SFeatureImpl`, `SAsyncImpl`,
+`SPersistentLocalStorageImpl` — all "Created"), then **all "Destroyed"** and the
+process exits 1. `XERROR: HR:80070006 ... TaskQueue` during teardown. Graphics
+(`d3d12_xs`) is NEVER reached — this is platform/GDK init, before the RHI.
+Exit-sink stack walk: `main`/`WinMain` already returned (CRT teardown), i.e. a
+**clean decision to quit**, not a crash.
+
+### Why: the title needs the Xbox GameOS environment
+- `MicrosoftGame.config` TargetDeviceFamily="Scarlett"; `appxmanifest.xml` has
+  `<uap7:OSPackageDependency Name="Microsoft.GameOs" .../>` and an Xbox proxy
+  entry point. `XGameRuntimeInitialize` expects the console runtime/identity.
+- Package registration ruled out: `Add-AppxPackage -Register` → 0x80073CFF
+  (no sideloading license); and the Microsoft.GameOs dependency can't be met on
+  desktop Windows anyway.
+
+### Next phase (decided): XGameRuntime / GDK compat shim
+Reimplement the Xbox GDK runtime surface (XGameRuntimeInitialize succeed, XTaskQueue,
+XAsync, XUser, XGame, PersistentLocalStorage, etc.) — the platform-services layer
+anticipated by CLAUDE.md §B. Same incremental method: shim → run → read the call
+log → implement the next required function. This is a substantial new subsystem.
+
+### Tooling added this session
+- `mdbg` debug tracer (OutputDebugString + exception + exit-stack capture) — to be
+  formalized into the repo as `tombox-trace`.
+- `mdparse` minidump parser (exception code/address/faulting module).
