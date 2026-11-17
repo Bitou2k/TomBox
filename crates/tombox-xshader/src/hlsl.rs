@@ -37,6 +37,7 @@ enum Res {
     Cb(u32),
     Tex(u32, u32), // slot, dim
     Samp(u32),
+    Uav(u32, u32), // slot, dim
 }
 
 const XYZW: [&str; 4] = ["x", "y", "z", "w"];
@@ -104,6 +105,8 @@ struct Emitter<'a> {
     cb_size: BTreeMap<u32, u32>,   // slot -> dwords
     tex: BTreeMap<u32, u32>,       // slot -> dim
     samp: BTreeSet<u32>,
+    uav: BTreeMap<u32, u32>,       // slot -> dim
+    is_cs: bool,
     regs: BTreeSet<String>,
     body: String,
     tmp: usize,
@@ -115,6 +118,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
     let (profile, is_ps) = match ex.stage {
         Stage::Vertex => ("vs_5_0", false),
         Stage::Pixel => ("ps_5_0", true),
+        Stage::Compute => ("cs_5_0", false),
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let insns = disassemble(&ex.isa);
@@ -125,6 +129,8 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         cb_size: BTreeMap::new(),
         tex: BTreeMap::new(),
         samp: BTreeSet::new(),
+        uav: BTreeMap::new(),
+        is_cs: ex.stage == Stage::Compute,
         regs: BTreeSet::new(),
         body: String::new(),
         tmp: 0,
@@ -138,6 +144,20 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
 }
 
 impl<'a> Emitter<'a> {
+    /// Root-signature range type (0 SRV, 1 UAV, 2 CBV, 3 Sampler) of the descriptor table
+    /// whose pointer lives in user SGPR `sgpr` at shader entry. The FSSM register table
+    /// maps user SGPR (base + i) to root parameter i, with base 8 for graphics stages and
+    /// 4 for compute (observed: PS s8/s9/s10 = params 0/1/2, VS s12 = param 4, CS s5/s7 =
+    /// params 1/3). `None` when the root signature is unavailable or the SGPR is not a table.
+    fn table_kind(&self, sgpr: u8) -> Option<u32> {
+        let base = if self.is_cs { 4 } else { 8 };
+        let idx = (sgpr as usize).checked_sub(base)?;
+        match &self.ex.root_sig.as_ref()?.params.get(idx)?.kind {
+            crate::meta::RootParamKind::Table(r) if r.len() == 1 && r[0].base_register == 0 => Some(r[0].range_type),
+            _ => None,
+        }
+    }
+
     /// Linear symbolic pass: classify descriptor loads and bind them to HLSL registers.
     fn resolve_resources(&mut self) -> Result<(), String> {
         let mut sym: HashMap<u8, Sym> = HashMap::new();
@@ -220,16 +240,18 @@ impl<'a> Emitter<'a> {
                     let rs = ins.src.get(n - 2).and_then(sg).ok_or("mimg: bad srsrc")?;
                     let ss = ins.src.get(n - 1).and_then(sg).ok_or("mimg: bad ssamp")?;
                     let dim = ins.aux.imm as u32;
-                    let tslot = match sym.get(&rs) {
-                        Some(Sym::Desc { off, k: 0, .. }) => off / 32,
+                    let (tslot, ttable) = match sym.get(&rs) {
+                        Some(Sym::Desc { off, k: 0, table }) => (off / 32, *table),
                         other => {
                             return Err(format!("mimg at {:#x}: s{rs} not an image descriptor ({other:?})", ins.offset))
                         }
                     };
-                    let mut v = vec![Res::Tex(tslot, dim)];
-                    if let Some(prev) = self.tex.insert(tslot, dim) {
+                    let is_uav = self.table_kind(ttable) == Some(1);
+                    let mut v = vec![if is_uav { Res::Uav(tslot, dim) } else { Res::Tex(tslot, dim) }];
+                    let map = if is_uav { &mut self.uav } else { &mut self.tex };
+                    if let Some(prev) = map.insert(tslot, dim) {
                         if prev != dim {
-                            return Err(format!("texture t{tslot} used with two dimensions"));
+                            return Err(format!("image slot {tslot} used with two dimensions"));
                         }
                     }
                     if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") {
@@ -761,6 +783,73 @@ impl<'a> Emitter<'a> {
 
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         let rs = self.res.get(&idx).cloned().ok_or("unresolved image")?;
+        // Texel-addressed ops (no sampler): image_load / image_store, on SRVs or UAVs.
+        if matches!(ins.mnemonic.as_str(), "image_load" | "image_store") {
+            let (slot, dim, is_uav) = match rs.first() {
+                Some(Res::Tex(t, d)) => (*t, *d, false),
+                Some(Res::Uav(t, d)) => (*t, *d, true),
+                _ => return Err("unresolved image".into()),
+            };
+            let ncoord = match dim {
+                1 => 2,
+                2 | 5 => 3,
+                _ => return Err(format!("image dim {dim} unsupported for load/store")),
+            };
+            let nsa = ins.aux.imm2 as usize;
+            let first = match ins.src[0] {
+                Opnd::Vgpr(n) => n,
+                _ => return Err("bad vaddr".into()),
+            };
+            let mut c = vec![];
+            for i in 0..ncoord {
+                let o = if nsa > 0 { ins.src[i] } else { Opnd::Vgpr(first + i as u8) };
+                self.touch(&o);
+                c.push(r(&o)?);
+            }
+            let vd = match ins.dst[0] {
+                Opnd::Vgpr(n) => n,
+                _ => return Err("bad vdata".into()),
+            };
+            if ins.mnemonic == "image_store" {
+                if !is_uav {
+                    return Err("image_store to a non-UAV table".into());
+                }
+                let mut comp = vec![];
+                let mut n = 0u8;
+                for ch in 0..4 {
+                    if (ins.aux.mask >> ch) & 1 != 0 {
+                        let o = Opnd::Vgpr(vd + n);
+                        self.touch(&o);
+                        comp.push(f(&o)?);
+                        n += 1;
+                    } else {
+                        comp.push("0.0".into());
+                    }
+                }
+                self.line(&format!(
+                    "if (exec_lo & 1u) uav{slot}[uint{ncoord}({})] = float4({});",
+                    c.join(", "),
+                    comp.join(", ")
+                ));
+            } else {
+                let t = self.tmp;
+                self.tmp += 1;
+                let e = if is_uav {
+                    format!("uav{slot}[uint{ncoord}({})]", c.join(", "))
+                } else {
+                    format!("tex{slot}.Load(int{}({}, 0))", ncoord + 1, c.iter().map(|x| format!("(int){x}")).collect::<Vec<_>>().join(", "))
+                };
+                self.line(&format!("float4 t{t} = {e};"));
+                let mut n = 0u8;
+                for ch in 0..4 {
+                    if (ins.aux.mask >> ch) & 1 != 0 {
+                        self.wv(&Opnd::Vgpr(vd + n), &format!("asuint(t{t}.{})", XYZW[ch]))?;
+                        n += 1;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let (tslot, dim) = match rs.first() {
             Some(Res::Tex(t, d)) => (*t, *d),
             _ => return Err("unresolved image".into()),
@@ -901,6 +990,41 @@ impl<'a> Emitter<'a> {
         }
         for slot in &self.samp {
             let _ = writeln!(h, "SamplerState samp{slot} : register(s{slot});");
+        }
+        for (slot, dim) in &self.uav {
+            let ty = match dim {
+                1 => "RWTexture2D<float4>",
+                2 => "RWTexture3D<float4>",
+                5 => "RWTexture2DArray<float4>",
+                _ => return Err(format!("UAV dim {dim} unsupported")),
+            };
+            let _ = writeln!(h, "{ty} uav{slot} : register(u{slot});");
+        }
+        if self.is_cs {
+            // Compute ABI (from ClearCS + FSSM metadata): local thread id in v0..v2, the
+            // thread-group id in the three SGPRs following the user-data (root-parameter)
+            // registers, thread-group size in the ISA preamble dwords 1..3.
+            let p = ex.isa_preamble;
+            let (tx, ty_, tz) = (p[1].max(1), p[2].max(1), p[3].max(1));
+            let nparams = ex.root_sig.as_ref().map(|r| r.params.len()).unwrap_or(4);
+            let g = 4 + nparams;
+            let _ = writeln!(h, "[numthreads({tx}, {ty_}, {tz})]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
+            let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
+            for r in ["v0", "v1", "v2"] {
+                self.regs.insert(r.to_string());
+            }
+            for k in 0..3 {
+                self.regs.insert(format!("s{}", g + k));
+            }
+            let decl: Vec<String> = self.regs.iter().map(|r| format!("{r} = 0u")).collect();
+            let _ = writeln!(h, "    uint {};", decl.join(", "));
+            let _ = writeln!(h, "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;");
+            let _ = writeln!(h, "    s{} = gid.x; s{} = gid.y; s{} = gid.z;", g, g + 1, g + 2);
+            h.push_str(&self.body);
+            h.push_str("}
+");
+            return Ok(h);
         }
         let _ = writeln!(h, "struct SIn {{");
         for e in &ex.input_sig {

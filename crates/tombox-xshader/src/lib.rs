@@ -120,6 +120,8 @@ pub struct ShaderExtract {
     pub isa: Vec<u8>,
     /// Offset of the ISA within the FSSM blob.
     pub isa_offset_in_fssm: usize,
+    /// The 16-byte ISA-section preamble (compute: dwords 1..3 = thread-group size X,Y,Z).
+    pub isa_preamble: [u32; 4],
     /// Presence of the standard signature/validation/root-sig chunks in the outer DXBC.
     pub has_input_sig: bool,
     pub has_output_sig: bool,
@@ -171,6 +173,15 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
     let fssm = find_and_inflate_fssm(xdat)?;
 
     let (isa, isa_off) = locate_isa(&fssm)?;
+    let isa_preamble = {
+        let mut p = [0u32; 4];
+        if isa_off >= 16 {
+            for (i, v) in p.iter_mut().enumerate() {
+                *v = u32_at(&fssm, isa_off - 16 + i * 4).unwrap_or(0);
+            }
+        }
+        p
+    };
     let chunk_body = |cc: &[u8; 4]| container.chunk(cc).map(|c| &dxbc[c.offset..c.offset + c.size]);
     let entry = find_entry_name(&fssm);
 
@@ -181,6 +192,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         entry,
         isa,
         isa_offset_in_fssm: isa_off,
+        isa_preamble,
         fssm,
         has_input_sig: container.chunk(b"ISG1").is_some() || container.chunk(b"ISGN").is_some(),
         has_output_sig: container.chunk(b"OSG1").is_some() || container.chunk(b"OSGN").is_some(),
@@ -261,11 +273,14 @@ fn locate_isa(fssm: &[u8]) -> Result<(Vec<u8>, usize), String> {
 /// Strip the 16-byte ISA-section preamble (dword0 = code offset, dwords 1..3 zero) that
 /// precedes the executable RDNA2 code. Returns the code slice and its absolute FSSM offset.
 fn strip_isa_preamble(sect: &[u8], sect_off: usize) -> (&[u8], usize) {
-    if sect.len() >= 16 {
-        let d1 = u32::from_le_bytes([sect[4], sect[5], sect[6], sect[7]]);
-        let d2 = u32::from_le_bytes([sect[8], sect[9], sect[10], sect[11]]);
-        let d3 = u32::from_le_bytes([sect[12], sect[13], sect[14], sect[15]]);
-        if d1 == 0 && d2 == 0 && d3 == 0 {
+    if sect.len() >= 24 {
+        let w = |o: usize| u32::from_le_bytes([sect[o], sect[o + 1], sect[o + 2], sect[o + 3]]);
+        // Graphics: dwords 1..3 are zero. Compute: dwords 1..3 are the thread-group size.
+        // In both cases the code proper starts with the driver hash marker, a VOP3
+        // `v_nop` (0xD580....) whose second dword is 0x03FE..../0x03FF.....
+        let zeros = w(4) == 0 && w(8) == 0 && w(12) == 0;
+        let marker = (w(16) >> 16) == 0xd580 && (w(20) >> 17) == 0x1ff;
+        if zeros || marker {
             return (&sect[16..], sect_off + 16);
         }
     }

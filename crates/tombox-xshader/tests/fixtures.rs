@@ -48,3 +48,29 @@ fn vertex_shader_extracts_and_decodes() {
 fn pixel_shader_extracts_and_decodes() {
     check("fortnite_ps_sample.dxbc", Stage::Pixel);
 }
+
+#[test]
+fn compute_shader_extracts_and_decodes() {
+    check("fortnite_cs_clear.dxbc", Stage::Compute);
+    let ex = extract(&fixture("fortnite_cs_clear.dxbc")).unwrap();
+    // Thread-group size lives in the ISA preamble.
+    assert_eq!(&ex.isa_preamble[1..], &[4, 4, 4]);
+}
+
+/// The HLSL emitter must accept all three real shaders and bind what they actually use.
+#[test]
+fn fixtures_translate_to_hlsl() {
+    use tombox_xshader::hlsl::translate;
+    let vs = translate(&extract(&fixture("fortnite_vs_sample.dxbc")).unwrap()).expect("VS");
+    assert_eq!(vs.profile, "vs_5_0");
+    assert!(vs.hlsl.contains("cbuffer CB0 : register(b0)"));
+    assert!(vs.hlsl.contains("SV_Position"));
+    let ps = translate(&extract(&fixture("fortnite_ps_sample.dxbc")).unwrap()).expect("PS");
+    assert_eq!(ps.profile, "ps_5_0");
+    assert!(ps.hlsl.contains("tex0.Sample(samp0"));
+    assert!(ps.hlsl.contains("SV_Target0"));
+    let cs = translate(&extract(&fixture("fortnite_cs_clear.dxbc")).unwrap()).expect("CS");
+    assert_eq!(cs.profile, "cs_5_0");
+    assert!(cs.hlsl.contains("[numthreads(4, 4, 4)]"));
+    assert!(cs.hlsl.contains("RWTexture3D<float4> uav0 : register(u0)"));
+}

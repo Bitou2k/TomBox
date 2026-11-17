@@ -698,6 +698,50 @@ unsafe extern "system" fn create_derived_pso_x(
     hr
 }
 
+/// Xbox compute-PSO create (device slot 62), call site EXE+0xd54c30:
+/// `(this, pDesc, numExt, pExtDesc, riid, ppv)` with a PC-layout
+/// D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature@0, CS{ptr@8,len@0x10}, NodeMask@0x18,
+/// CachedPSO@0x20, Flags@0x30 }. The CS is translated like graphics stages.
+unsafe extern "system" fn create_compute_pso_x(
+    this: *mut DeviceWrapper, pdesc: *const u8, _num_ext: u32, _pext: *const u8,
+    riid: *const Guid, ppv: *mut *mut c_void,
+) -> i32 {
+    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+    static OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static FAIL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let real = unsafe { (*this).real };
+    if pdesc.is_null() {
+        return E_FAIL;
+    }
+    let mut desc = unsafe { core::slice::from_raw_parts(pdesc, 0x38).to_vec() };
+    let p = u64::from_le_bytes(desc[8..16].try_into().unwrap()) as *const u8;
+    let n = u64::from_le_bytes(desc[16..24].try_into().unwrap()) as usize;
+    let code = match unsafe { crate::shader_xlat::translate(p, n) } {
+        Ok(c) => c,
+        Err(e) => {
+            if FAIL.fetch_add(1, Ordering::Relaxed) < 6 {
+                record("d3d12_xs", "CreateComputePSO_X",
+                    &format!("untranslatable compute shader -> E_FAIL ({})", e.lines().next().unwrap_or("")));
+            }
+            return E_FAIL;
+        }
+    };
+    desc[8..16].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+    desc[16..24].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(*real_vtbl(real).add(11)) }; // PC CreateComputePipelineState
+    let hr = unsafe { f(real, desc.as_ptr(), riid, ppv) };
+    if hr == 0 {
+        let k = OK.fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 4 || k % 100 == 0 {
+            record("d3d12_xs", "CreateComputePSO_X", &format!("compute PSO #{k} created from translated shader"));
+        }
+    } else if FAIL.fetch_add(1, Ordering::Relaxed) < 10 {
+        record("d3d12_xs", "CreateComputePSO_X", &format!("real CreateComputePipelineState FAILED hr={hr:#010x}"));
+    }
+    hr
+}
+
 // Per-slot logging stubs for the Xbox device extensions (44+): capture slot +
 // caller RVA and return S_OK (most are hints like SetFrameIntervalX that the RHI
 // only checks for success). This reveals which Xbox device methods the game needs.
@@ -762,6 +806,7 @@ fn vtable() -> *const usize {
         unsafe { install_dev_stubs(&mut v); } // 44..90: logging S_OK stubs (diagnostic)
         v[60] = create_gfx_pso_x as usize; // Xbox graphics PSO create -> PC CreateGraphicsPipelineState
         v[55] = create_derived_pso_x as usize; // Xbox derived-PSO create (base PSO + state patches)
+        v[62] = create_compute_pso_x as usize; // Xbox compute PSO create
         v[48] = create_command_queue_x as usize; // CreateCommandQueueX
         v[8] = create_command_queue_x as usize; // PC-slot CreateCommandQueue: same desc; needs the Xbox-sized queue vtable too
         v[15] = get_descriptor_increment as usize; // GetDescriptorHandleIncrementSize
