@@ -41,7 +41,29 @@ static PC_IID_IDSTORAGEFILE: [u8; 16] = [
     0xa7, 0x3c, 0x24, 0x3b, 0x29, 0xf4, 0xb8, 0xda, // Data4
 ];
 
+/// PC `IID_IDStorageQueue` = {cfdbd83f-9e06-4fda-8ea5-69042137f49b}, LE layout.
+static PC_IID_IDSTORAGEQUEUE: [u8; 16] = [
+    0x3f, 0xd8, 0xdb, 0xcf, // Data1 = 0xCFDBD83F
+    0x06, 0x9e, // Data2 = 0x9E06
+    0xda, 0x4f, // Data3 = 0x4FDA
+    0x8e, 0xa5, 0x69, 0x04, 0x21, 0x37, 0xf4, 0x9b, // Data4
+];
+
 static ORIG_OPENFILE: AtomicUsize = AtomicUsize::new(0);
+static ORIG_CREATEQUEUE: AtomicUsize = AtomicUsize::new(0);
+
+/// Factory slot 3 = CreateQueue(this, const DSTORAGE_QUEUE_DESC*, REFIID, void** ppv).
+/// Substitute the PC IDStorageQueue IID so the async IoStore read queue isn't null.
+unsafe extern "system" fn create_queue_shim(
+    this: *mut c_void, pdesc: *const c_void, _riid: *const c_void, ppv: *mut *mut c_void,
+) -> i32 {
+    let orig: unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> i32 =
+        unsafe { core::mem::transmute(ORIG_CREATEQUEUE.load(Ordering::Relaxed)) };
+    let hr = unsafe { orig(this, pdesc, PC_IID_IDSTORAGEQUEUE.as_ptr() as *const c_void, ppv) };
+    let out = if ppv.is_null() { core::ptr::null_mut() } else { unsafe { *ppv } };
+    record(M, "CreateQueue", &format!("(PC queue IID) -> hr={hr:#010x} queue={out:p}"));
+    hr
+}
 
 /// Factory slot 4 = OpenFile(this, PCWSTR path, REFIID, void** ppv). The Xbox
 /// IoStore passes the Xbox IDStorageFile IID, which PC OpenFile rejects; swap it
@@ -64,14 +86,17 @@ fn patch_factory(factory: *mut c_void) {
     }
     unsafe {
         let vtbl = *(factory as *const *mut usize);
-        let slot = vtbl.add(4);
-        ORIG_OPENFILE.store(*slot, Ordering::Relaxed);
+        // slot 3 = CreateQueue, slot 4 = OpenFile.
+        ORIG_CREATEQUEUE.store(*vtbl.add(3), Ordering::Relaxed);
+        ORIG_OPENFILE.store(*vtbl.add(4), Ordering::Relaxed);
+        let addr = vtbl.add(3) as *mut c_void;
         let mut old: u32 = 0;
-        if VirtualProtect(slot as *mut c_void, 8, PAGE_READWRITE, &mut old) != 0 {
-            *slot = open_file_shim as usize;
+        if VirtualProtect(addr, 16, PAGE_READWRITE, &mut old) != 0 {
+            *vtbl.add(3) = create_queue_shim as usize;
+            *vtbl.add(4) = open_file_shim as usize;
             let mut tmp: u32 = 0;
-            VirtualProtect(slot as *mut c_void, 8, old, &mut tmp);
-            record(M, "patch_factory", &format!("vtable {vtbl:p} slot 4 OpenFile -> IID-substituting shim"));
+            VirtualProtect(addr, 16, old, &mut tmp);
+            record(M, "patch_factory", &format!("vtable {vtbl:p} slots 3/4 (CreateQueue/OpenFile) -> IID-substituting shims"));
         }
     }
 }

@@ -397,3 +397,30 @@ setup triggers DXGI device-removed ("GPU Crashed or D3D Device Removed", Line 65
 Likely the unified-memory gap: Xbox places GPU resources on app physical pages
 (GPU-visible on console); our commit-on-map gives CPU VirtualAlloc memory the GPU
 can't access. Investigating.
+
+## 2026-11-16 — ★ FIRST WINDOW: real Fortnite XSX binary opens on PC ★
+
+MILESTONE 13 reached. After the presentation-init stubs (S_OK), the real
+FortniteClient-XSX-Shipping.exe **created and presented its own window** on the
+desktop (titled "Fortnite", blank first frame) before continuing init — the
+actual supplied Xbox Series console binary driving a live D3D12 swap chain on the
+RTX 5060 Ti. Confirmed visually by the user.
+
+### Async asset streaming (DirectStorage read path)
+After the window, the IoStore I/O thread (FXSXFileIoStoreImpl::StartRequests)
+crashed: it enqueues DirectStorage reads on a queue that was null, because we had
+only substituted the PC IID on OpenFile. Added CreateQueue (factory slot 3) IID
+substitution (PC IID_IDStorageQueue {cfdbd83f-...}). The queue now creates and the
+game advances to FFortniteEarlyPreLoadScreen + FAssetRegistry startup + a WinHttp
+service call.
+
+### Current frontier: DSTORAGE_REQUEST translation
+Real DStorageCore now fail-fasts in DStorageQueue.cpp:287 with E_INVALIDARG — the
+Xbox DSTORAGE_REQUEST layout passed to IDStorageQueue::EnqueueRequest differs from
+PC. Next: intercept EnqueueRequest on the queue vtable, translate the Xbox request
+(source file/offset/size + destination) to the PC DSTORAGE_REQUEST, or service the
+read directly. This is the asset-streaming subsystem that gates reaching the menu.
+
+### Milestones
+- [x] 13 actual game renders a first frame (window created + presented).
+- [~] 14 main menu: blocked on DirectStorage request translation (asset streaming).
