@@ -7,13 +7,16 @@ public static class TbMouse {
     public delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, UIntPtr e);
     public static IntPtr Find() {
         IntPtr found = IntPtr.Zero;
         EnumWindows((h, l) => { var sb = new StringBuilder(256); GetClassName(h, sb, 256);
-            if (sb.ToString() == "TomBoxHostWindow") { found = h; return false; } return true; }, IntPtr.Zero);
+            var tt = new StringBuilder(256); GetWindowText(h, tt, 256);
+            if (sb.ToString() == "TomBoxHostWindow" || (tt.ToString() == "Fortnite" && IsWindowVisible(h))) { found = h; return false; } return true; }, IntPtr.Zero);
         return found;
     }
 }

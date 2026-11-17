@@ -581,6 +581,34 @@ unsafe extern "system" fn create_gfx_pso_x(
             }
             record("d3d12_xs", "CreateGraphicsPSO_X", &s);
         }
+        // Diagnostic: depth-only pipelines (no colour target) — input layout + original VS.
+        {
+            static DO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let u32at = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+            if u32at(0x240) == 0 && u32at(0x264) != 0 && DO.fetch_add(1, Ordering::Relaxed) < 6 {
+                let ptr = rd(&desc, 0x228) as *const u8;
+                let n = (u32at(0x230) as usize).min(16);
+                let mut s = format!("depth-only PSO: {n} input elements");
+                for i in 0..n {
+                    let e = unsafe { core::slice::from_raw_parts(ptr.add(i * 32), 32) };
+                    let name_ptr = u64::from_le_bytes(e[0..8].try_into().unwrap()) as *const u8;
+                    let mut name = String::new();
+                    if !name_ptr.is_null() {
+                        let mut k = 0;
+                        while k < 32 && unsafe { *name_ptr.add(k) } != 0 { name.push(unsafe { *name_ptr.add(k) } as char); k += 1; }
+                    }
+                    let f = |o: usize| u32::from_le_bytes(e[o..o + 4].try_into().unwrap());
+                    s.push_str(&format!("\n    {name}{} fmt={} slot={} off={} class={} step={}", f(8), f(12), f(16), f(20), f(24), f(28)));
+                }
+                record("d3d12_xs", "PSOFMT", &s);
+                let (p, len) = (unsafe { core::ptr::read_unaligned(pdesc.add(0x08) as *const u64) } as *const u8, unsafe { core::ptr::read_unaligned(pdesc.add(0x10) as *const u64) } as usize);
+                if !p.is_null() && len > 0 && len < 0x100000 {
+                    let dir = std::env::temp_dir().join("tombox_shaders");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("depthonly_vs_{}.dxbc", DO.load(Ordering::Relaxed))), unsafe { core::slice::from_raw_parts(p, len) });
+                }
+            }
+        }
         // Diagnostic: output-merger formats of the first PSOs plus the (so far ignored)
         // Xbox extension struct, to check whether formats live outside the PC-layout desc.
         static FMTLOG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -691,7 +719,15 @@ unsafe extern "system" fn create_derived_pso_x(
             let payload = |n: usize| unsafe { core::slice::from_raw_parts(p.add(4), n) };
             tags.push_str(&format!("{tag} "));
             match tag {
-                0 => desc[0x1f0..0x1f0 + 0x34].copy_from_slice(payload(0x34)),
+                0 => {
+                    static T0: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+                    if u32::from_le_bytes(desc[0x264..0x268].try_into().unwrap()) != 0 && T0.fetch_add(1, Ordering::Relaxed) < 400 {
+                        let hex = payload(0x34).chunks(4).map(|c| format!("{:x}", u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>().join(" ");
+                        let u32at = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+                        record("d3d12_xs", "PSOFMT", &format!("tag0 numRT={} dsv={} payload[{hex}]", u32at(0x240), u32at(0x264)));
+                    }
+                    desc[0x1f0..0x1f0 + 0x34].copy_from_slice(payload(0x34))
+                }
                 1 => desc[0x1c4..0x1c4 + 0x2c].copy_from_slice(payload(0x2c)),
                 2 => desc[0x78..0x78 + 0x148].copy_from_slice(payload(0x148)),
                 3 => desc[0x1c0..0x1c4].copy_from_slice(payload(4)),

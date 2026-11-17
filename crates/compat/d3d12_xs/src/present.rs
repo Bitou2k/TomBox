@@ -54,6 +54,40 @@ extern "system" {
     fn ShowWindow(h: *mut c_void, cmd: i32) -> i32;
     fn AdjustWindowRect(r: *mut [i32; 4], style: u32, menu: i32) -> i32;
     fn LoadCursorW(inst: *mut c_void, name: *const u16) -> *mut c_void;
+    fn EnumWindows(cb: unsafe extern "system" fn(*mut c_void, isize) -> i32, l: isize) -> i32;
+    fn GetWindowThreadProcessId(h: *mut c_void, pid: *mut u32) -> u32;
+    fn IsWindowVisible(h: *mut c_void) -> i32;
+    fn GetClientRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
+    fn GetWindow(h: *mut c_void, cmd: u32) -> *mut c_void;
+    fn GetClassNameW(h: *mut c_void, buf: *mut u16, n: i32) -> i32;
+}
+extern "system" {
+    fn GetCurrentProcessId() -> u32;
+}
+
+/// The title's own top-level window: it creates one itself
+/// (`FXboxCommonGDKWindow::Initialize`, EXE+0x10d0dc3 `CreateWindowExW`), so presentation
+/// goes there rather than into a second window. Picks the largest visible, unowned
+/// top-level window of this process.
+unsafe fn find_title_window() -> usize {
+    unsafe extern "system" fn cb(h: *mut c_void, l: isize) -> i32 {
+        let best = &mut *(l as *mut (usize, i64));
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        if pid != GetCurrentProcessId() || IsWindowVisible(h) == 0 || !GetWindow(h, 4 /* GW_OWNER */).is_null() {
+            return 1;
+        }
+        let mut r = [0i32; 4];
+        GetClientRect(h, &mut r);
+        let area = r[2] as i64 * r[3] as i64;
+        if area > best.1 {
+            *best = (h as usize, area);
+        }
+        1
+    }
+    let mut best: (usize, i64) = (0, 0);
+    EnumWindows(cb, &mut best as *mut _ as isize);
+    best.0
 }
 
 #[repr(C)]
@@ -179,12 +213,27 @@ unsafe fn init(queue: *mut c_void, src: *mut c_void) -> Result<State, String> {
         return Err(format!("queue->GetDevice hr={hr:#010x}"));
     }
 
-    // Window scaled to fit a 1280-wide client area, preserving aspect.
-    let cw = 1280i32;
-    let ch = ((height as u64 * 1280) / width).max(1) as i32;
-    let hwnd = create_window(cw, ch);
-    if hwnd == 0 {
-        return Err("CreateWindowExW failed".into());
+    // Present into the title's own window; the swap chain stretches the back buffer to the
+    // client area. Only if the title has no window (or TOMBOX_OWN_WINDOW=1) open our own,
+    // scaled to fit a 1280-wide client area.
+    let mut cw = 1280i32;
+    let mut ch = ((height as u64 * 1280) / width).max(1) as i32;
+    let own = std::env::var("TOMBOX_OWN_WINDOW").map(|v| v == "1").unwrap_or(false);
+    let mut hwnd = if own { 0 } else { find_title_window() };
+    if hwnd != 0 {
+        let mut r = [0i32; 4];
+        GetClientRect(hwnd as *mut c_void, &mut r);
+        (cw, ch) = (r[2], r[3]);
+        let mut cls = [0u16; 128];
+        let n = GetClassNameW(hwnd as *mut c_void, cls.as_mut_ptr(), 128).max(0) as usize;
+        record("d3d12_xs", "PresentX", &format!(
+            "presenting into the title's own window hwnd={hwnd:#x} class='{}' client {cw}x{ch}", String::from_utf16_lossy(&cls[..n])));
+    } else {
+        hwnd = create_window(cw, ch);
+        if hwnd == 0 {
+            return Err("CreateWindowExW failed".into());
+        }
+        record("d3d12_xs", "PresentX", "title window not found (or TOMBOX_OWN_WINDOW=1): presenting into a TomBox host window");
     }
 
     let dxgi = LoadLibraryA(b"dxgi.dll\0".as_ptr());

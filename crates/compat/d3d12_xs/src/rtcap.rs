@@ -123,7 +123,7 @@ fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
         9..=10 => (4, true, 8, "rgba16f"),
         11 => (4, false, 8, "rgba16"),
         15..=16 => (2, true, 8, "rg32f"),
-        19..=22 => (1, true, 8, "d32s8"),
+        19..=22 => (1, true, 4, "d32s8"), // plane 0 of the copy is a 32-bit float
         23..=24 => (4, false, 4, "rgb10a2"),
         26 => (3, true, 4, "r11g11b10f"),
         27..=29 => (4, false, 4, "rgba8"),
