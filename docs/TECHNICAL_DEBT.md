@@ -3,9 +3,15 @@
 Honest ledger. Updated continuously.
 
 ## Incomplete functionality
-- Loader, compat libraries, host services, graphics backend: **not started**.
-- `pe-inspect --json` omits exports, relocations, and TLS from the JSON summary
-  (present in text output). Extend when a consumer needs them.
+- Loader, compat libraries, host services, graphics backend: **not started**
+  (intentionally — these follow the real binary's evidence per ADR-0002).
+- ~~`pe-inspect --json` omits exports, relocations, TLS~~ **RESOLVED**: JSON now
+  includes exports (named+ordinals), relocation type histogram, and TLS summary.
+
+## Independent validation done
+- `pe-inspect` cross-checked against **Microsoft `dumpbin`** on the same binary:
+  machine/sections/magic/entry-point/image-base/subsystem and the full import
+  module list all agree. (CLAUDE.md §3A — compare against independent tools.)
 
 ## Tests that should exist but don't yet
 - Base-relocation parser: a fixture asserting exact block/entry/type counts

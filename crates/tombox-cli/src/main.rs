@@ -365,6 +365,56 @@ fn print_json(path: &str, file_len: usize, pe: &PeFile) {
     }
     out.push_str("],\n");
 
+    // exports (named only, with ordinals)
+    out.push_str("  \"exports\": ");
+    match &pe.exports {
+        None => out.push_str("null,\n"),
+        Some(ex) => {
+            out.push_str("{\n");
+            out.push_str(&format!("    \"dll_name\": {},\n", esc(&ex.dll_name)));
+            out.push_str(&format!("    \"number_of_functions\": {},\n", ex.number_of_functions));
+            out.push_str(&format!("    \"number_of_names\": {},\n", ex.number_of_names));
+            out.push_str(&format!("    \"forwarder_count\": {},\n", ex.forwarders.len()));
+            out.push_str("    \"named\": [");
+            for (j, (n, ord)) in ex.named.iter().enumerate() {
+                out.push_str(&format!("{{\"name\": {}, \"ordinal\": {}}}", esc(n), ord));
+                if j + 1 < ex.named.len() {
+                    out.push_str(", ");
+                }
+            }
+            out.push_str("]\n  },\n");
+        }
+    }
+
+    // relocations summary
+    out.push_str("  \"relocations\": ");
+    match &pe.relocations {
+        None => out.push_str("null,\n"),
+        Some(rel) => {
+            out.push_str(&format!(
+                "{{ \"total_blocks\": {}, \"total_entries\": {}, \"by_type\": [",
+                rel.total_blocks, rel.total_entries
+            ));
+            for (j, (t, n)) in rel.by_type.iter().enumerate() {
+                out.push_str(&format!("{{\"type\": {t}, \"count\": {n}}}"));
+                if j + 1 < rel.by_type.len() {
+                    out.push_str(", ");
+                }
+            }
+            out.push_str("] },\n");
+        }
+    }
+
+    // tls
+    out.push_str("  \"tls\": ");
+    match &pe.tls {
+        None => out.push_str("null,\n"),
+        Some(tls) => out.push_str(&format!(
+            "{{ \"address_of_callbacks\": {}, \"callback_count\": {}, \"size_of_zero_fill\": {} }},\n",
+            tls.address_of_callbacks, tls.callback_count, tls.size_of_zero_fill
+        )),
+    }
+
     out.push_str(&format!("  \"notes\": {}\n", notes_json(&pe.notes.0)));
     out.push_str("}\n");
     print!("{out}");
