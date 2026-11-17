@@ -97,3 +97,17 @@ Honest ledger. Updated continuously.
 - **XALLOC_ATTRIBUTES** bit layout is recalled from the public XDK header and matches the two
   attribute values seen; not checked against a header in this repo. Page size / memory type
   fields are ignored.
+
+## Network redirect mode (2026-11-17)
+
+- Policy (owner's instruction): traffic may leave the machine only towards
+  `horizon.halcy0n.net`; never Epic. Enforced in-process only — no OS firewall rule.
+- Not covered: `ConnectEx` to a literal IP, any resolver path that bypasses the hooked
+  ws2_32 / WinHTTP exports, other processes.
+- The Host header and TLS server name become the redirect host; the originally requested
+  host name is not forwarded to the server (the server cannot tell which Epic service a
+  request was meant for except by path).
+- Non-WinHTTP TLS clients in the title (if any) will see a certificate for the redirect
+  host while expecting another name; untested.
+- Literal-IP destinations other than loopback / the redirect host's addresses are refused,
+  including LAN addresses.

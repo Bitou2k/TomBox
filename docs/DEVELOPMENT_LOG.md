@@ -610,3 +610,31 @@ the expected outcome with the network guard on.
 **Not yet true:** no text (font glyph textures are not arriving — path not yet identified);
 no input, no audio; unmapped streamed mips are skipped (re-tried every frame); command-list
 slots 67/68/83 are still no-ops; device slot 74 still a logging stub.
+
+## 2026-11-17 (night) — text, texture copies, network redirect
+
+**Command-list slots.** Xbox 83 = `CopyTextureRegion` + one trailing argument (always 0 at
+`FD3D12TextureBase::UpdateTexture` and `FD3D12RHICommandInitializeTexture`), forwarded to PC
+slot 16; Xbox 68 = `OMSetDepthBounds` (PC slot 62, inferred from the state cache's two
+depth-bound floats); Xbox 67 = texture-cache flush, deliberate no-op. With the copies
+forwarded the font atlas fills in: the title screen now shows "UNABLE TO COMPLETE LOGIN.
+PLEASE TRY AGAIN LATER.", RETRY and "v14.50 (14617919)"
+(`analysis/evidence/2026-11-17_title_screen_text.png`).
+
+**Network policy change (project owner's instruction, 2026-11-17):** network traffic is now
+allowed, but must go to the owner's own server `horizon.halcy0n.net`, never to Epic.
+`compat-common::net_guard` gained a redirect mode (`TOMBOX_NET_REDIRECT=<host>`, set by
+`tools/dev/iter.sh`): every requested host name is replaced by the redirect host in the
+resolver calls and `WinHttpConnect`; outbound sockets are allowed only to loopback or an
+address the redirect host resolves to; an entry point that cannot be trampolined fails
+closed. Without the variable the guard is deny-all as before. Offline test:
+`cargo test -p compat-common --test net_redirect`.
+
+**Verified in one run:** guard logs `REDIRECT mode ... 12/12 entry points hooked`,
+`'horizon.halcy0n.net' -> 4 address(es)`, five `WinHttpConnect 'datarouter.ol.epicgames.com'
+-> 'horizon.halcy0n.net'` rewrites, no denied destinations, and the title logs one WinHTTP
+request `State=[Succeeded]`.
+
+**Login still fails before any login request is sent:** the GDK layer reports no signed-in
+user (`LogGDKSaveGame: User -1 is not valid`, `no AuthToken stored for ControllerId -1`).
+Next: find what answers the XUser calls today and what a sign-in needs.

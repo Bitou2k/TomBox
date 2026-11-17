@@ -11,6 +11,9 @@ for d in acphal d3d12_xs dxcompiler_xs mfplat xcrdapi xmem; do
   cp "target/release/$d.dll" "$BIN/$d.dll" || echo "LOCKED $d"
 done
 rm -rf /c/Users/drych/AppData/Local/Temp/tombox_shaders
+# Network policy: every host the title asks for is redirected to the project owner's server
+# (never Epic). Unset TOMBOX_NET_REDIRECT to fall back to deny-all.
+export TOMBOX_NET_REDIRECT="${TOMBOX_NET_REDIRECT-horizon.halcy0n.net}"
 export TOMBOX_LOG="C:/Users/drych/AppData/Local/Temp/tombox_g.log"; rm -f "$TOMBOX_LOG"
 MDBG_LIMIT=${1:-240} timeout $((${1:-240}+30)) "$SB/mdbg.exe" "G:/FortniteGame/Binaries/XSX/FortniteClient-XSX-Shipping.exe" -unattended > "$SB/run.txt" 2>&1
 grep -aE "shader_xlat FAIL|PSO_X (.*FAIL)|PSO_X untrans" "$TOMBOX_LOG" | cut -c15-240 | tail -5

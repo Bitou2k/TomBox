@@ -8,3 +8,7 @@ license = "MIT OR Apache-2.0"
 [lib]
 name = "compat_common"
 path = "src/lib.rs"
+
+[dependencies]
+# Relocates displaced prologue instructions when hooking network entry points (net_guard).
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
