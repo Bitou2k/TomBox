@@ -842,3 +842,23 @@ Result: scene colour max 0.66–0.69 on all three channels; the lobby shows the 
 blue backdrop and floor pads with plausible tones. **Still wrong** (screenshot kept locally):
 the character is not visible; white rectangles flicker in the upper part of the image
 (bloom-chain targets contain infinities); the floor centre is very bright.
+
+## 2026-11-17 (night) — Character missing from depth: vertex inputs are packed by *read* registers
+
+With lighting sane, the capture showed the G-buffer with the fully textured character but a
+scene depth without it, so later passes shaded those pixels as background.
+
+The skinned depth-only vertex shader (`d15c18830a4616f9`) multiplies v8..v11 by 3 and uses
+them as bone-matrix row indices, v16..v19 as weights and v24..v26 as a float vector. Its
+input signature is ATTRIBUTE0,1,2,3,14,4,15,5,13 with read masks 0 for ATTRIBUTE1, 2 and 5.
+The translator placed input register *r* at v[4+4r], which put the bone indices at v16. The
+code only fits if the fetch shader hands over one group of four VGPRs per input register
+that the shader reads, in order, skipping unread ones (ATTRIBUTE3 → v8, ATTRIBUTE14 → v12,
+ATTRIBUTE4 → v16, ATTRIBUTE15 → v20, ATTRIBUTE13 → v24). A second shader with a different
+skip pattern (`54ecf3051dfb9659`: only ATTRIBUTE1 and 5 unread, bone indices used from v12)
+fits the same rule. Base-pass shaders read every input, which is why they worked.
+
+Result: the character is in scene depth and appears in the lobby with correct occlusion
+(screenshot kept locally). **Still wrong:** it is almost unlit (dark silhouette), a white
+rectangle flickers in the upper part of the image (infinities in the bloom chain), and the
+floor centre is over-bright.

@@ -3778,7 +3778,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(h, "}};\nSOut main(SIn i) {{\n    SOut o = (SOut)0;");
         }
         let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
-        // Vertex attributes arrive in v[4 + 4*register + component] after the fetch call.
+        // Vertex attributes arrive after the fetch call in consecutive groups of four VGPRs
+        // from v4, one group per input register the shader reads. A register none of whose
+        // elements is read (read mask 0 in the input signature) gets no group: in the skinned
+        // depth-only shader d15c18830a4616f9 ATTRIBUTE1/2 (tangents) are unread and the bone
+        // indices of ATTRIBUTE3 arrive in v8..v11, not v16..v19.
         let mut init = String::new();
         if self.is_gs {
             // GS entry ABI (from WriteToSliceMainGS): s3 carries the wave's primitive count in
@@ -3807,9 +3811,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(init, "    s3 = 0x100u; v0 = 0x04000000u; v1 = 0x800u;");
         }
         if !is_ps && !self.is_gs {
+            let mut group = 0usize;
             for reg in distinct_regs(ex.input_sig.iter().filter(|e| e.sysval == 0)) {
+                let read = ex.input_sig.iter().any(|e| e.sysval == 0 && e.register == reg && e.rw_mask != 0);
+                if ex.stage == Stage::Vertex && !read {
+                    continue;
+                }
+                let first = if ex.stage == Stage::Vertex { 4 + 4 * group } else { 4 + 4 * reg as usize };
+                group += 1;
                 for c in 0..4usize {
-                    let v = format!("v{}", 4 + 4 * reg as usize + c);
+                    let v = format!("v{}", first + c);
                     self.regs.insert(v.clone());
                     let val = match sig_lookup(&ex.input_sig, reg, c) {
                         Some((ei, k)) => {

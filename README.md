@@ -59,8 +59,9 @@ Verified on one machine (Windows 11, x64) with the Fortnite build above:
 ## Known problems
 
 - **3D rendering is incorrect.** The lobby stage, backdrop and floor now render with plausible
-  tones, but the character is not visible, white rectangles flicker in the upper part of the
-  picture (infinities in the bloom chain) and the floor centre is too bright.
+  tones and the character is in place, but it is almost unlit (a dark silhouette), a white
+  rectangle flickers in the upper part of the picture (infinities in the bloom chain) and the
+  floor centre is too bright.
 - **A shader that fails to compile is fatal.** Every shader now translates, but if the
   generated HLSL for one does not compile, pipeline creation fails and the engine exits.
 - **First-time shader compiles are slow** (FXC took up to minutes; DXC about a second, not yet measured in the game) and
