@@ -198,6 +198,8 @@ struct Emitter<'a> {
     sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
+    /// Inferred integer element type of typed buffers: (is_uav, slot) -> 1 uint, 2 sint.
+    tbuf_ty: BTreeMap<(bool, u32), u8>,
     is_cs: bool,
     /// Nesting depth of emitted HLSL loops at the current instruction.
     loop_depth: u32,
@@ -454,6 +456,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         sbuf: BTreeMap::new(),
         tbuf: BTreeSet::new(),
         tbuf_uint: BTreeSet::new(),
+        tbuf_ty: BTreeMap::new(),
         is_cs: ex.stage == Stage::Compute,
         is_gs: ex.stage == Stage::Geometry,
         uses_lds: false,
@@ -492,6 +495,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         }
     }
     em.resolve_resources()?;
+    em.infer_tbuf_types();
     let live_in = em.live_in();
     em.live = live_in.clone();
     em.emit_body(is_ps)?;
@@ -686,6 +690,139 @@ impl<'a> Emitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Element type of each typed buffer, inferred from how the shader uses the values it
+    /// loads from (or produces for) the buffer. The buffer view's format is not part of the
+    /// shader: the hardware delivers floats for float/normalised formats and integers for
+    /// integer formats, and the compiled code simply goes on to treat the registers as one
+    /// or the other. HLSL needs the element type declared, so it is recovered from the
+    /// first typed uses: conversions from / comparisons as / arithmetic on integers or
+    /// floats, and use as a memory index. Bitwise logic and moves are followed, not counted.
+    /// Slots with no evidence, or more float than integer evidence, stay float.
+    fn infer_tbuf_types(&mut self) {
+        // 0 float, 1 uint, 2 sint
+        fn class(mn: &str) -> Option<u8> {
+            let m = mn.strip_suffix("_e64").unwrap_or(mn);
+            if let Some(rest) = m.strip_prefix("v_cvt_") {
+                let last = rest.rsplit('_').next().unwrap_or("");
+                return Some(if last.starts_with('f') { 0 } else if last.starts_with('i') { 2 } else { 1 });
+            }
+            if m.starts_with("v_cmp") {
+                return if m.contains("_f") { Some(0) } else if m.contains("_i") { Some(2) } else if m.contains("_u") { Some(1) } else { None };
+            }
+            const SINT: [&str; 7] = ["v_ashr", "v_max_i", "v_min_i", "v_bfe_i", "v_mul_i32", "v_mad_i32", "v_mul_hi_i"];
+            const UINT: [&str; 14] = [
+                "v_lshl", "v_lshr", "v_bfe_u", "v_mul_lo", "v_mul_hi_u", "v_mul_u32", "v_mad_u32", "v_add_nc", "v_sub_nc", "v_subrev_nc", "v_add_co", "v_sub_co",
+                "v_max_u", "v_min_u",
+            ];
+            if SINT.iter().any(|p| m.starts_with(p)) {
+                return Some(2);
+            }
+            if UINT.iter().any(|p| m.starts_with(p)) {
+                return Some(1);
+            }
+            if m.starts_with("v_") && (m.contains("_f32") || m.contains("_f16") || m.contains("_f64")) {
+                return Some(0);
+            }
+            None
+        }
+        fn follows(mn: &str) -> bool {
+            ["v_mov_b32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_cndmask_b32", "v_not_b32"].iter().any(|p| mn.starts_with(p))
+        }
+        let mut votes: BTreeMap<(bool, u32), [u32; 3]> = BTreeMap::new();
+        // (stored-to buffer, loaded-from buffer): a store of registers loaded from another
+        // typed buffer says both hold the same kind of element.
+        let mut links: Vec<((bool, u32), (bool, u32))> = Vec::new();
+        let n = self.insns.len();
+        for i in 0..n {
+            let Some(Res::TBuf(slot, is_uav)) = self.res.get(&i).and_then(|v| v.first()).copied() else { continue };
+            let ins = &self.insns[i];
+            let comps = match ins.mnemonic.rsplit('_').next() {
+                Some("x") => 1u8,
+                Some("xy") => 2,
+                Some("xyz") => 3,
+                Some("xyzw") => 4,
+                _ => continue,
+            };
+            let Some(&Opnd::Vgpr(vd)) = ins.dst.first() else { continue };
+            let regs: BTreeSet<u8> = (0..comps).map(|k| vd.wrapping_add(k)).collect();
+            let v = votes.entry((is_uav, slot)).or_insert([0; 3]);
+            if ins.mnemonic.starts_with("buffer_load") {
+                // Forward: how are the loaded registers (and plain copies / masks of them) used?
+                let mut live = regs;
+                for j in i + 1..n {
+                    if live.is_empty() {
+                        break;
+                    }
+                    let u = &self.insns[j];
+                    // The scan is linear: past an unconditional branch (or the program end)
+                    // the following code belongs to another path.
+                    if u.enc == Enc::Sopp && (u.op == 1 || u.op == 2) {
+                        break;
+                    }
+                    let uses = u.src.iter().any(|o| matches!(o, Opnd::Vgpr(r) if live.contains(r)));
+                    let mem_index = matches!(u.enc, Enc::Mubuf | Enc::Mimg | Enc::Ds) && matches!(u.src.first(), Some(Opnd::Vgpr(r)) if live.contains(r));
+                    if mem_index && u.enc == Enc::Mimg && (u.mnemonic.starts_with("image_sample") || u.mnemonic.starts_with("image_gather")) {
+                        // Sampling coordinates are floats; only texel fetches index by integer.
+                        v[0] += 1;
+                    } else if mem_index && !(u.mnemonic.contains("store") && matches!(u.enc, Enc::Mubuf)) {
+                        v[1] += 1;
+                    } else if uses {
+                        if let Some(c) = class(&u.mnemonic) {
+                            v[c as usize] += 1;
+                        }
+                    }
+                    let carry = uses && follows(&u.mnemonic);
+                    for d in &u.dst {
+                        if let Opnd::Vgpr(r) = d {
+                            if carry {
+                                live.insert(*r);
+                            } else if !matches!(u.enc, Enc::Mubuf | Enc::Ds | Enc::Exp) || u.mnemonic.contains("load") || u.mnemonic.contains("read") {
+                                live.remove(r);
+                            }
+                        }
+                    }
+                }
+            } else if ins.mnemonic.starts_with("buffer_store") {
+                // Backward: what produced each stored register?
+                for r in regs {
+                    for j in (0..i).rev() {
+                        let d = &self.insns[j];
+                        if d.dst.iter().any(|o| matches!(o, Opnd::Vgpr(x) if *x == r)) {
+                            if let Some(Res::TBuf(s2, u2)) = self.res.get(&j).and_then(|v| v.first()).copied() {
+                                if d.mnemonic.starts_with("buffer_load") {
+                                    links.push(((is_uav, slot), (u2, s2)));
+                                    break;
+                                }
+                            }
+                            // A conversion's result type is its first type token.
+                            let c = match d.mnemonic.strip_prefix("v_cvt_") {
+                                Some(rest) => Some(if rest.starts_with('f') { 0 } else if rest.contains("i32") || rest.contains("i16") { 2 } else { 1 }),
+                                None => class(&d.mnemonic),
+                            };
+                            if let Some(c) = c {
+                                v[c as usize] += 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for (k, v) in &votes {
+            let ints = v[1] + v[2];
+            if ints > v[0] {
+                self.tbuf_ty.insert(*k, if v[2] > 0 { 2 } else { 1 });
+            }
+        }
+        for (to, from) in links {
+            if votes.get(&to).map(|v| v.iter().all(|&x| x == 0)).unwrap_or(true) {
+                if let Some(&t) = self.tbuf_ty.get(&from) {
+                    self.tbuf_ty.insert(to, t);
+                }
+            }
+        }
     }
 
     /// Resource a MUBUF instruction addresses when its descriptor is `slot` of `table`
@@ -2749,13 +2886,34 @@ impl<'a> Emitter<'a> {
                         c.push("0.0".into());
                     }
                 }
-                self.line(&format!("if (exec_lo & 1u) {nm}[{index}] = float4({});", c.join(", ")));
+                match self.tbuf_ty.get(&(is_uav, slot)) {
+                    Some(t) => {
+                        let mut c = vec![];
+                        for k in 0..4u8 {
+                            c.push(if k < n { r(&Opnd::Vgpr(vd + k))? } else { "0u".into() });
+                        }
+                        let ctor = if *t == 2 { "int4" } else { "uint4" };
+                        self.line(&format!("if (exec_lo & 1u) {nm}[{index}] = {ctor}({});", c.join(", ")));
+                    }
+                    None => self.line(&format!("if (exec_lo & 1u) {nm}[{index}] = float4({});", c.join(", "))),
+                }
             } else {
                 let t = self.tmp;
                 self.tmp += 1;
-                self.line(&format!("float4 t{t} = {nm}[{index}];"));
+                let ety = match self.tbuf_ty.get(&(is_uav, slot)) {
+                    Some(2) => "int4",
+                    Some(_) => "uint4",
+                    None => "float4",
+                };
+                self.line(&format!("{ety} t{t} = {nm}[{index}];"));
                 for k in 0..n {
-                    self.wv(&Opnd::Vgpr(vd + k), &format!("asuint(t{t}.{})", XYZW[k as usize]))?;
+                    let c = XYZW[k as usize];
+                    let e = match ety {
+                        "float4" => format!("asuint(t{t}.{c})"),
+                        "int4" => format!("(uint)t{t}.{c}"),
+                        _ => format!("t{t}.{c}"),
+                    };
+                    self.wv(&Opnd::Vgpr(vd + k), &e)?;
                 }
             }
             return Ok(());
@@ -3447,10 +3605,17 @@ impl<'a> Emitter<'a> {
         for (is_uav, slot) in &self.tbuf {
             let _ = if *is_uav && self.tbuf_uint.contains(slot) {
                 writeln!(h, "RWBuffer<uint> utb{slot} : register(u{slot});")
-            } else if *is_uav {
-                writeln!(h, "RWBuffer<float4> utb{slot} : register(u{slot});")
             } else {
-                writeln!(h, "Buffer<float4> stb{slot} : register(t{slot});")
+                let e = match self.tbuf_ty.get(&(*is_uav, *slot)) {
+                    Some(2) => "int4",
+                    Some(_) => "uint4",
+                    None => "float4",
+                };
+                if *is_uav {
+                    writeln!(h, "RWBuffer<{e}> utb{slot} : register(u{slot});")
+                } else {
+                    writeln!(h, "Buffer<{e}> stb{slot} : register(t{slot});")
+                }
             };
         }
         for (slot, dim) in &self.uav {

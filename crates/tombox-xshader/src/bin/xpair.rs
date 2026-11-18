@@ -88,6 +88,105 @@ fn load(path: &str, file_idx: usize) -> Vec<Rec> {
     out
 }
 
+/// `--decls`: for every uniquely keyed pair, compare the resource declarations the PC
+/// compiler recorded with the ones the translator inferred for the Xbox shader.
+#[derive(Default)]
+struct DeclStats {
+    pairs: usize,
+    no_pc_decls: usize,
+    translate_failed: usize,
+    clean: usize,
+    /// Same kinds per register class, at different slots.
+    permuted: usize,
+    /// Slot-independent difference (pc-only kinds / xbox-only kinds) -> (count, example).
+    sets: std::collections::BTreeMap<String, (usize, String)>,
+    /// difference description -> (shaders showing it, first example)
+    kinds: std::collections::BTreeMap<String, (usize, String)>,
+}
+
+impl DeclStats {
+    fn add(&mut self, xc: &[u8], pc: &[u8], freq: u8) {
+        use tombox_xshader::decls::{compare, from_dxbc, from_generated_hlsl, Diff, Kind};
+        let ordinal = self.pairs;
+        self.pairs += 1;
+        let Some(r) = from_dxbc(pc) else {
+            self.no_pc_decls += 1;
+            return;
+        };
+        let Some(t) = tombox_xshader::extract(xc).ok().and_then(|ex| tombox_xshader::hlsl::translate(&ex).ok()) else {
+            self.translate_failed += 1;
+            return;
+        };
+        let x = from_generated_hlsl(&t.hlsl);
+        let d = compare(&r, &x);
+        if d.is_empty() {
+            self.clean += 1;
+            return;
+        }
+        let show = |k: &Kind| match k {
+            Kind::ConstantBuffer(_) => "cbuffer".to_string(),
+            Kind::Sampler { comparison } => if *comparison { "sampler_cmp" } else { "sampler" }.to_string(),
+            Kind::Typed { dim, ty } => format!("{dim}<{}>", if *ty == "float" { "float" } else { "int" }),
+            Kind::Structured(n) => format!("structured[{n}]"),
+            Kind::Raw => "raw".to_string(),
+        };
+        // Slot-independent view: the two compilers assign registers independently, so a
+        // pure slot permutation is not a translation fault.
+        let bag = |d: &tombox_xshader::decls::ShaderDecls| {
+            let mut v: Vec<String> = d.res.iter().map(|(k, v)| format!("{}:{}", k.0, show(v))).collect();
+            v.sort();
+            v
+        };
+        let (mut pb, mut xb) = (bag(&r), bag(&x));
+        let mut i = 0;
+        while i < pb.len() {
+            match xb.iter().position(|e| *e == pb[i]) {
+                Some(j) => {
+                    xb.remove(j);
+                    pb.remove(i);
+                }
+                None => i += 1,
+            }
+        }
+        if pb.is_empty() && xb.is_empty() {
+            self.permuted += 1;
+        } else {
+            let e = self.sets.entry(format!("pc only [{}]  xbox only [{}]", pb.join(" "), xb.join(" "))).or_insert((0, format!("stage {freq} pair #{ordinal}")));
+            e.0 += 1;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for x in d {
+            let s = match &x {
+                Diff::MissingInTranslation(c, k) => format!("{c}: pc {} / xbox none", show(k)),
+                Diff::ExtraInTranslation(c, k) => format!("{c}: pc none / xbox {}", show(k)),
+                Diff::Mismatch(c, a, b) if matches!(a, Kind::ConstantBuffer(_)) => format!("{c}: xbox {} larger than pc", show(b)),
+                Diff::Mismatch(c, a, b) => format!("{c}: pc {} / xbox {}", show(a), show(b)),
+                Diff::Threads => "thread group size".to_string(),
+            };
+            if seen.insert(s.clone()) {
+                let e = self.kinds.entry(s).or_insert((0, format!("stage {freq} pair #{ordinal}")));
+                e.0 += 1;
+            }
+        }
+    }
+    fn report(&self) {
+        println!("unique pairs: {}  pc declarations unreadable: {}  xbox translate failed: {}", self.pairs, self.no_pc_decls, self.translate_failed);
+        println!("declarations agree: {}  differ: {}", self.clean, self.pairs - self.no_pc_decls - self.translate_failed - self.clean);
+        let mut v: Vec<_> = self.kinds.iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (k, (n, ex)) in v {
+            println!("{n:>7}  {k}   (e.g. {ex})");
+        }
+        println!("
+slot-independent: {} differ only in slot assignment; {} differ in kind:", self.permuted, self.sets.values().map(|v| v.0).sum::<usize>());
+        let mut v: Vec<_> = self.sets.iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (k, (n, ex)) in v.iter().take(60) {
+            println!("{n:>7}  {k}   (e.g. {ex})");
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
@@ -98,10 +197,16 @@ fn main() {
     // hashes in order + signatures) is unique on both sides as x_<k>.dxbc / p_<k>.dxbc.
     let mut files: Vec<String> = Vec::new();
     let (mut pairs_dir, mut stage, mut limit) = (None, None, 50usize);
+    let mut decls = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--pairs" => pairs_dir = it.next().cloned(),
+            "--decls" => {
+                decls = true;
+                pairs_dir = Some(String::new());
+                limit = usize::MAX;
+            }
             "--stage" => stage = it.next().and_then(|v| v.parse::<u8>().ok()),
             "--limit" => limit = it.next().and_then(|v| v.parse().ok()).unwrap_or(50),
             _ => files.push(a.clone()),
@@ -123,8 +228,11 @@ fn main() {
         let mut mp: HashMap<Vec<u8>, Vec<&Rec>> = HashMap::new();
         xb.iter().for_each(|r| mx.entry(key(r)).or_default().push(r));
         pc.iter().for_each(|r| mp.entry(key(r)).or_default().push(r));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        if !decls {
+            std::fs::create_dir_all(&dir).expect("mkdir");
+        }
         let mut n = 0;
+        let mut stats = DeclStats::default();
         let mut keys: Vec<&Vec<u8>> = mx.keys().collect();
         keys.sort();
         for k in keys {
@@ -135,12 +243,20 @@ fn main() {
                 continue;
             }
             let (Some(xc), Some(pcc)) = (container(&files, x[0]), container(&files, p[0])) else { continue };
+            if decls {
+                stats.add(&xc, &pcc, x[0].freq);
+                continue;
+            }
             std::fs::write(format!("{dir}/x_{n}.dxbc"), xc).expect("write");
             std::fs::write(format!("{dir}/p_{n}.dxbc"), pcc).expect("write");
             n += 1;
             if n >= limit {
                 break;
             }
+        }
+        if decls {
+            stats.report();
+            return;
         }
         println!("wrote {n} unique pairs to {dir}");
         return;

@@ -735,3 +735,41 @@ disassembly (`fxc /dumpbin`, 17 instructions) and the translation of the Xbox sh
 instruction for instruction: same thread-ID math, same constant-buffer elements, same
 texture/sampler/UAV slots and component selections, same store. One shader, read by eye —
 evidence that pairing and register slots line up, not a general correctness claim.
+
+## 2026-11-17 — Declarations compared against the PC reference; typed-buffer element types
+
+New: `decls` module (resource declarations from a PC SM5 `SHEX` chunk, and from generated
+HLSL) and `xpair --decls`, which compares the two for every pair whose key is unique on
+both sides and non-trivial (4,553 pairs; the 11,7xx figure above counted Xbox entries with
+one PC candidate, not uniqueness on both sides).
+
+First run (translator as committed in 07dae65):
+
+* 2,371 pairs agree register for register; 565 differ only in which slot a resource got
+  (the two compilers assign registers independently — binding slots are **not** generally
+  identical across platforms, correcting the impression from the three compute pairs).
+* ~1,400 differ in whole sampler+texture units or constant buffers present on one side
+  only. Read as: the pairing key does not identify the same material/permutation, or the
+  versions differ. These pairs are not usable as references without a stricter key.
+* Clear translator fault: ~250 pairs where the PC declares `Buffer<int>`/`Buffer<uint>`
+  and the translation declared `Buffer<float4>` (mostly vertex shaders). A float-declared
+  read of an integer-format view is undefined in D3D12.
+
+Fix: `infer_tbuf_types` recovers the element type of each typed buffer from the first
+typed use of loaded registers (conversions, comparisons, integer/float arithmetic, use as
+a memory index; texture *sampling* coordinates count as float, fetches as integer), follows
+moves and bitwise logic, stops at unconditional branches, and propagates through direct
+buffer-to-buffer copies. Signedness is not reliably recoverable: integer buffers are
+declared `uint4` unless a signed operation is seen; the comparison treats sint/uint as
+equal.
+
+After the fix: 2,576 pairs agree; integer/float disagreements at the same register: 7
+(6 + 1), all of them in pairs whose slots are permuted (both sides have the same set of
+kinds). Two intermediate versions over-inferred (233, then 139 float buffers marked
+integer) because the scan ran across unconditional branches and counted sampling
+coordinates as integer indices — both found through this comparison.
+
+Checked: the 36 shaders among the first 70 pairs that now declare integer buffers compile
+with DXC (vs_6_0); `xpso` accepts the LightGridCompactCS pair (all five buffers now match
+the PC types). Not checked: behaviour in the game (new `d3d12_xs.dll` staged, not run).
+No fixture added: the evidence needs the game archives, which stay out of the repository.

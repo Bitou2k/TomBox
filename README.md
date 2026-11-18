@@ -66,7 +66,9 @@ Verified on one machine (Windows 11, x64) with the Fortnite build above:
   can trip the engine's stall watchdog the first time a screen is opened. Compiled shaders
   are cached, so a given shader stalls at most once.
 - **Approximations in translated shaders**: texture lookups inside shader loops always use
-  the sharpest mip; typed buffers are assumed to hold floats unless used atomically.
+  the sharpest mip; whether a typed buffer holds floats or integers is inferred from how
+  the shader uses it (checked against a PC build's declarations, not exact); typed
+  textures are always assumed float.
 - **Texture mirroring is polling-based**: changes are detected by hashing game memory each
   frame; mips the game has not streamed in yet are left undefined.
 - **Window**: the image is stretched to the window, so resizing it to a non-16:9 shape

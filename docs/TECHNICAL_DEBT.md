@@ -68,8 +68,16 @@ Honest ledger. Updated continuously.
 
 ## Shader translator (tombox-xshader) — unverified assumptions
 
-* Typed buffers are declared `float4` (or `uint` when used atomically); the real view format
-  is not visible to the shader.
+* Typed-buffer element type (float vs integer) is inferred from use (`infer_tbuf_types`):
+  linear scan, majority vote, float when there is no evidence. Agrees with the PC build's
+  declarations on the comparable pairs (`xpair --decls`), but it is a heuristic. Signed vs
+  unsigned is not recovered reliably (declared `uint4` unless a signed operation is seen);
+  a `uint` declaration over an `SINT` view is formally a type mismatch in D3D12.
+* Typed *textures* are always declared float; the PC reference shows a few `Texture2D<uint>`
+  / `Texture3D<uint>` (7 of 4,553 pairs) that are therefore wrong.
+* Register slots differ between the Xbox and PC compilers in a sizeable share of shaders, and
+  the pairing key (stage + layout hashes + signature names) often pairs different
+  permutations; reference comparison by execution needs a stricter key.
 * Indexed constant-buffer arrays assume a 16-byte element stride.
 * Compute thread-group id registers are assumed to follow the user-data SGPRs.
 * PS entry ABI assumes perspective-centre barycentrics in v0/v1 and position in v2..v5.
