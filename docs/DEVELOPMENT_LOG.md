@@ -899,3 +899,15 @@ samples of 639,600 and includes floor and character; no white rectangles in this
 **Still wrong / unverified:** the character is very dark (direct lighting not yet examined
 after these fixes); whether the scene matches the real console output is unknown — there is
 no reference image of this lobby.
+
+### Follow-up, same session: why the character is dark
+
+Instrumenting the full-screen directional light (`a06ce28faeb9dc00`): pre-exposure ≈ 1.1,
+light colour ≈ (2.9, 2.6, 2.2) — both plausible — but the shader's result is ≈ 0 on every
+pixel. The light-attenuation (shadow mask) target has its blue channel at 0 on the floor
+and the character and 1 elsewhere; that channel is written with MIN blending by the
+per-object shadow projection shader `d2397579fc2ea0fa` (and red/green by `24915c8b11bee1f2`).
+Both do percentage-closer filtering with `image_gather4_lz_o` against the D16 shadow atlas.
+So the lights are being shadowed out. Not yet determined: whether the shadow atlas content
+or the projection/compare is wrong. The capture tool decodes D16 targets as half floats, so
+the atlas cannot be read from the current reports (fix the decoder first).
