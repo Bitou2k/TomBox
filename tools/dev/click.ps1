@@ -20,7 +20,7 @@ public static class TbClick {
         IntPtr found = IntPtr.Zero;
         EnumWindows((h, l) => { var sb = new StringBuilder(256); GetClassName(h, sb, 256);
             var tt = new StringBuilder(256); GetWindowText(h, tt, 256);
-            if (sb.ToString() == "TomBoxHostWindow" || (tt.ToString() == "Fortnite" && IsWindowVisible(h))) { found = h; return false; } return true; }, IntPtr.Zero);
+            if (sb.ToString() == "TomBoxHostWindow" || (tt.ToString().Trim() == "Fortnite" && IsWindowVisible(h))) { found = h; return false; } return true; }, IntPtr.Zero);
         return found;
     }
 }

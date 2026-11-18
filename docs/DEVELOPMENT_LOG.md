@@ -773,3 +773,35 @@ Checked: the 36 shaders among the first 70 pairs that now declare integer buffer
 with DXC (vs_6_0); `xpso` accepts the LightGridCompactCS pair (all five buffers now match
 the PC types). Not checked: behaviour in the game (new `d3d12_xs.dll` staged, not run).
 No fixture added: the evidence needs the game archives, which stay out of the repository.
+
+## 2026-11-17 (night) — Lobby: empty scene depth traced to swapped MUBUF opcodes
+
+Run with the typed-buffer inference: lobby looked unchanged. Render-target capture
+(`TOMBOX_RTCAP=1`) at the lobby:
+
+* G-buffer targets contain the character and floor, correctly shaded, in the top-left
+  1600x900 of the 3200x1800 targets (the title renders at 50% dynamic resolution).
+* Scene depth (D32S8 3200x1800): 1 non-zero sample of 639,600. Derived-PSO depth state
+  shows the base pass tests GREATER_EQUAL with depth writes **off** and a separate
+  depth-only pass (no colour target) writes depth — so an empty depth buffer means the
+  depth pre-pass draws nothing visible, and everything after it (fog, lighting, post)
+  treats each pixel as infinitely far.
+
+Translating the dumped depth-only vertex shader (position-only stream + primitive id →
+`StructuredBuffer` of per-primitive transforms) showed impossible code: a 4-dword buffer
+load into v0..v3 immediately followed by a load indexed by v3, and the same pattern with
+v10..v13. The ISA only makes sense if those loads write three registers. The MUBUF opcode
+table had 0x0e/0x0f (and 0x1e/0x1f for stores) the wrong way round: on this hardware
+generation 0x0e is `dwordx4` and 0x0f is `dwordx3`. Evidence: destination spacing in the
+same shader (0x0f loads into v13, v16, v19 — three apart; the one 0x0e load into v9 leaves
+four registers before v13). The store pair was swapped by analogy with the load pair and
+the public LLVM opcode order; no store has been examined.
+
+Result (same procedure, driven to the lobby by script): depth has 160,200 non-zero samples
+of 639,600 — the whole rendered quarter. The lobby now shows the backdrop, stage, slot
+markers and particles (screenshot kept locally, not committed).
+**Still wrong:** the image is heavily over-exposed (white character and floor, blue cast).
+
+Tooling fixes: `mouse.ps1`/`capture.ps1`/`click.ps1` looked for a window titled exactly
+"Fortnite" (the title has trailing spaces) and could not take the foreground from a
+background shell; both fixed, `drive_lobby.sh` works unattended again.
