@@ -687,6 +687,34 @@ unsafe fn register_pso(pso: *mut c_void, mut desc: Vec<u8>, shaders: Vec<std::sy
     pso_registry().lock().unwrap().insert(pso as usize, rec);
 }
 
+/// For the diagnostic draw trace: (translated VS pointer, translated PS pointer, state text).
+pub fn pso_summary(pso: usize) -> Option<(usize, usize, String)> {
+    let rec = pso_registry().lock().unwrap().get(&pso).cloned()?;
+    let d = &rec.desc;
+    let q = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap()) as usize;
+    let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    // D3D12_BLEND_DESC at 0x78: AlphaToCoverage, IndependentBlend, then RT0 {BlendEnable, LogicOpEnable, Src, Dest, Op, SrcA, DestA, OpA, LogicOp, WriteMask}
+    let state = format!("depth(en={} write={} func={}) blend0(en={} src={} dst={} op={} srcA={} dstA={} mask={:#x}) nRT={}",
+        u(0x1f0), u(0x1f4), u(0x1f8), u(0x80), u(0x88), u(0x8c), u(0x90), u(0x94), u(0x98), d[0xa4], u(0x240));
+    Some((q(0x08), q(0x18), state))
+}
+
+/// CreateRenderTargetView (20) / CreateDepthStencilView (21): forwarded unchanged; the
+/// (descriptor handle -> resource) pair is remembered for the diagnostic draw trace.
+unsafe extern "system" fn create_rtv_traced(this: *mut DeviceWrapper, res: *mut c_void, pdesc: *const u8, dest: usize) {
+    let real = unsafe { (*this).real };
+    let inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
+    crate::rtcap::note_view(dest, res as usize, unsafe { inc(real, 2) } as usize);
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(*real_vtbl(real).add(20)) };
+    unsafe { f(real, res, pdesc, dest) }
+}
+unsafe extern "system" fn create_dsv_traced(this: *mut DeviceWrapper, res: *mut c_void, pdesc: *const u8, dest: usize) {
+    let real = unsafe { (*this).real };
+    crate::rtcap::note_view(dest, res as usize, 0);
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(*real_vtbl(real).add(21)) };
+    unsafe { f(real, res, pdesc, dest) }
+}
+
 /// Xbox "derived pipeline" create (device slot 55), from the RHI call site at EXE+0xd56979:
 /// `(this, pBasePSO, numPatches, pPatches, riid, ppv)`. Each patch is a 0x14C-byte tagged
 /// struct (u32 tag, payload at +4) overriding one block of the base pipeline's state:
@@ -804,6 +832,9 @@ unsafe extern "system" fn create_compute_pso_x(
     let f: unsafe extern "system" fn(*mut c_void, *const u8, *const Guid, *mut *mut c_void) -> i32 =
         unsafe { core::mem::transmute(*real_vtbl(real).add(11)) }; // PC CreateComputePipelineState
     let hr = unsafe { f(real, desc.as_ptr(), riid, ppv) };
+    if hr == 0 && !ppv.is_null() && crate::rtcap::enabled() {
+        crate::rtcap::note_compute_pso(unsafe { *ppv } as usize, code.as_ptr() as usize);
+    }
     if hr == 0 {
         let k = OK.fetch_add(1, Ordering::Relaxed) + 1;
         if k <= 4 || k % 100 == 0 {
@@ -1051,6 +1082,10 @@ fn vtable() -> *const usize {
         v[17] = create_cbv as usize; // CreateConstantBufferView (256-align size)
         v[27] = create_committed_resource as usize; // CreateCommittedResource (IID subst)
         v[73] = create_command_list_x as usize;  // Xbox command-list create
+        if crate::rtcap::enabled() {
+            v[20] = create_rtv_traced as usize;
+            v[21] = create_dsv_traced as usize;
+        }
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     }) as *const usize
 }

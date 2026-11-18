@@ -17,6 +17,13 @@ static CACHE: OnceLock<Mutex<HashMap<u64, Cached>>> = OnceLock::new();
 static OK: AtomicUsize = AtomicUsize::new(0);
 static FAIL: AtomicUsize = AtomicUsize::new(0);
 static DUMPED: AtomicUsize = AtomicUsize::new(0);
+/// Translated code pointer -> (hash, original Xbox container); kept only for the diagnostic
+/// draw trace (`rtcap`).
+static ORIGIN: OnceLock<Mutex<HashMap<usize, (u64, Arc<Vec<u8>>)>>> = OnceLock::new();
+
+pub fn origin(code: usize) -> Option<(u64, Arc<Vec<u8>>)> {
+    ORIGIN.get()?.lock().unwrap().get(&code).cloned()
+}
 
 fn fnv1a(b: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -123,10 +130,16 @@ fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
         dump_failure(hash, blob, None, &e);
         format!("extract: {e}")
     })?;
-    let t = tombox_xshader::hlsl::translate(&ex).map_err(|e| {
+    let mut t = tombox_xshader::hlsl::translate(&ex).map_err(|e| {
         dump_failure(hash, blob, None, &e);
         format!("translate: {e}")
     })?;
+    // Development aid: `%TEMP%	ombox_shader_override<hash>.hlsl` replaces the generated
+    // HLSL for that shader (to instrument a translation while debugging). Logged every time.
+    if let Ok(h) = std::fs::read_to_string(std::env::temp_dir().join("tombox_shader_override").join(format!("{hash:016x}.hlsl"))) {
+        record("d3d12_xs", "shader_xlat", &format!("OVERRIDE: hash={hash:016x} uses hand-edited HLSL ({} bytes)", h.len()));
+        t.hlsl = h;
+    }
     // Compiler: DXC (SM6 DXIL) when dxcompiler.dll + dxil.dll are available, otherwise FXC
     // (SM5 DXBC). FXC needs minutes for some of the generated compute shaders; DXC about a
     // second. `TOMBOX_SHADER_COMPILER=fxc` forces the old path.
@@ -197,7 +210,11 @@ pub unsafe fn translate(ptr: *const u8, len: usize) -> Cached {
             if n <= 8 || n % 50 == 0 {
                 record("d3d12_xs", "shader_xlat", &format!("ok #{n} hash={hash:016x} {len}B -> {}B DXBC", v.len()));
             }
-            Ok(Arc::new(v))
+            let v = Arc::new(v);
+            if crate::rtcap::enabled() {
+                ORIGIN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(v.as_ptr() as usize, (hash, Arc::new(blob.to_vec())));
+            }
+            Ok(v)
         }
         Err(e) => {
             let n = FAIL.fetch_add(1, Ordering::Relaxed) + 1;

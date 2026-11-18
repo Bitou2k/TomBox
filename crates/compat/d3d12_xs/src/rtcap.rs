@@ -207,6 +207,7 @@ pub unsafe fn maybe_capture(queue: *mut c_void) {
     }
     let trigger = std::env::temp_dir().join("tombox_capture_now");
     if !trigger.exists() {
+        end_frame(None);
         return;
     }
     let _ = std::fs::remove_file(&trigger);
@@ -385,4 +386,181 @@ pub unsafe fn maybe_capture(queue: *mut c_void) {
     vcall!(alloc, 2, fn() -> u32);
     vcall!(fence, 2, fn() -> u32);
     record("d3d12_xs", "rtcap", &format!("captured {done} render targets into {}", dir.display()));
+    end_frame(Some(&dir));
+}
+
+// ---- draw trace ------------------------------------------------------------------------
+//
+// While the capture is enabled, every draw / dispatch the title records is attributed to
+// (pipeline state, bound render targets, bound depth target). A capture writes the list for
+// the frame just recorded to `draws.txt` and saves the original (Xbox) shader containers of
+// every pipeline involved under `shaders/`, so a wrong render target can be traced back to
+// the shaders that wrote it. Recording order across command lists is not execution order.
+
+#[derive(Default)]
+struct ListState {
+    pso: usize,
+    rtv: Vec<usize>,
+    dsv: usize,
+}
+#[derive(Default)]
+struct Trace {
+    /// CPU descriptor handle -> resource, for render-target and depth views.
+    views: HashMap<usize, usize>,
+    rtv_increment: usize,
+    lists: HashMap<usize, ListState>,
+    /// compute pipeline -> translated code pointer
+    compute: HashMap<usize, usize>,
+    /// (pso, render targets, depth target, kind) in first-seen order, with a draw count.
+    draws: Vec<((usize, Vec<usize>, usize, u8), u32)>,
+    index: HashMap<(usize, Vec<usize>, usize, u8), usize>,
+    /// Shader hashes listed in `%TEMP%	ombox_skip_shaders.txt` (re-read every present):
+    /// draws and dispatches using a pipeline with one of them are dropped. A bisection aid.
+    skip_hashes: Vec<u64>,
+    skip_pso: HashMap<usize, bool>,
+}
+static TRACE: Mutex<Option<Trace>> = Mutex::new(None);
+
+fn with_trace<R>(f: impl FnOnce(&mut Trace) -> R) -> R {
+    let mut g = TRACE.lock().unwrap();
+    f(g.get_or_insert_with(Trace::default))
+}
+
+pub fn note_view(handle: usize, res: usize, rtv_increment: usize) {
+    with_trace(|t| {
+        t.views.insert(handle, res);
+        if rtv_increment != 0 {
+            t.rtv_increment = rtv_increment;
+        }
+    });
+}
+pub fn note_compute_pso(pso: usize, code: usize) {
+    with_trace(|t| {
+        t.compute.insert(pso, code);
+    });
+}
+pub fn on_set_pso(list: usize, pso: usize) {
+    with_trace(|t| t.lists.entry(list).or_default().pso = pso);
+}
+pub unsafe fn on_set_targets(list: usize, n: u32, handles: *const usize, single_range: bool, dsv: *const usize) {
+    with_trace(|t| {
+        let mut rtv = Vec::new();
+        for i in 0..(n as usize).min(8) {
+            if handles.is_null() {
+                break;
+            }
+            let h = if single_range { (*handles).wrapping_add(i * t.rtv_increment) } else { *handles.add(i) };
+            rtv.push(t.views.get(&h).copied().unwrap_or(0));
+        }
+        let d = if dsv.is_null() { 0 } else { t.views.get(&*dsv).copied().unwrap_or(usize::MAX) };
+        let s = t.lists.entry(list).or_default();
+        s.rtv = rtv;
+        s.dsv = d;
+    });
+}
+/// kind: 0 draw, 1 indexed draw, 2 dispatch, 3 indirect. Returns false when the draw must
+/// be dropped (its pipeline uses a shader on the skip list).
+pub fn on_draw(list: usize, kind: u8) -> bool {
+    with_trace(|t| {
+        let pso = t.lists.entry(list).or_default().pso;
+        if !t.skip_hashes.is_empty() {
+            let skip = match t.skip_pso.get(&pso) {
+                Some(&b) => b,
+                None => {
+                    let mut codes = vec![t.compute.get(&pso).copied().unwrap_or(0)];
+                    if let Some((v, p, _)) = crate::device_wrap::pso_summary(pso) {
+                        codes.push(v);
+                        codes.push(p);
+                    }
+                    let b = codes.iter().any(|&c| c != 0 && crate::shader_xlat::origin(c).map(|(h, _)| t.skip_hashes.contains(&h)).unwrap_or(false));
+                    t.skip_pso.insert(pso, b);
+                    b
+                }
+            };
+            if skip {
+                return false;
+            }
+        }
+        let s = t.lists.entry(list).or_default();
+        let key = if kind == 2 { (s.pso, Vec::new(), 0, kind) } else { (s.pso, s.rtv.clone(), s.dsv, kind) };
+        match t.index.get(&key) {
+            Some(&i) => t.draws[i].1 += 1,
+            None => {
+                t.index.insert(key.clone(), t.draws.len());
+                t.draws.push((key, 1));
+            }
+        }
+        true
+    })
+}
+
+/// Forget the draws recorded so far (called at every present).
+fn take_draws() -> (Vec<((usize, Vec<usize>, usize, u8), u32)>, HashMap<usize, usize>) {
+    with_trace(|t| {
+        t.index.clear();
+        (std::mem::take(&mut t.draws), t.compute.clone())
+    })
+}
+
+fn write_draws(dir: &std::path::Path, draws: &[((usize, Vec<usize>, usize, u8), u32)], compute: &HashMap<usize, usize>) {
+    let order: HashMap<usize, usize> = TARGETS.lock().unwrap().iter().map(|t| (t.res, t.order)).collect();
+    let name = |r: usize| match r {
+        0 => "-".to_string(),
+        usize::MAX => "?".to_string(),
+        r => order.get(&r).map(|o| format!("#{o:03}")).unwrap_or_else(|| format!("{r:#x}")),
+    };
+    let sdir = dir.join("shaders");
+    let _ = std::fs::create_dir_all(&sdir);
+    let mut out = String::new();
+    let mut shader = |code: usize| -> String {
+        if code == 0 {
+            return "-".into();
+        }
+        match crate::shader_xlat::origin(code) {
+            Some((hash, blob)) => {
+                let p = sdir.join(format!("{hash:016x}.dxbc"));
+                if !p.exists() {
+                    let _ = std::fs::write(p, &blob[..]);
+                }
+                format!("{hash:016x}")
+            }
+            None => "unknown".into(),
+        }
+    };
+    for (i, ((pso, rtv, dsv, kind), count)) in draws.iter().enumerate() {
+        let k = ["draw", "drawidx", "dispatch", "indirect"][(*kind as usize).min(3)];
+        if *kind == 2 {
+            let cs = compute.get(pso).copied().unwrap_or(0);
+            out.push_str(&format!("{i:04} {k} x{count} cs={}\n", shader(cs)));
+            continue;
+        }
+        let rts: Vec<String> = rtv.iter().map(|r| name(*r)).collect();
+        let (vs, ps, state) = match crate::device_wrap::pso_summary(*pso) {
+            Some((v, p, s)) => (shader(v), shader(p), s),
+            None => ("?".into(), "?".into(), String::new()),
+        };
+        out.push_str(&format!("{i:04} {k} x{count} rt=[{}] ds={} vs={vs} ps={ps} {state}\n", rts.join(","), name(*dsv)));
+    }
+    let _ = std::fs::write(dir.join("draws.txt"), out);
+}
+
+/// Called at every PresentX after `maybe_capture`'s own work: writes the trace when a
+/// capture was just taken into `dir`, and starts a fresh frame.
+pub fn end_frame(captured_into: Option<&std::path::Path>) {
+    if !enabled() {
+        return;
+    }
+    let (draws, compute) = take_draws();
+    let list: Vec<u64> = std::fs::read_to_string(std::env::temp_dir().join("tombox_skip_shaders.txt"))
+        .map(|s| s.split_whitespace().filter_map(|w| u64::from_str_radix(w, 16).ok()).collect())
+        .unwrap_or_default();
+    with_trace(|t| {
+        if t.skip_hashes != list {
+            t.skip_hashes = list;
+            t.skip_pso.clear();
+        }
+    });
+    if let Some(dir) = captured_into {
+        write_draws(dir, &draws, &compute);
+    }
 }

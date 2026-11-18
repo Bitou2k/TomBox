@@ -200,6 +200,9 @@ struct Emitter<'a> {
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     /// Inferred integer element type of typed buffers: (is_uav, slot) -> 1 uint, 2 sint.
     tbuf_ty: BTreeMap<(bool, u32), u8>,
+    /// Structured buffers read with scalar loads (`s_buffer_load` through an SRV/UAV
+    /// descriptor): they need the byte-offset helper.
+    sbuf_flat: BTreeSet<(bool, u32)>,
     is_cs: bool,
     /// Nesting depth of emitted HLSL loops at the current instruction.
     loop_depth: u32,
@@ -457,6 +460,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         tbuf: BTreeSet::new(),
         tbuf_uint: BTreeSet::new(),
         tbuf_ty: BTreeMap::new(),
+        sbuf_flat: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
         is_gs: ex.stage == Stage::Geometry,
         uses_lds: false,
@@ -1085,8 +1089,23 @@ impl<'a> Emitter<'a> {
                     let dynamic = (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d;
                     let end = if dynamic { 4096 * 4 } else { ins.aux.imm as u32 / 4 + n };
                     let mut out: Vec<(u32, Res)> = Vec::new();
+                    // A scalar load reads whatever buffer the descriptor names. From the CBV
+                    // table that is a constant buffer; from the SRV / UAV table it is a
+                    // (structured) buffer addressed by byte offset, e.g. the sky-light
+                    // spherical-harmonics buffer read by ReflectionEnvironmentSkyLighting.
+                    // Only the unambiguous case is handled; with several candidate
+                    // descriptors the load is still treated as a constant buffer (debt).
+                    let buffer_kind = if cands.len() == 1 { self.table_kind(cands[0].0).filter(|k| *k <= 1) } else { None };
                     for (table, off) in &cands {
                         let slot = off / 32;
+                        if let Some(k) = buffer_kind {
+                            let key = (k == 1, slot);
+                            let e = self.sbuf.entry(key).or_insert(0);
+                            *e = (*e).max(4);
+                            self.sbuf_flat.insert(key);
+                            out.push((((*table as u32) << 24) | off, Res::Buf(slot, k == 1)));
+                            continue;
+                        }
                         let e = self.cb_size.entry(slot).or_insert(0);
                         *e = (*e).max(end);
                         out.push((((*table as u32) << 24) | off, Res::Cb(slot)));
@@ -1927,13 +1946,30 @@ impl<'a> Emitter<'a> {
                     self.line("// (descriptor fetch from root table — resolved statically)");
                     return Ok(());
                 }
-                let slot = match self.res.get(&idx).and_then(|v| v.first()) {
-                    Some(Res::Cb(s)) => *s,
-                    _ => return Err("unresolved constant buffer".into()),
-                };
                 let n = 1u32 << (ins.op - 8);
                 let base = sreg_num(&d.ok_or("no dst")?).ok_or("bad dst")?;
                 let soff = ins.raw.get(1).copied().unwrap_or(0) >> 25;
+                let slot = match self.res.get(&idx).and_then(|v| v.first()).copied() {
+                    Some(Res::Cb(s)) => s,
+                    Some(Res::Buf(slot, is_uav)) => {
+                        // Structured buffer read by byte offset (see `tb_sbw_*`).
+                        let nm = if is_uav { "ubuf" } else { "sbuf" };
+                        let dynamic = if soff != 0x7d { format!(" + {}", ssrc_name(soff)?) } else { String::new() };
+                        let t = self.tmp;
+                        self.tmp += 1;
+                        self.line(&format!("uint t{t} = {:#x}u{dynamic};", ins.aux.imm as u32));
+                        for k in 0..n {
+                            self.line(&format!("uint t{t}_{k} = tb_sbw_{nm}{slot}(t{t} + {}u);", 4 * k));
+                        }
+                        for k in 0..n {
+                            let dst = sreg_opnd(base + k as u8);
+                            self.touch(&dst);
+                            self.ws(&dst, &format!("t{t}_{k}"))?;
+                        }
+                        return Ok(());
+                    }
+                    _ => return Err("unresolved constant buffer".into()),
+                };
                 if soff != 0x7d {
                     // Dynamic byte offset = imm + SGPR[soffset].
                     let so = ssrc_name(soff)?;
@@ -3601,6 +3637,11 @@ impl<'a> Emitter<'a> {
             let (ty, nm, reg) = if *is_uav { ("RWStructuredBuffer", "ubuf", "u") } else { ("StructuredBuffer", "sbuf", "t") };
             let _ = writeln!(h, "struct TbElem_{nm}{slot} {{ uint w[{}]; }};
 {ty}<TbElem_{nm}{slot}> {nm}{slot} : register({reg}{slot});", (*dwords).max(1));
+            if self.sbuf_flat.contains(&(*is_uav, *slot)) {
+                // Word at a byte offset: the element stride is a property of the view, not of
+                // the shader, so it is queried.
+                let _ = writeln!(h, "uint tb_sbw_{nm}{slot}(uint off) {{ uint n, st; {nm}{slot}.GetDimensions(n, st); st = max(st, 4u); uint e = off / st; return {nm}{slot}[e].w[(off - e * st) >> 2]; }}");
+            }
         }
         for (is_uav, slot) in &self.tbuf {
             let _ = if *is_uav && self.tbuf_uint.contains(slot) {

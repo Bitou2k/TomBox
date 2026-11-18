@@ -78,6 +78,12 @@ Honest ledger. Updated continuously.
 * Register slots differ between the Xbox and PC compilers in a sizeable share of shaders, and
   the pairing key (stage + layout hashes + signature names) often pairs different
   permutations; reference comparison by execution needs a stricter key.
+* Scalar buffer loads (`s_buffer_load`) are read as structured-buffer accesses only when the
+  descriptor is unambiguously from the SRV/UAV table; with several candidate descriptors they
+  are still treated as constant-buffer reads, which is wrong if one candidate is a buffer.
+  The structured read declares a 4-dword element and indexes past it when the real stride is
+  larger (works with DXC's raw-buffer lowering; not guaranteed by HLSL).
+* MUBUF store opcodes 0x1e/0x1f were swapped by analogy with the load pair; unverified.
 * Indexed constant-buffer arrays assume a 16-byte element stride.
 * Compute thread-group id registers are assumed to follow the user-data SGPRs.
 * PS entry ABI assumes perspective-centre barycentrics in v0/v1 and position in v2..v5.

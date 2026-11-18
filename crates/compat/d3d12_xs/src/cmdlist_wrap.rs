@@ -127,6 +127,12 @@ macro_rules! make_probes {
             XBOX_VT[59].store(*REAL_VT_PTR.add(59), Ordering::Relaxed);
             if crate::rtcap::enabled() {
                 XBOX_VT[26].store(resource_barrier_traced as usize, Ordering::Relaxed);
+                XBOX_VT[25].store(set_pso_traced as usize, Ordering::Relaxed);
+                XBOX_VT[50].store(om_set_targets_traced as usize, Ordering::Relaxed);
+                XBOX_VT[12].store(draw_traced as usize, Ordering::Relaxed);
+                XBOX_VT[13].store(draw_indexed_traced as usize, Ordering::Relaxed);
+                XBOX_VT[14].store(dispatch_traced as usize, Ordering::Relaxed);
+                XBOX_VT[59].store(indirect_traced as usize, Ordering::Relaxed);
             }
         }
     };
@@ -149,6 +155,46 @@ unsafe extern "system" fn resource_barrier_traced(this: *mut c_void, n: u32, bar
     crate::rtcap::note_barriers(n, barriers);
     let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = core::mem::transmute(*REAL_VT_PTR.add(26));
     f(this, n, barriers)
+}
+
+// Draw-trace hooks (installed only with the diagnostic capture): note, then forward.
+unsafe extern "system" fn set_pso_traced(this: *mut c_void, pso: *mut c_void) {
+    crate::rtcap::on_set_pso(this as usize, pso as usize);
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = core::mem::transmute(*REAL_VT_PTR.add(25));
+    f(this, pso)
+}
+unsafe extern "system" fn om_set_targets_traced(this: *mut c_void, n: u32, handles: *const usize, single: i32, dsv: *const usize) {
+    crate::rtcap::on_set_targets(this as usize, n, handles, single != 0, dsv);
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize) = core::mem::transmute(*REAL_VT_PTR.add(46));
+    f(this, n, handles, single, dsv)
+}
+unsafe extern "system" fn draw_traced(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
+    if !crate::rtcap::on_draw(this as usize, 0) {
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = core::mem::transmute(*REAL_VT_PTR.add(12));
+    f(this, a, b, c, d)
+}
+unsafe extern "system" fn draw_indexed_traced(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
+    if !crate::rtcap::on_draw(this as usize, 1) {
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32) = core::mem::transmute(*REAL_VT_PTR.add(13));
+    f(this, a, b, c, d, e)
+}
+unsafe extern "system" fn dispatch_traced(this: *mut c_void, a: u32, b: u32, c: u32) {
+    if !crate::rtcap::on_draw(this as usize, 2) {
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = core::mem::transmute(*REAL_VT_PTR.add(14));
+    f(this, a, b, c)
+}
+unsafe extern "system" fn indirect_traced(this: *mut c_void, sig: *mut c_void, n: u32, buf: *mut c_void, off: u64, cbuf: *mut c_void, coff: u64) {
+    if !crate::rtcap::on_draw(this as usize, 3) {
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64) = core::mem::transmute(*REAL_VT_PTR.add(59));
+    f(this, sig, n, buf, off, cbuf, coff)
 }
 
 /// Xbox slot 67: reached (by tail call) from `FD3D12CommandContext::FlushTextureCacheIfNeeded`

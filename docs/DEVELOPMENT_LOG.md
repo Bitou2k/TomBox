@@ -805,3 +805,40 @@ markers and particles (screenshot kept locally, not committed).
 Tooling fixes: `mouse.ps1`/`capture.ps1`/`click.ps1` looked for a window titled exactly
 "Fortnite" (the title has trailing spaces) and could not take the foreground from a
 background shell; both fixed, `drive_lobby.sh` works unattended again.
+
+## 2026-11-17 (night) — Over-exposure traced to a structured buffer read as a constant buffer
+
+New diagnostics in `d3d12_xs` (all behind `TOMBOX_RTCAP=1` / `rtcap=1`):
+
+* **Draw trace.** Hooks on SetPipelineState, OMSetRenderTargets, Draw*, Dispatch,
+  ExecuteIndirect and on CreateRenderTargetView/CreateDepthStencilView attribute each draw of
+  the captured frame to (pipeline, render targets, depth target). A capture writes
+  `draws.txt` (targets by capture number, shader hashes, depth/blend state) and the original
+  shader containers under `shaders/`. Recording order across command lists, not execution
+  order.
+* **Skip list.** `%TEMP%\tombox_skip_shaders.txt` (hashes, re-read every present) drops draws
+  whose pipeline uses a listed shader — live bisection without restarting.
+* **Shader override.** `%TEMP%\tombox_shader_override\<hash>.hlsl` replaces the generated HLSL
+  of one shader (logged as `OVERRIDE`), to instrument a translation.
+
+Procedure and result:
+
+1. Scene colour in the lobby had green ≤ 1.2 but red up to ~1,400 and blue up to ~33,800.
+2. Skipping each additive pass into scene colour in turn: only skipping pixel shader
+   `815832c94bb46f01` (entry `ReflectionEnvironmentSkyLighting`) removed the excess.
+3. Three instrumented copies of that shader (intermediate values written out in screen
+   strips) showed sane G-buffer decode, specular colour, reflection-capture and sky sums; the
+   excess comes from the diffuse sky term, i.e. the spherical-harmonics evaluation.
+4. Its coefficients are read with `s_buffer_load_dwordx16/x8/x4` through a descriptor that
+   comes from the **SRV** table (PSV0 lists a structured SRV at t0), but the translator
+   mapped every scalar buffer load to a constant buffer — here `b0`, unrelated data.
+
+Fix: a scalar load whose (single) candidate descriptor is in the SRV or UAV table is
+translated as a read of a structured buffer by byte offset; the element stride is queried
+at run time (`GetDimensions`) because it belongs to the view, not the shader. When several
+descriptors are possible the old constant-buffer reading is kept (debt).
+
+Result: scene colour max 0.66–0.69 on all three channels; the lobby shows the dark stage,
+blue backdrop and floor pads with plausible tones. **Still wrong** (screenshot kept locally):
+the character is not visible; white rectangles flicker in the upper part of the image
+(bloom-chain targets contain infinities); the floor centre is very bright.
