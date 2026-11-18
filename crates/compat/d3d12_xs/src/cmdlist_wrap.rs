@@ -133,6 +133,7 @@ macro_rules! make_probes {
                 XBOX_VT[13].store(draw_indexed_traced as usize, Ordering::Relaxed);
                 XBOX_VT[14].store(dispatch_traced as usize, Ordering::Relaxed);
                 XBOX_VT[59].store(indirect_traced as usize, Ordering::Relaxed);
+                XBOX_VT[48].store(ia_set_vbs_traced as usize, Ordering::Relaxed);
             }
         }
     };
@@ -175,7 +176,14 @@ unsafe extern "system" fn draw_traced(this: *mut c_void, a: u32, b: u32, c: u32,
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = core::mem::transmute(*REAL_VT_PTR.add(12));
     f(this, a, b, c, d)
 }
+/// IASetVertexBuffers (PC 44 = Xbox 48): (StartSlot, NumViews, pViews); views are 16 bytes.
+unsafe extern "system" fn ia_set_vbs_traced(this: *mut c_void, start: u32, n: u32, views: *const u8) {
+    crate::rtcap::on_set_vbs(this as usize, start, n, views);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const u8) = core::mem::transmute(*REAL_VT_PTR.add(44));
+    f(this, start, n, views)
+}
 unsafe extern "system" fn draw_indexed_traced(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
+    crate::rtcap::trace_draw(this as usize, &format!("DrawIndexedInstanced(idx={a} inst={b} startIdx={c} baseVtx={d} startInst={e})"));
     if !crate::rtcap::on_draw(this as usize, 1) {
         return;
     }

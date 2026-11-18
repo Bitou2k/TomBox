@@ -100,6 +100,8 @@ struct DeclStats {
     permuted: usize,
     /// Slot-independent difference (pc-only kinds / xbox-only kinds) -> (count, example).
     sets: std::collections::BTreeMap<String, (usize, String)>,
+    /// Structured buffers declared at the same register on both sides: (pc stride, xbox stride) -> count.
+    strides: std::collections::BTreeMap<(u32, u32), usize>,
     /// difference description -> (shaders showing it, first example)
     kinds: std::collections::BTreeMap<String, (usize, String)>,
 }
@@ -118,6 +120,11 @@ impl DeclStats {
             return;
         };
         let x = from_generated_hlsl(&t.hlsl);
+        for (k, v) in &r.res {
+            if let (Kind::Structured(a), Some(Kind::Structured(b))) = (v, x.res.get(k)) {
+                *self.strides.entry((*a, *b)).or_insert(0) += 1;
+            }
+        }
         let d = compare(&r, &x);
         if d.is_empty() {
             self.clean += 1;
@@ -176,6 +183,11 @@ impl DeclStats {
         v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
         for (k, (n, ex)) in v {
             println!("{n:>7}  {k}   (e.g. {ex})");
+        }
+        println!("
+structured buffers at the same register (pc stride, xbox inferred stride): count");
+        for ((a, b), n) in &self.strides {
+            println!("  pc {a:>3}  xbox {b:>3}  x{n}");
         }
         println!("
 slot-independent: {} differ only in slot assignment; {} differ in kind:", self.permuted, self.sets.values().map(|v| v.0).sum::<usize>());

@@ -58,10 +58,9 @@ Verified on one machine (Windows 11, x64) with the Fortnite build above:
 
 ## Known problems
 
-- **3D rendering is incorrect.** The lobby stage, backdrop and floor now render with plausible
-  tones and the character is in place, but it is almost unlit (a dark silhouette), a white
-  rectangle flickers in the upper part of the picture (infinities in the bloom chain) and the
-  floor centre is too bright.
+- **3D rendering is not verified correct.** The lobby now renders as a coherent scene (stage
+  floor with pads, character, backdrop effects), but the character is very dark — direct
+  lighting is suspect — and there is no reference image to compare against.
 - **A shader that fails to compile is fatal.** Every shader now translates, but if the
   generated HLSL for one does not compile, pipeline creation fails and the engine exits.
 - **First-time shader compiles are slow** (FXC took up to minutes; DXC about a second, not yet measured in the game) and
@@ -70,7 +69,8 @@ Verified on one machine (Windows 11, x64) with the Fortnite build above:
 - **Approximations in translated shaders**: texture lookups inside shader loops always use
   the sharpest mip; whether a typed buffer holds floats or integers is inferred from how
   the shader uses it (checked against a PC build's declarations, not exact); typed
-  textures are always assumed float.
+  textures are always assumed float; the element size of structured buffers is guessed
+  (D3D12 takes it from the shader, the console from the buffer view).
 - **Texture mirroring is polling-based**: changes are detected by hashing game memory each
   frame; mips the game has not streamed in yet are left undefined.
 - **Window**: the image is stretched to the window, so resizing it to a non-16:9 shape

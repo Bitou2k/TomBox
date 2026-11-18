@@ -418,6 +418,13 @@ struct Trace {
     /// draws and dispatches using a pipeline with one of them are dropped. A bisection aid.
     skip_hashes: Vec<u64>,
     skip_pso: HashMap<usize, bool>,
+    /// Shader hashes in `%TEMP%	ombox_trace_shaders.txt`: draws using them log their
+    /// arguments and vertex-buffer bindings (first few per frame).
+    trace_hashes: Vec<u64>,
+    trace_pso: HashMap<usize, bool>,
+    trace_budget: u32,
+    /// Last IASetVertexBuffers per list: (start slot, views as (address, size, stride)).
+    vbs: HashMap<usize, Vec<(u32, u64, u32, u32)>>,
 }
 static TRACE: Mutex<Option<Trace>> = Mutex::new(None);
 
@@ -458,6 +465,53 @@ pub unsafe fn on_set_targets(list: usize, n: u32, handles: *const usize, single_
         s.dsv = d;
     });
 }
+pub unsafe fn on_set_vbs(list: usize, start: u32, n: u32, views: *const u8) {
+    with_trace(|t| {
+        let v = t.vbs.entry(list).or_default();
+        for i in 0..(n as usize).min(16) {
+            if views.is_null() {
+                break;
+            }
+            let p = views.add(i * 16);
+            let slot = start + i as u32;
+            v.retain(|e| e.0 != slot);
+            v.push((slot, core::ptr::read_unaligned(p as *const u64), core::ptr::read_unaligned(p.add(8) as *const u32), core::ptr::read_unaligned(p.add(12) as *const u32)));
+        }
+    });
+}
+
+/// Log one traced draw (see `trace_hashes`).
+pub fn trace_draw(list: usize, text: &str) {
+    let line = with_trace(|t| {
+        if t.trace_hashes.is_empty() || t.trace_budget == 0 {
+            return None;
+        }
+        let pso = t.lists.get(&list).map(|s| s.pso).unwrap_or(0);
+        let hit = match t.trace_pso.get(&pso) {
+            Some(&b) => b,
+            None => {
+                let b = crate::device_wrap::pso_summary(pso)
+                    .map(|(v, p, _)| [v, p].iter().any(|&c| c != 0 && crate::shader_xlat::origin(c).map(|(h, _)| t.trace_hashes.contains(&h)).unwrap_or(false)))
+                    .unwrap_or(false);
+                t.trace_pso.insert(pso, b);
+                b
+            }
+        };
+        if !hit {
+            return None;
+        }
+        t.trace_budget -= 1;
+        let vs = crate::device_wrap::pso_summary(pso).and_then(|(v, _, _)| crate::shader_xlat::origin(v)).map(|(h, _)| h).unwrap_or(0);
+        let mut vb = t.vbs.get(&list).cloned().unwrap_or_default();
+        vb.sort();
+        let vbs: Vec<String> = vb.iter().map(|(s, a, sz, st)| format!("{s}:{a:#x}+{sz}/{st}")).collect();
+        Some(format!("vs={vs:016x} {text} vb=[{}]", vbs.join(" ")))
+    });
+    if let Some(l) = line {
+        record("d3d12_xs", "drawtrace", &l);
+    }
+}
+
 /// kind: 0 draw, 1 indexed draw, 2 dispatch, 3 indirect. Returns false when the draw must
 /// be dropped (its pipeline uses a shader on the skip list).
 pub fn on_draw(list: usize, kind: u8) -> bool {
@@ -554,10 +608,18 @@ pub fn end_frame(captured_into: Option<&std::path::Path>) {
     let list: Vec<u64> = std::fs::read_to_string(std::env::temp_dir().join("tombox_skip_shaders.txt"))
         .map(|s| s.split_whitespace().filter_map(|w| u64::from_str_radix(w, 16).ok()).collect())
         .unwrap_or_default();
+    let tl: Vec<u64> = std::fs::read_to_string(std::env::temp_dir().join("tombox_trace_shaders.txt"))
+        .map(|s| s.split_whitespace().filter_map(|w| u64::from_str_radix(w, 16).ok()).collect())
+        .unwrap_or_default();
     with_trace(|t| {
         if t.skip_hashes != list {
             t.skip_hashes = list;
             t.skip_pso.clear();
+        }
+        if t.trace_hashes != tl {
+            t.trace_hashes = tl;
+            t.trace_pso.clear();
+            t.trace_budget = 40;
         }
     });
     if let Some(dir) = captured_into {

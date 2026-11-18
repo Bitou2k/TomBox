@@ -862,3 +862,40 @@ Result: the character is in scene depth and appears in the lobby with correct oc
 (screenshot kept locally). **Still wrong:** it is almost unlit (dark silhouette), a white
 rectangle flickers in the upper part of the image (infinities in the bloom chain), and the
 floor centre is over-bright.
+
+## 2026-11-18 — Lobby geometry: structured-buffer element size, legacy multiply, precise positions
+
+State after the previous entry: character in depth but unlit; deferred light volumes cover
+the scene yet are rejected on the character; depth shows no floor.
+
+Findings, each by experiment in the running title (overrides / skip list / draw trace):
+
+1. **Structured-buffer element size is taken from the shader on PC.** The depth-only vertex
+   shaders read 3 dwords per row of the per-primitive data and were given a 12-byte element;
+   the buffer has 16-byte elements. D3D12 addressed `index * 12`, so the depth pre-pass used
+   scrambled transforms (the floor collapsed to a line; another object covered the screen at
+   "infinite" distance). Overriding one shader to declare 16 bytes made the floor appear in
+   depth. The PC reference (`xpair --decls`, new stride table) shows for 801 structured
+   buffers at the same register: stride 16 where the Xbox code's extent is 8, 12, 16, 20, 24
+   or 28 bytes (175 of them were declared wrong), stride 64 for extent 64. Rule now:
+   extent of one dword → 4-byte element; 2..7 dwords → 16 bytes, larger constant offsets
+   address following elements; otherwise round up to 16. The one-dword case is needed:
+   `ScatterCopyCS` reads a real 4-byte index buffer, and forcing 16 there scrambled the
+   per-primitive data it uploads (three different wrong scenes before this was found).
+   This is a heuristic fitted to one title — see TECHNICAL_DEBT.
+2. **`v_mul_legacy_f32` / `v_mad_legacy_f32`** now follow the ISA definition (product is 0
+   when either operand is 0). They were emitted as plain multiplies.
+3. **`precise` on position outputs** of non-pixel stages. The base pass tests depth without
+   writing and relies on matching the pre-pass exactly; without `precise` the character
+   showed holes once it was in the pre-pass.
+4. Vertex-buffer / draw-argument trace added to the capture tooling
+   (`%TEMP%\tombox_trace_shaders.txt`): confirmed both passes bind the same streams.
+
+Check: all 139 shaders of the lobby frame compile with DXC after these changes.
+
+Result (screenshot kept locally): dark stage with floor pads, the character on its pad
+inside a translucent blue cylinder, coloured lights at the top; depth has 160,200 non-zero
+samples of 639,600 and includes floor and character; no white rectangles in this capture.
+**Still wrong / unverified:** the character is very dark (direct lighting not yet examined
+after these fixes); whether the scene matches the real console output is unknown — there is
+no reference image of this lobby.

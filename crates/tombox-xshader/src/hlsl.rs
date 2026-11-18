@@ -77,6 +77,7 @@ float tb_cubesc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az 
 float tb_cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return -y; if (ay >= ax) return y < 0.0 ? -z : z; return -y; }
 float tb_cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? 5.0 : 4.0; if (ay >= ax) return y < 0.0 ? 3.0 : 2.0; return x < 0.0 ? 1.0 : 0.0; }
 float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v = (t - 1.5) * 2.0; int f = (int)round(face); if (f == 0) return float3(1.0, -v, -u); if (f == 1) return float3(-1.0, -v, u); if (f == 2) return float3(u, 1.0, v); if (f == 3) return float3(u, -1.0, -v); if (f == 4) return float3(u, -v, 1.0); return float3(-u, -v, -1.0); }
+float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 "#;
 
 fn name(o: &Opnd) -> Result<String, String> {
@@ -826,6 +827,30 @@ impl<'a> Emitter<'a> {
                     self.tbuf_ty.insert(to, t);
                 }
             }
+        }
+    }
+
+    /// Declared element size, in dwords, of a structured buffer.
+    ///
+    /// The stride is a property of the buffer view, not of the shader: on the console the
+    /// hardware multiplies the element index by the descriptor's stride. D3D12 instead takes
+    /// the stride from the HLSL element type (observed: a translation declaring a 12-byte
+    /// element for the 16-byte primitive-data buffer read the wrong rows), so the declared
+    /// element has to be the real one. It is not recoverable in general. What the PC build
+    /// of the same game shows for 801 buffers bound at the same register: stride 16 for
+    /// every buffer the Xbox code touches with extents of 8..28 bytes, 64 for extents of 64.
+    /// Hence: extents of 8..28 bytes -> 16-byte elements (larger offsets address following
+    /// elements), anything larger rounded up to a multiple of 16. A buffer only ever read or
+    /// written one dword at offset 0 keeps a 4-byte element: ScatterCopyCS reads its index
+    /// buffer that way and its view really has stride 4 (forcing 16 scrambled the per-object
+    /// data it uploads); no 16-byte buffer in the comparison was touched like that.
+    /// A heuristic (TECHNICAL_DEBT).
+    fn sbuf_words(&self, key: (bool, u32)) -> u32 {
+        let raw = self.sbuf.get(&key).copied().unwrap_or(1).max(1);
+        match raw {
+            1 => 1,
+            2..=7 => 4,
+            _ => raw.div_ceil(4) * 4,
         }
     }
 
@@ -2642,6 +2667,10 @@ impl<'a> Emitter<'a> {
         let fc = || self.fm(ins, 2);
         let (a, b) = (r(&s[0])?, s.get(1).map(r).transpose()?.unwrap_or_default());
         let c = s.get(2).map(|o| r(o)).transpose().unwrap_or(None).unwrap_or_default();
+        // `v_mul_legacy_f32` / `v_mad_legacy_f32`: DX9 multiply rules — the product is 0 when
+        // either operand is 0, even against infinity or NaN (`tb_mull`). A plain multiply
+        // only matched under fast-math; with exact arithmetic it produced NaN positions.
+        let legacy = m.ends_with("_legacy_f32");
         if m.ends_with("_legacy_f32") {
             m = m.replace("_legacy", "");
         }
@@ -2649,12 +2678,14 @@ impl<'a> Emitter<'a> {
             "v_add_f32" => Some(format!("{} + {}", fa()?, fb()?)),
             "v_sub_f32" => Some(format!("{} - {}", fa()?, fb()?)),
             "v_subrev_f32" => Some(format!("{} - {}", fb()?, fa()?)),
+            "v_mul_f32" if legacy => Some(format!("tb_mull({}, {})", fa()?, fb()?)),
             "v_mul_f32" => Some(format!("{} * {}", fa()?, fb()?)),
             "v_min_f32" => Some(format!("min({}, {})", fa()?, fb()?)),
             "v_max_f32" => Some(format!("max({}, {})", fa()?, fb()?)),
             "v_mac_f32" | "v_fmac_f32" => Some(format!("{} * {} + asfloat({dn})", fa()?, fb()?)),
             "v_madmk_f32" | "v_fmamk_f32" => Some(format!("{} * {k} + {}", fa()?, fb()?)),
             "v_madak_f32" | "v_fmaak_f32" => Some(format!("{} * {} + {k}", fa()?, fb()?)),
+            "v_mad_f32" if legacy => Some(format!("tb_mull({}, {}) + {}", fa()?, fb()?, fc()?)),
             "v_mad_f32" | "v_fma_f32" => Some(format!("{} * {} + {}", fa()?, fb()?, fc()?)),
             "v_min3_f32" => Some(format!("min(min({}, {}), {})", fa()?, fb()?, fc()?)),
             "v_max3_f32" => Some(format!("max(max({}, {}), {})", fa()?, fb()?, fc()?)),
@@ -2819,9 +2850,12 @@ impl<'a> Emitter<'a> {
             let target = match (self.res.get(&idx).and_then(|v| v.first()).copied(), offen) {
                 (Some(Res::TBuf(slot, true)), false) if ins.aux.imm == 0 => format!("utb{slot}[{index}]"),
                 (Some(Res::TBuf(slot, true)), true) => format!("utb{slot}[(({}) + {:#x}u) >> 2]", r(&ins.src[0])?, ins.aux.imm as u32),
-                (Some(Res::Buf(slot, true)), false) => format!("ubuf{slot}[{index}].w[{}]", ins.aux.imm as u32 / 4),
+                (Some(Res::Buf(slot, true)), false) => {
+                    let (nwords, w) = (self.sbuf_words((true, slot)), ins.aux.imm as u32 / 4);
+                    format!("ubuf{slot}[{index} + {}u].w[{}]", w / nwords, w % nwords)
+                }
                 (Some(Res::Buf(slot, true)), true) => {
-                    let nwords = self.sbuf.get(&(true, slot)).copied().unwrap_or(1).max(1);
+                    let nwords = self.sbuf_words((true, slot));
                     let w = format!("((({}) + {:#x}u) >> 2)", r(&ins.src[0])?, ins.aux.imm as u32);
                     format!("ubuf{slot}[{w} / {nwords}u].w[{w} % {nwords}u]")
                 }
@@ -2988,13 +3022,15 @@ impl<'a> Emitter<'a> {
         // Element `k` of this access. With a run-time byte offset the buffer is addressed
         // flat over the declared element size (which assumes, like every structured-buffer
         // access here, that the declared element matches the view's stride).
-        let nwords = self.sbuf.get(&(is_uav, slot)).copied().unwrap_or(1).max(1);
+        let nwords = self.sbuf_words((is_uav, slot));
         let t = self.tmp;
         self.tmp += 1;
         if let Some(vo) = &voff {
             self.line(&format!("uint t{t}w = (({vo}) + {:#x}u) >> 2;", ins.aux.imm as u32));
         }
         let elem = |k: u32| match &voff {
+            // A constant offset past the element addresses the following elements.
+            None if w0 + k >= nwords => format!("{nm}[{index} + {}u].w[{}]", (w0 + k) / nwords, (w0 + k) % nwords),
             None => format!("{nm}[{index}].w[{}]", w0 + k),
             Some(_) => format!("{nm}[{index} + (t{t}w + {k}u) / {nwords}u].w[(t{t}w + {k}u) % {nwords}u]"),
         };
@@ -3633,10 +3669,10 @@ impl<'a> Emitter<'a> {
             }
             let _ = writeln!(h, "SamplerComparisonState scmp{slot} : register(s{slot});");
         }
-        for ((is_uav, slot), dwords) in &self.sbuf {
+        for (is_uav, slot) in self.sbuf.keys() {
             let (ty, nm, reg) = if *is_uav { ("RWStructuredBuffer", "ubuf", "u") } else { ("StructuredBuffer", "sbuf", "t") };
             let _ = writeln!(h, "struct TbElem_{nm}{slot} {{ uint w[{}]; }};
-{ty}<TbElem_{nm}{slot}> {nm}{slot} : register({reg}{slot});", (*dwords).max(1));
+{ty}<TbElem_{nm}{slot}> {nm}{slot} : register({reg}{slot});", self.sbuf_words((*is_uav, *slot)));
             if self.sbuf_flat.contains(&(*is_uav, *slot)) {
                 // Word at a byte offset: the element stride is a property of the view, not of
                 // the shader, so it is queried.
@@ -3757,6 +3793,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let (ty, _) = sig_type(e);
             if matches!(e.sysval, 65 | 67 | 68) {
                 let _ = writeln!(h, "    float od : {};", semantic(e).trim_end_matches('0'));
+            } else if e.sysval == 1 && !is_ps {
+                // `precise`: no fast-math on the position computation. The title relies on a
+                // depth-only pass and the base pass producing identical depth (the base pass
+                // tests without writing); the two are separate shaders here, and without this
+                // the compiler may contract or reorder them differently (observed as holes
+                // in the character where the base pass failed the depth test).
+                let _ = writeln!(h, "    precise {ty} o{ei} : {};", semantic(e));
             } else {
                 let _ = writeln!(h, "    {ty} o{ei} : {};", semantic(e));
             }

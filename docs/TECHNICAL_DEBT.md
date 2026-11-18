@@ -78,6 +78,14 @@ Honest ledger. Updated continuously.
 * Register slots differ between the Xbox and PC compilers in a sizeable share of shaders, and
   the pairing key (stage + layout hashes + signature names) often pairs different
   permutations; reference comparison by execution needs a stricter key.
+* **Structured-buffer element size is a heuristic** (`sbuf_words`): 1 dword touched → 4
+  bytes, 2..7 → 16, else rounded up to 16. Derived from one title's PC build. A buffer with
+  stride 8/12/20/…, or a 16-byte buffer of which a shader reads only the first dword, will be
+  addressed wrongly and silently. Proper fix: the runtime knows the real stride when the
+  view is created; either validate it against the bound shader and report mismatches, or
+  feed strides to the shader. Not started.
+* `precise` is applied to position outputs only; other depth-equality dependencies (e.g.
+  pixel-shader depth output) are not covered.
 * Scalar buffer loads (`s_buffer_load`) are read as structured-buffer accesses only when the
   descriptor is unambiguously from the SRV/UAV table; with several candidate descriptors they
   are still treated as constant-buffer reads, which is wrong if one candidate is a buffer.
