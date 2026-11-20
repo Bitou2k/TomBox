@@ -134,6 +134,8 @@ macro_rules! make_probes {
                 XBOX_VT[14].store(dispatch_traced as usize, Ordering::Relaxed);
                 XBOX_VT[59].store(indirect_traced as usize, Ordering::Relaxed);
                 XBOX_VT[48].store(ia_set_vbs_traced as usize, Ordering::Relaxed);
+                XBOX_VT[35].store(set_compute_table_traced as usize, Ordering::Relaxed);
+                XBOX_VT[36].store(set_gfx_table_traced as usize, Ordering::Relaxed);
             }
         }
     };
@@ -169,7 +171,20 @@ unsafe extern "system" fn om_set_targets_traced(this: *mut c_void, n: u32, handl
     let f: unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize) = core::mem::transmute(*REAL_VT_PTR.add(46));
     f(this, n, handles, single, dsv)
 }
+/// SetCompute/GraphicsRootDescriptorTable (PC 31/32 = Xbox 35/36): (RootParameterIndex,
+/// D3D12_GPU_DESCRIPTOR_HANDLE by value). Recorded for the binding trace.
+unsafe extern "system" fn set_compute_table_traced(this: *mut c_void, index: u32, handle: u64) {
+    crate::bindtrace::set_table(this as usize, true, index, handle);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(*REAL_VT_PTR.add(31));
+    f(this, index, handle)
+}
+unsafe extern "system" fn set_gfx_table_traced(this: *mut c_void, index: u32, handle: u64) {
+    crate::bindtrace::set_table(this as usize, false, index, handle);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64) = core::mem::transmute(*REAL_VT_PTR.add(32));
+    f(this, index, handle)
+}
 unsafe extern "system" fn draw_traced(this: *mut c_void, a: u32, b: u32, c: u32, d: u32) {
+    crate::rtcap::trace_draw(this as usize, false, &format!("DrawInstanced(vtx={a} inst={b} startVtx={c} startInst={d})"));
     if !crate::rtcap::on_draw(this as usize, 0) {
         return;
     }
@@ -183,7 +198,7 @@ unsafe extern "system" fn ia_set_vbs_traced(this: *mut c_void, start: u32, n: u3
     f(this, start, n, views)
 }
 unsafe extern "system" fn draw_indexed_traced(this: *mut c_void, a: u32, b: u32, c: u32, d: i32, e: u32) {
-    crate::rtcap::trace_draw(this as usize, &format!("DrawIndexedInstanced(idx={a} inst={b} startIdx={c} baseVtx={d} startInst={e})"));
+    crate::rtcap::trace_draw(this as usize, false, &format!("DrawIndexedInstanced(idx={a} inst={b} startIdx={c} baseVtx={d} startInst={e})"));
     if !crate::rtcap::on_draw(this as usize, 1) {
         return;
     }
@@ -191,6 +206,7 @@ unsafe extern "system" fn draw_indexed_traced(this: *mut c_void, a: u32, b: u32,
     f(this, a, b, c, d, e)
 }
 unsafe extern "system" fn dispatch_traced(this: *mut c_void, a: u32, b: u32, c: u32) {
+    crate::rtcap::trace_draw(this as usize, true, &format!("Dispatch({a},{b},{c})"));
     if !crate::rtcap::on_draw(this as usize, 2) {
         return;
     }

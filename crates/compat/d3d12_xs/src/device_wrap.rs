@@ -163,6 +163,22 @@ unsafe extern "system" fn create_descriptor_heap(
         // Keep the heap REAL (so it works when passed to SetDescriptorHeaps etc.);
         // patch the shared heap vtable once to fix the handle-getter ABI.
         crate::heap_wrap::ensure_patched(unsafe { *ppv });
+        if crate::rtcap::enabled() && !pdesc.is_null() {
+            // Binding trace: remember shader-visible heaps (GPU handle -> CPU handle).
+            let d = pdesc as *const u32;
+            let (htype, numd, flags) = unsafe { (*d.add(0), *d.add(1), *d.add(2)) };
+            let inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
+            for t in 0..4 {
+                crate::bindtrace::set_increment(t, unsafe { inc(real, t) });
+            }
+            if flags & 1 != 0 {
+                let heap = unsafe { *ppv };
+                let hv = unsafe { *(heap as *const *const usize) };
+                let c: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*hv.add(9)) };
+                let g: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*hv.add(10)) };
+                crate::bindtrace::note_heap(unsafe { c(heap) } as usize, unsafe { g(heap) }, numd, htype);
+            }
+        }
         // Log DESC { Type@0, NumDescriptors@4, Flags@8, NodeMask@0xC } + GPU base so
         // we can correlate the shader-visible online heap with the handles the game
         // later binds. Only log shader-visible (Flags bit0) or the first few.
@@ -444,6 +460,10 @@ unsafe extern "system" fn create_committed_resource(
     let hr = unsafe { f(real, pheap, heap_flags, desc_ptr, init_state, pclear, use_riid, ppv) };
     if hr >= 0 && !ppv.is_null() && !pdesc.is_null() {
         unsafe { crate::rtcap::register(*ppv, &desc_copy[..0x38], init_state) };
+        if crate::rtcap::enabled() && desc_copy[0] == 1 && !pheap.is_null() {
+            let width = u64::from_le_bytes(desc_copy[0x10..0x18].try_into().unwrap());
+            unsafe { crate::bindtrace::note_buffer(*ppv, width, *pheap) };
+        }
     }
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     if hr < 0 && !pdesc.is_null() {
@@ -701,6 +721,104 @@ pub fn pso_summary(pso: usize) -> Option<(usize, usize, String)> {
 
 /// CreateRenderTargetView (20) / CreateDepthStencilView (21): forwarded unchanged; the
 /// (descriptor handle -> resource) pair is remembered for the diagnostic draw trace.
+// Binding-trace hooks (diagnostic capture only). They are patched into the REAL device's
+// method table rather than installed on the wrapper, because the title also reaches the
+// real device directly (ID3D12DeviceChild::GetDevice on a resource or command list returns
+// it) and views created that way would otherwise go unrecorded.
+static REAL_ORIG: [core::sync::atomic::AtomicUsize; 32] = [const { core::sync::atomic::AtomicUsize::new(0) }; 32];
+fn real_orig(slot: usize) -> usize {
+    REAL_ORIG[slot].load(Ordering::Relaxed)
+}
+unsafe extern "system" fn real_create_cbv(real: *mut c_void, pdesc: *const u8, dest: usize) {
+    if !pdesc.is_null() {
+        let va = unsafe { core::ptr::read_unaligned(pdesc as *const u64) };
+        let size = unsafe { core::ptr::read_unaligned(pdesc.add(8) as *const u32) };
+        crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Cbv { va, size });
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(17)) };
+    unsafe { f(real, pdesc, dest) }
+}
+unsafe extern "system" fn real_create_srv(real: *mut c_void, res: *mut c_void, pdesc: *const u8, dest: usize) {
+    let desc = if pdesc.is_null() { None } else { Some(unsafe { core::ptr::read_unaligned(pdesc as *const [u8; 40]) }) };
+    crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Srv { res: res as usize, desc });
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(18)) };
+    unsafe { f(real, res, pdesc, dest) }
+}
+unsafe extern "system" fn real_create_uav(real: *mut c_void, res: *mut c_void, counter: *mut c_void, pdesc: *const u8, dest: usize) {
+    let desc = if pdesc.is_null() { None } else { Some(unsafe { core::ptr::read_unaligned(pdesc as *const [u8; 40]) }) };
+    crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Uav { res: res as usize, desc });
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(19)) };
+    unsafe { f(real, res, counter, pdesc, dest) }
+}
+unsafe extern "system" fn real_create_sampler(real: *mut c_void, pdesc: *const u8, dest: usize) {
+    if !pdesc.is_null() {
+        let desc = unsafe { core::ptr::read_unaligned(pdesc as *const [u8; 0x34]) };
+        crate::bindtrace::note_desc(dest, crate::bindtrace::Desc::Sampler { desc });
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, usize) = unsafe { core::mem::transmute(real_orig(22)) };
+    unsafe { f(real, pdesc, dest) }
+}
+/// CopyDescriptors (slot 23): a null size array means every range has one descriptor.
+unsafe extern "system" fn real_copy_descriptors(
+    real: *mut c_void, nd: u32, dstarts: *const usize, dsizes: *const u32,
+    ns: u32, sstarts: *const usize, ssizes: *const u32, heap_type: u32,
+) {
+    if !dstarts.is_null() && !sstarts.is_null() {
+        // Walk both range lists in step, as the API does.
+        let size = |p: *const u32, i: u32| if p.is_null() { 1 } else { unsafe { *p.add(i as usize) } };
+        let inc = crate::bindtrace::increment(heap_type);
+        let (mut di, mut doff, mut si, mut soff) = (0u32, 0u32, 0u32, 0u32);
+        while di < nd && si < ns {
+            let (dn, sn) = (size(dsizes, di), size(ssizes, si));
+            let n = (dn - doff).min(sn - soff);
+            if n == 0 {
+                break;
+            }
+            unsafe {
+                crate::bindtrace::copy_desc(*dstarts.add(di as usize) + doff as usize * inc, *sstarts.add(si as usize) + soff as usize * inc, n, heap_type);
+            }
+            doff += n;
+            soff += n;
+            if doff == dn { di += 1; doff = 0; }
+            if soff == sn { si += 1; soff = 0; }
+        }
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const usize, *const u32, u32, *const usize, *const u32, u32) =
+        unsafe { core::mem::transmute(real_orig(23)) };
+    unsafe { f(real, nd, dstarts, dsizes, ns, sstarts, ssizes, heap_type) }
+}
+unsafe extern "system" fn real_copy_descriptors_simple(real: *mut c_void, n: u32, dest: usize, src: usize, heap_type: u32) {
+    crate::bindtrace::copy_desc(dest, src, n, heap_type);
+    let f: unsafe extern "system" fn(*mut c_void, u32, usize, usize, u32) = unsafe { core::mem::transmute(real_orig(24)) };
+    unsafe { f(real, n, dest, src, heap_type) }
+}
+/// Patch the real device's method table (shared by every interface version of the device).
+unsafe fn patch_real_device(real: *mut c_void) {
+    extern "system" {
+        fn VirtualProtect(addr: *mut c_void, size: usize, new_protect: u32, old_protect: *mut u32) -> i32;
+    }
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| unsafe {
+        let vt = *(real as *const *mut usize);
+        let hooks: [(usize, usize); 6] = [
+            (17, real_create_cbv as usize), (18, real_create_srv as usize), (19, real_create_uav as usize),
+            (22, real_create_sampler as usize), (23, real_copy_descriptors as usize), (24, real_copy_descriptors_simple as usize),
+        ];
+        let mut old = 0u32;
+        if VirtualProtect(vt.add(17) as *mut c_void, 8 * 8, 0x04, &mut old) == 0 {
+            record("d3d12_xs", "bindtrace", "could not unprotect the device method table - descriptor trace disabled");
+            return;
+        }
+        for (slot, f) in hooks {
+            REAL_ORIG[slot].store(*vt.add(slot), Ordering::Relaxed);
+            *vt.add(slot) = f;
+        }
+        let mut tmp = 0u32;
+        VirtualProtect(vt.add(17) as *mut c_void, 8 * 8, old, &mut tmp);
+        record("d3d12_xs", "bindtrace", "descriptor hooks installed on the real device method table");
+    });
+}
+
 unsafe extern "system" fn create_rtv_traced(this: *mut DeviceWrapper, res: *mut c_void, pdesc: *const u8, dest: usize) {
     let real = unsafe { (*this).real };
     let inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = unsafe { core::mem::transmute(*real_vtbl(real).add(15)) };
@@ -877,6 +995,9 @@ unsafe extern "system" fn create_heap(
         note = format!(" | retry flags={pc_flags:#x} -> hr={hr2:#010x}");
         hr = hr2;
     }
+    if hr >= 0 && crate::rtcap::enabled() && !ppv.is_null() {
+        crate::bindtrace::note_heap_type(unsafe { *ppv } as usize, htype);
+    }
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 || hr < 0 {
         record("d3d12_xs", "CreateHeap", &format!(
@@ -911,6 +1032,10 @@ unsafe extern "system" fn create_placed_resource(
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
     let hr = unsafe { f(real, heap, offset, d.as_ptr(), init_state, pclear, &IID_ID3D12RESOURCE, ppv) };
+    if hr >= 0 && crate::rtcap::enabled() && d[0] == 1 && !ppv.is_null() {
+        let width = u64::from_le_bytes(d[0x10..0x18].try_into().unwrap());
+        unsafe { crate::bindtrace::note_buffer(*ppv, width, crate::bindtrace::heap_type_of(heap as usize)) };
+    }
     static N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     if hr < 0 || N.fetch_add(1, Ordering::Relaxed) < 4 {
         let orig = unsafe { core::slice::from_raw_parts(pdesc, 0x38) };
@@ -1092,6 +1217,9 @@ fn vtable() -> *const usize {
 
 /// Wrap a real `ID3D12Device` so we can intercept QueryInterface.
 pub fn wrap_device(real: *mut c_void) -> *mut c_void {
+    if crate::rtcap::enabled() && !real.is_null() {
+        unsafe { patch_real_device(real) };
+    }
     let w = Box::new(DeviceWrapper { vtable: vtable(), real, refs: AtomicU32::new(1) });
     Box::into_raw(w) as *mut c_void
 }

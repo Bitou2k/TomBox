@@ -15,7 +15,7 @@ pub fn vop2(op: u32) -> Option<&'static str> {
         0x25 => "v_add_nc_u32", 0x26 => "v_sub_nc_u32", 0x27 => "v_subrev_nc_u32",
         0x28 => "v_add_co_ci_u32", 0x29 => "v_sub_co_ci_u32", 0x2a => "v_subrev_co_ci_u32",
         0x2b => "v_fmac_f32", 0x2c => "v_fmamk_f32", 0x2d => "v_fmaak_f32",
-        0x2f => "v_pack_b32_f16",
+        0x2f => "v_cvt_pkrtz_f16_f32",
         0x32 => "v_add_f16", 0x33 => "v_sub_f16", 0x34 => "v_subrev_f16", 0x35 => "v_mul_f16",
         0x36 => "v_mac_f16", 0x37 => "v_madmk_f16", 0x38 => "v_madak_f16", 0x39 => "v_max_f16", 0x3a => "v_min_f16",
         _ => return None,

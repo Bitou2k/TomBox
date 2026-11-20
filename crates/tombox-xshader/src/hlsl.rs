@@ -201,6 +201,16 @@ struct Emitter<'a> {
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     /// Inferred integer element type of typed buffers: (is_uav, slot) -> 1 uint, 2 sint.
     tbuf_ty: BTreeMap<(bool, u32), u8>,
+    /// Inferred integer texel type of textures read with texel fetches / written with image
+    /// stores: (is_uav, slot) -> 1 uint, 2 sint. Absent = float (the default).
+    img_ty: BTreeMap<(bool, u32), u8>,
+    /// Pixel-shader colour-export epilogues (see `find_export_epilogs`): pack instruction
+    /// index -> capture id, and export instruction index -> the capture ids feeding its
+    /// two packed operands (usize::MAX = operand not written).
+    epilog_pack: HashMap<usize, usize>,
+    epilog_exp: HashMap<usize, (usize, usize)>,
+    /// Index of the instruction being emitted.
+    cur_idx: usize,
     /// Structured buffers read with scalar loads (`s_buffer_load` through an SRV/UAV
     /// descriptor): they need the byte-offset helper.
     sbuf_flat: BTreeSet<(bool, u32)>,
@@ -461,6 +471,10 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         tbuf: BTreeSet::new(),
         tbuf_uint: BTreeSet::new(),
         tbuf_ty: BTreeMap::new(),
+        img_ty: BTreeMap::new(),
+        epilog_pack: HashMap::new(),
+        epilog_exp: HashMap::new(),
+        cur_idx: 0,
         sbuf_flat: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
         is_gs: ex.stage == Stage::Geometry,
@@ -500,6 +514,9 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         }
     }
     em.resolve_resources()?;
+    if is_ps {
+        em.find_export_epilogs();
+    }
     em.infer_tbuf_types();
     let live_in = em.live_in();
     em.live = live_in.clone();
@@ -732,28 +749,68 @@ impl<'a> Emitter<'a> {
             }
             None
         }
+        // Bitwise logic with a small constant (`x & 1`, `x & 0xf`, `x ^ 1`) is integer work:
+        // the masks applied to float bit patterns are sign / exponent / mantissa masks, all
+        // far larger.
+        fn small_mask(u: &Insn) -> bool {
+            ["v_and_b32", "v_or_b32", "v_xor_b32"].iter().any(|p| u.mnemonic.starts_with(p))
+                && u.src.iter().any(|o| match o {
+                    Opnd::ConstInt(c) => *c > 0 && *c <= 64,
+                    Opnd::Literal(l) => *l > 0 && *l <= 0xffff,
+                    _ => false,
+                })
+        }
         fn follows(mn: &str) -> bool {
             ["v_mov_b32", "v_and_b32", "v_or_b32", "v_xor_b32", "v_cndmask_b32", "v_not_b32"].iter().any(|p| mn.starts_with(p))
         }
-        let mut votes: BTreeMap<(bool, u32), [u32; 3]> = BTreeMap::new();
-        // (stored-to buffer, loaded-from buffer): a store of registers loaded from another
-        // typed buffer says both hold the same kind of element.
-        let mut links: Vec<((bool, u32), (bool, u32))> = Vec::new();
+        // Keys are (is image, is_uav, slot): typed buffers and textures are told apart.
+        let mut votes: BTreeMap<(bool, bool, u32), [u32; 3]> = BTreeMap::new();
+        // (stored-to resource, loaded-from resource): a store of registers loaded from another
+        // typed resource says both hold the same kind of element.
+        let mut links: Vec<((bool, bool, u32), (bool, bool, u32))> = Vec::new();
+        // Textures that are sampled or gathered hold filterable (float) data.
+        let mut sampled: BTreeSet<u32> = BTreeSet::new();
         let n = self.insns.len();
+        // The typed resource an instruction reads or writes, with the data registers.
+        let typed = |em: &Self, i: usize| -> Option<((bool, bool, u32), BTreeSet<u8>, bool, bool)> {
+            let ins = &em.insns[i];
+            let Some(&Opnd::Vgpr(vd)) = ins.dst.first() else { return None };
+            match em.res.get(&i).and_then(|v| v.first()).copied()? {
+                Res::TBuf(slot, is_uav) => {
+                    let comps = match ins.mnemonic.rsplit('_').next() {
+                        Some("x") => 1u8,
+                        Some("xy") => 2,
+                        Some("xyz") => 3,
+                        Some("xyzw") => 4,
+                        _ => return None,
+                    };
+                    let regs = (0..comps).map(|k| vd.wrapping_add(k)).collect();
+                    Some(((false, is_uav, slot), regs, ins.mnemonic.starts_with("buffer_load"), ins.mnemonic.starts_with("buffer_store")))
+                }
+                r @ (Res::Tex(..) | Res::Uav(..)) => {
+                    let (slot, is_uav) = match r {
+                        Res::Tex(s, _) => (s, false),
+                        Res::Uav(s, _) => (s, true),
+                        _ => unreachable!(),
+                    };
+                    let comps = (ins.aux.mask & 0xf).count_ones() as u8;
+                    let regs = (0..comps).map(|k| vd.wrapping_add(k)).collect();
+                    let load = matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip");
+                    Some(((true, is_uav, slot), regs, load, ins.mnemonic == "image_store"))
+                }
+                _ => None,
+            }
+        };
         for i in 0..n {
-            let Some(Res::TBuf(slot, is_uav)) = self.res.get(&i).and_then(|v| v.first()).copied() else { continue };
-            let ins = &self.insns[i];
-            let comps = match ins.mnemonic.rsplit('_').next() {
-                Some("x") => 1u8,
-                Some("xy") => 2,
-                Some("xyz") => 3,
-                Some("xyzw") => 4,
-                _ => continue,
-            };
-            let Some(&Opnd::Vgpr(vd)) = ins.dst.first() else { continue };
-            let regs: BTreeSet<u8> = (0..comps).map(|k| vd.wrapping_add(k)).collect();
-            let v = votes.entry((is_uav, slot)).or_insert([0; 3]);
-            if ins.mnemonic.starts_with("buffer_load") {
+            if let Some(Res::Tex(slot, _)) = self.res.get(&i).and_then(|v| v.first()).copied() {
+                let m = &self.insns[i].mnemonic;
+                if m.starts_with("image_sample") || m.starts_with("image_gather") {
+                    sampled.insert(slot);
+                }
+            }
+            let Some((key, regs, is_load, is_store)) = typed(self, i) else { continue };
+            let v = votes.entry(key).or_insert([0; 3]);
+            if is_load {
                 // Forward: how are the loaded registers (and plain copies / masks of them) used?
                 let mut live = regs;
                 for j in i + 1..n {
@@ -773,9 +830,12 @@ impl<'a> Emitter<'a> {
                         v[0] += 1;
                     } else if mem_index && !(u.mnemonic.contains("store") && matches!(u.enc, Enc::Mubuf)) {
                         v[1] += 1;
-                    } else if uses {
+                    } else if uses && !self.epilog_pack.contains_key(&j) {
+                        // (The export tail packs whatever type the output has: no evidence.)
                         if let Some(c) = class(&u.mnemonic) {
                             v[c as usize] += 1;
+                        } else if small_mask(u) {
+                            v[1] += 1;
                         }
                     }
                     let carry = uses && follows(&u.mnemonic);
@@ -789,17 +849,15 @@ impl<'a> Emitter<'a> {
                         }
                     }
                 }
-            } else if ins.mnemonic.starts_with("buffer_store") {
+            } else if is_store {
                 // Backward: what produced each stored register?
                 for r in regs {
                     for j in (0..i).rev() {
                         let d = &self.insns[j];
                         if d.dst.iter().any(|o| matches!(o, Opnd::Vgpr(x) if *x == r)) {
-                            if let Some(Res::TBuf(s2, u2)) = self.res.get(&j).and_then(|v| v.first()).copied() {
-                                if d.mnemonic.starts_with("buffer_load") {
-                                    links.push(((is_uav, slot), (u2, s2)));
-                                    break;
-                                }
+                            if let Some((k2, _, true, _)) = typed(self, j) {
+                                links.push((key, k2));
+                                break;
                             }
                             // A conversion's result type is its first type token.
                             let c = match d.mnemonic.strip_prefix("v_cvt_") {
@@ -815,18 +873,120 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        let mut ty: BTreeMap<(bool, bool, u32), u8> = BTreeMap::new();
         for (k, v) in &votes {
             let ints = v[1] + v[2];
             if ints > v[0] {
-                self.tbuf_ty.insert(*k, if v[2] > 0 { 2 } else { 1 });
+                ty.insert(*k, if v[2] > 0 { 2 } else { 1 });
             }
         }
         for (to, from) in links {
             if votes.get(&to).map(|v| v.iter().all(|&x| x == 0)).unwrap_or(true) {
-                if let Some(&t) = self.tbuf_ty.get(&from) {
-                    self.tbuf_ty.insert(to, t);
+                if let Some(&t) = ty.get(&from) {
+                    ty.insert(to, t);
                 }
             }
+        }
+        for ((is_img, is_uav, slot), t) in ty {
+            if !is_img {
+                self.tbuf_ty.insert((is_uav, slot), t);
+            } else if is_uav {
+                // Textures used with image atomics already have their own uint declaration.
+                if !self.uav_uint.contains(&slot) {
+                    self.img_ty.insert((true, slot), t);
+                }
+            } else if !sampled.contains(&slot) {
+                self.img_ty.insert((false, slot), t);
+            }
+        }
+    }
+
+    /// Recognise the colour-export epilogue of a pixel shader.
+    ///
+    /// Every colour export in the title's pixel shaders has the same shape, whatever the
+    /// HLSL output type:
+    ///
+    /// ```text
+    /// s_nop ; s_nop ; v_cvt_pkrtz_f16_f32 vA, x, y ; v_cvt_pkrtz_f16_f32 vB, z, w ; exp mrtN vA, vB (compressed)
+    /// ```
+    ///
+    /// including shaders whose output is `uint4` (the lighting-channel copy writes an R16_UINT
+    /// target this way, where a float-to-half conversion of the integer would always give 0).
+    /// The export format belongs to the render target, which the shader compiler does not
+    /// know, so this tail can only be a default that the console's pipeline creation replaces
+    /// per target format (the two leading no-ops are spare room for it). That replacement is
+    /// inferred, not observed. What the shader itself computes is the four unpacked operands
+    /// (x, y, z, w), so those are exported directly: as integers for an integer output
+    /// element, as full floats otherwise (the render-target write then converts to the
+    /// target's own format, as a per-format epilogue would).
+    ///
+    /// Records the pack instructions whose operands must be captured and, per export, which
+    /// captures feed it. An export is left alone unless both packed operands come from pack
+    /// instructions directly before it with nothing but no-ops in between and no branch
+    /// landing inside the sequence.
+    fn find_export_epilogs(&mut self) {
+        let mut off2idx: HashMap<usize, usize> = HashMap::new();
+        for (i, ins) in self.insns.iter().enumerate() {
+            off2idx.insert(ins.offset, i);
+        }
+        let mut targets: BTreeSet<usize> = BTreeSet::new();
+        for ins in &self.insns {
+            if ins.enc == Enc::Sopp && Self::branch_cond(ins.op).is_some() {
+                let t = ins.offset as i64 + 4 + ins.aux.imm * 4;
+                if t >= 0 {
+                    if let Some(&ti) = off2idx.get(&(t as usize)) {
+                        targets.insert(ti);
+                    }
+                }
+            }
+        }
+        let mut next_id = 0usize;
+        for idx in 0..self.insns.len() {
+            let ins = &self.insns[idx];
+            if ins.enc != Enc::Exp || ins.aux.imm2 & 1 == 0 || ins.aux.imm > 7 {
+                continue;
+            }
+            let (Some(&Opnd::Vgpr(r0)), Some(&Opnd::Vgpr(r1))) = (ins.src.first(), ins.src.get(1)) else { continue };
+            let en = ins.aux.mask;
+            let (need0, need1) = (en & 0x3 != 0, en & 0xc != 0);
+            let (mut p0, mut p1) = (None, None);
+            let mut first = idx;
+            for j in (idx.saturating_sub(8)..idx).rev() {
+                let u = &self.insns[j];
+                if matches!(u.mnemonic.as_str(), "s_nop" | "s_waitcnt") {
+                    continue;
+                }
+                if u.mnemonic != "v_cvt_pkrtz_f16_f32" {
+                    break;
+                }
+                let Some(&Opnd::Vgpr(d)) = u.dst.first() else { break };
+                if d == r0 && p0.is_none() {
+                    p0 = Some(j);
+                    first = j;
+                }
+                if d == r1 && p1.is_none() {
+                    p1 = Some(j);
+                    first = j;
+                }
+            }
+            if (need0 && p0.is_none()) || (need1 && p1.is_none()) {
+                continue;
+            }
+            if targets.range(first + 1..=idx).next().is_some() {
+                continue;
+            }
+            let mut id_of = |em: &mut Self, p: Option<usize>, need: bool| -> usize {
+                match p {
+                    Some(j) if need => *em.epilog_pack.entry(j).or_insert_with(|| {
+                        next_id += 1;
+                        next_id - 1
+                    }),
+                    _ => usize::MAX,
+                }
+            };
+            let a = id_of(self, p0, need0);
+            let b = id_of(self, p1, need1);
+            self.epilog_exp.insert(idx, (a, b));
         }
     }
 
@@ -1612,6 +1772,16 @@ impl<'a> Emitter<'a> {
         let s = &ins.src;
         let d = ins.dst.first().cloned();
         self.line(&format!("// {:#06x} {m}", ins.offset));
+        self.cur_idx = idx;
+        if let Some(&id) = self.epilog_pack.get(&idx) {
+            // Export epilogue: keep the unpacked operands (see `find_export_epilogs`).
+            for (k, sfx) in ["a", "b"].iter().enumerate() {
+                let o = *s.get(k).ok_or("pack without two operands")?;
+                self.touch(&o);
+                self.regs.insert(format!("tb_pk{id}{sfx}"));
+                self.line(&format!("tb_pk{id}{sfx} = {};", r(&o)?));
+            }
+        }
         // Run-time descriptor selectors (only for shaders with a "one of N" image op).
         if let Some((reg, cands)) = self.bsel.remove(&idx) {
             // One guarded copy of the op per candidate buffer.
@@ -2784,7 +2954,7 @@ impl<'a> Emitter<'a> {
             "v_cvt_flr_i32_f32" => format!("asuint((int)floor({}))", fa()?),
             "v_cvt_rpi_i32_f32" => format!("asuint((int)floor({} + 0.5))", fa()?),
             "v_cvt_f16_f32" => format!("f32tof16({})", fa()?),
-            "v_pack_b32_f16" => format!("(f32tof16({}) | (f32tof16({}) << 16))", fa()?, fb()?),
+            "v_cvt_pkrtz_f16_f32" => format!("(f32tof16({}) | (f32tof16({}) << 16))", fa()?, fb()?),
             _ => return Err("unsupported vector op".into()),
         };
         self.wv(&d, &e)
@@ -3246,9 +3416,28 @@ impl<'a> Emitter<'a> {
                 }
                 return Ok(());
             }
+            let ity = self.img_ty.get(&(is_uav, slot)).copied();
             if ins.mnemonic == "image_store" {
                 if !is_uav {
                     return Err("image_store to a non-UAV table".into());
+                }
+                if let Some(t) = ity {
+                    // Integer texels: the registers are stored as they are.
+                    let mut comp = vec![];
+                    let mut n = 0u8;
+                    for ch in 0..4 {
+                        if (ins.aux.mask >> ch) & 1 != 0 {
+                            let o = Opnd::Vgpr(vd + n);
+                            self.touch(&o);
+                            comp.push(r(&o)?);
+                            n += 1;
+                        } else {
+                            comp.push("0u".into());
+                        }
+                    }
+                    let ctor = if t == 2 { "int4" } else { "uint4" };
+                    self.line(&format!("if (exec_lo & 1u) uav{slot}[uint{ncoord}({})] = {ctor}({});", c.join(", "), comp.join(", ")));
+                    return Ok(());
                 }
                 let mut comp = vec![];
                 let mut n = 0u8;
@@ -3293,11 +3482,21 @@ impl<'a> Emitter<'a> {
                 } else {
                     format!("tex{slot}.Load(int{}({}, {mip}))", ncoord + 1, c.iter().map(|x| format!("(int){x}")).collect::<Vec<_>>().join(", "))
                 };
-                self.line(&format!("float4 t{t} = {e};"));
+                let ety = match ity {
+                    Some(2) => "int4",
+                    Some(_) => "uint4",
+                    None => "float4",
+                };
+                self.line(&format!("{ety} t{t} = {e};"));
                 let mut n = 0u8;
                 for ch in 0..4 {
                     if (ins.aux.mask >> ch) & 1 != 0 {
-                        self.wv(&Opnd::Vgpr(vd + n), &format!("asuint(t{t}.{})", XYZW[ch]))?;
+                        let e = match ety {
+                            "float4" => format!("asuint(t{t}.{})", XYZW[ch]),
+                            "int4" => format!("(uint)t{t}.{}", XYZW[ch]),
+                            _ => format!("t{t}.{}", XYZW[ch]),
+                        };
+                        self.wv(&Opnd::Vgpr(vd + n), &e)?;
                         n += 1;
                     }
                 }
@@ -3546,6 +3745,24 @@ impl<'a> Emitter<'a> {
             }
         }
         let v4 = format!("float4({})", comp.join(", "));
+        // The exported registers as raw 32-bit values, when they are available unpacked.
+        let raw: Option<Vec<String>> = if compr {
+            self.epilog_exp.get(&self.cur_idx).copied().map(|(a, b)| {
+                (0..4usize)
+                    .map(|i| {
+                        let id = if i < 2 { a } else { b };
+                        let on = (en >> (i / 2 * 2)) & 1 != 0 || (en >> i) & 1 != 0;
+                        if on && id != usize::MAX { format!("tb_pk{id}{}", if i % 2 == 0 { "a" } else { "b" }) } else { "0u".to_string() }
+                    })
+                    .collect()
+            })
+        } else {
+            let mut v = vec![];
+            for i in 0..4usize {
+                v.push(if (en >> i) & 1 != 0 { r(&ins.src[i])? } else { "0u".into() });
+            }
+            Some(v)
+        };
         if is_ps && ins.aux.imm2 & 4 != 0 {
             // Valid-mask export: lanes that are inactive here are killed (pixel discard).
             self.line("if ((exec_lo & 1u) == 0u) discard;");
@@ -3612,9 +3829,22 @@ impl<'a> Emitter<'a> {
         } else {
             return Err(format!("export target {target} unsupported"));
         }
+        let mut lines = vec![];
         for (ei, sw) in assigns {
             let (ty, _) = sig_type(&osig[ei]);
-            self.line(&format!("if (exec_lo & 1u) o.o{ei} = ({ty})({v4}.{sw});"));
+            // Integer elements carry the register bits themselves; converting them through
+            // float (or half) would destroy them.
+            let val = match (osig[ei].comp_type, &raw) {
+                (1, Some(rc)) => format!("uint4({})", rc.join(", ")),
+                (2, Some(rc)) => format!("int4(uint4({}))", rc.join(", ")),
+                (1 | 2, None) => return Err("integer output element fed by a packed export without a recognised pack epilogue".into()),
+                (_, Some(rc)) if compr => format!("float4({})", rc.iter().map(|x| format!("asfloat({x})")).collect::<Vec<_>>().join(", ")),
+                _ => v4.clone(),
+            };
+            lines.push(format!("if (exec_lo & 1u) o.o{ei} = ({ty})({val}.{sw});"));
+        }
+        for l in lines {
+            self.line(&l);
         }
         Ok(())
     }
@@ -3649,16 +3879,21 @@ impl<'a> Emitter<'a> {
         }
         for (slot, dim) in &self.tex {
             let ty = match dim {
-                0 => "Texture1D<float4>",
-                4 => "Texture1DArray<float4>",
-                1 => "Texture2D<float4>",
-                2 => "Texture3D<float4>",
-                3 => "TextureCube<float4>",
-                5 => "Texture2DArray<float4>",
-                6 => "Texture2DMS<float4>",
+                0 => "Texture1D",
+                4 => "Texture1DArray",
+                1 => "Texture2D",
+                2 => "Texture3D",
+                3 => "TextureCube",
+                5 => "Texture2DArray",
+                6 => "Texture2DMS",
                 _ => return Err(format!("texture dim {dim} unsupported")),
             };
-            let _ = writeln!(h, "{ty} tex{slot} : register(t{slot});");
+            let e = match self.img_ty.get(&(false, *slot)) {
+                Some(2) => "int4",
+                Some(_) => "uint4",
+                None => "float4",
+            };
+            let _ = writeln!(h, "{ty}<{e}> tex{slot} : register(t{slot});");
         }
         for slot in &self.samp {
             let _ = writeln!(h, "SamplerState samp{slot} : register(s{slot});");
@@ -3697,13 +3932,18 @@ impl<'a> Emitter<'a> {
         }
         for (slot, dim) in &self.uav {
             // Textures used with image atomics hold one uint per texel.
+            let e = match self.img_ty.get(&(true, *slot)) {
+                Some(2) => "int4",
+                Some(_) => "uint4",
+                None => "float4",
+            };
             let ty = match (dim, self.uav_uint.contains(slot)) {
-                (1, false) => "RWTexture2D<float4>",
-                (2, false) => "RWTexture3D<float4>",
-                (5, false) => "RWTexture2DArray<float4>",
-                (1, true) => "RWTexture2D<uint>",
-                (2, true) => "RWTexture3D<uint>",
-                (5, true) => "RWTexture2DArray<uint>",
+                (1, false) => format!("RWTexture2D<{e}>"),
+                (2, false) => format!("RWTexture3D<{e}>"),
+                (5, false) => format!("RWTexture2DArray<{e}>"),
+                (1, true) => "RWTexture2D<uint>".to_string(),
+                (2, true) => "RWTexture3D<uint>".to_string(),
+                (5, true) => "RWTexture2DArray<uint>".to_string(),
                 _ => return Err(format!("UAV dim {dim} unsupported")),
             };
             let _ = writeln!(h, "{ty} uav{slot} : register(u{slot});");

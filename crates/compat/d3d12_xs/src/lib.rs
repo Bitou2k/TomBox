@@ -21,6 +21,7 @@ mod frame;
 mod placed;
 mod upload;
 mod rtcap;
+mod bindtrace;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};

@@ -196,6 +196,16 @@ slot-independent: {} differ only in slot assignment; {} differ in kind:", self.p
         for (k, (n, ex)) in v.iter().take(60) {
             println!("{n:>7}  {k}   (e.g. {ex})");
         }
+        // Integer-vs-float disagreements are translator faults whatever their count (a float
+        // declaration over an integer view reads garbage), so they are always listed.
+        let ints: Vec<_> = v.iter().skip(60).filter(|(k, _)| k.contains("<int>")).collect();
+        if !ints.is_empty() {
+            println!("
+further kinds involving integer element types:");
+            for (k, (n, ex)) in ints {
+                println!("{n:>7}  {k}   (e.g. {ex})");
+            }
+        }
     }
 }
 

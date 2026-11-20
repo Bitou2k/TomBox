@@ -134,8 +134,9 @@ fn layout(fmt: u32) -> Option<(usize, bool, usize, &'static str)> {
         39..=41 => (1, true, 4, "r32f"),
         44..=47 => (1, false, 4, "d24s8"),
         48..=49 => (2, false, 2, "rg8"),
-        53..=54 => (1, true, 2, "r16f"),
-        55..=56 => (1, false, 2, "r16"),
+        // 53 is R16_TYPELESS: in practice a 16-bit depth target (shadow atlas), so UNORM.
+        54 => (1, true, 2, "r16f"),
+        53 | 55..=56 => (1, false, 2, "r16"),
         60..=61 => (1, false, 1, "r8"),
         87 | 90 | 91 => (4, false, 4, "bgra8"),
         _ => return None,
@@ -210,6 +211,11 @@ pub unsafe fn maybe_capture(queue: *mut c_void) {
         end_frame(None);
         return;
     }
+    // The trigger may list target numbers ("raw 99 100"): those are also written in full
+    // resolution as little-endian f32 (4 per pixel, `rtNNN_WxH.f32`) for offline analysis.
+    let raw_ids: Vec<usize> = std::fs::read_to_string(&trigger)
+        .map(|t| t.split_whitespace().filter_map(|w| w.parse().ok()).collect())
+        .unwrap_or_default();
     let _ = std::fs::remove_file(&trigger);
     static SEQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -319,6 +325,18 @@ pub unsafe fn maybe_capture(queue: *mut c_void) {
             let _ = writeln!(report, "{head}: readback map failed hr={hr:#010x} (waited {spins} ms)");
             vcall!(buf, 2, fn() -> u32);
             continue;
+        }
+        if raw_ids.contains(&order) {
+            let mut out = Vec::with_capacity(w * h * 16);
+            for y in 0..h {
+                let row = core::slice::from_raw_parts(data.add(y * pitch), w * bpp);
+                for x in 0..w {
+                    for c in decode(kind, &row[x * bpp..x * bpp + bpp]) {
+                        out.extend_from_slice(&c.to_le_bytes());
+                    }
+                }
+            }
+            let _ = std::fs::write(dir.join(format!("rt{order:03}_{w}x{h}.f32")), out);
         }
         // Statistics + preview (downscaled to <= 960 wide).
         let step = (w / 960).max(1);
@@ -480,19 +498,24 @@ pub unsafe fn on_set_vbs(list: usize, start: u32, n: u32, views: *const u8) {
     });
 }
 
-/// Log one traced draw (see `trace_hashes`).
-pub fn trace_draw(list: usize, text: &str) {
+/// Log one traced draw or dispatch (see `trace_hashes`): its arguments, vertex buffers and
+/// everything bound through descriptor tables (constant-buffer contents included).
+pub fn trace_draw(list: usize, compute: bool, text: &str) {
     let line = with_trace(|t| {
         if t.trace_hashes.is_empty() || t.trace_budget == 0 {
             return None;
         }
         let pso = t.lists.get(&list).map(|s| s.pso).unwrap_or(0);
+        let hash_of = |c: usize| if c == 0 { 0 } else { crate::shader_xlat::origin(c).map(|(h, _)| h).unwrap_or(0) };
+        let codes: Vec<usize> = if compute {
+            vec![t.compute.get(&pso).copied().unwrap_or(0)]
+        } else {
+            crate::device_wrap::pso_summary(pso).map(|(v, p, _)| vec![v, p]).unwrap_or_default()
+        };
         let hit = match t.trace_pso.get(&pso) {
             Some(&b) => b,
             None => {
-                let b = crate::device_wrap::pso_summary(pso)
-                    .map(|(v, p, _)| [v, p].iter().any(|&c| c != 0 && crate::shader_xlat::origin(c).map(|(h, _)| t.trace_hashes.contains(&h)).unwrap_or(false)))
-                    .unwrap_or(false);
+                let b = codes.iter().any(|&c| c != 0 && t.trace_hashes.contains(&hash_of(c)));
                 t.trace_pso.insert(pso, b);
                 b
             }
@@ -501,14 +524,30 @@ pub fn trace_draw(list: usize, text: &str) {
             return None;
         }
         t.trace_budget -= 1;
-        let vs = crate::device_wrap::pso_summary(pso).and_then(|(v, _, _)| crate::shader_xlat::origin(v)).map(|(h, _)| h).unwrap_or(0);
+        let s = t.lists.get(&list);
+        let targets = s.map(|s| (s.rtv.clone(), s.dsv)).unwrap_or_default();
         let mut vb = t.vbs.get(&list).cloned().unwrap_or_default();
         vb.sort();
         let vbs: Vec<String> = vb.iter().map(|(s, a, sz, st)| format!("{s}:{a:#x}+{sz}/{st}")).collect();
-        Some(format!("vs={vs:016x} {text} vb=[{}]", vbs.join(" ")))
+        let names: Vec<String> = codes.iter().map(|&c| format!("{:016x}", hash_of(c))).collect();
+        Some((format!("shaders=[{}] {text} vb=[{}]", names.join(","), vbs.join(" ")), targets))
     });
-    if let Some(l) = line {
-        record("d3d12_xs", "drawtrace", &l);
+    if let Some((l, (rtv, dsv))) = line {
+        let targets: HashMap<usize, (usize, [u8; 0x38])> = TARGETS.lock().unwrap().iter().map(|t| (t.res, (t.order, t.desc))).collect();
+        let name = |r: usize| -> String {
+            let d32 = |d: &[u8], o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+            if let Some((order, d)) = targets.get(&r) {
+                return format!("#{order:03} {}x{} fmt={}", u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()), d32(d, 0x18), d32(d, 0x20));
+            }
+            match crate::placed::lookup(r as *mut c_void) {
+                Some(p) => format!("placed {r:#x} {}x{}x{} mips={} fmt={}", p.width(), p.height(), p.depth_or_array(), p.mips(), p.format()),
+                None => format!("res {r:#x}"),
+            }
+        };
+        let rts: Vec<String> = rtv.iter().map(|r| if *r == 0 { "-".into() } else { name(*r) }).collect();
+        let ds = if dsv == 0 { "-".to_string() } else { name(dsv) };
+        let b = unsafe { crate::bindtrace::dump(list, compute, &name) };
+        record("d3d12_xs", "drawtrace", &format!("{l} rt=[{}] ds={ds}\n{b}", rts.join(" | ")));
     }
 }
 
@@ -605,6 +644,7 @@ pub fn end_frame(captured_into: Option<&std::path::Path>) {
         return;
     }
     let (draws, compute) = take_draws();
+    unsafe { crate::bindtrace::end_frame() };
     let list: Vec<u64> = std::fs::read_to_string(std::env::temp_dir().join("tombox_skip_shaders.txt"))
         .map(|s| s.split_whitespace().filter_map(|w| u64::from_str_radix(w, 16).ok()).collect())
         .unwrap_or_default();
@@ -619,7 +659,7 @@ pub fn end_frame(captured_into: Option<&std::path::Path>) {
         if t.trace_hashes != tl {
             t.trace_hashes = tl;
             t.trace_pso.clear();
-            t.trace_budget = 40;
+            t.trace_budget = 14;
         }
     });
     if let Some(dir) = captured_into {

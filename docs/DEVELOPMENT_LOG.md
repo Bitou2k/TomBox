@@ -911,3 +911,56 @@ Both do percentage-closer filtering with `image_gather4_lz_o` against the D16 sh
 So the lights are being shadowed out. Not yet determined: whether the shadow atlas content
 or the projection/compare is wrong. The capture tool decodes D16 targets as half floats, so
 the atlas cannot be read from the current reports (fix the decoder first).
+
+## 2026-11-18/19 — Lights were skipped: integer textures and integer outputs; binding trace
+
+**Correction of the previous entry.** The shadow mask was not the cause of the dark
+character. The binding trace (below) showed that mask belongs to a low-bias rim spotlight
+behind the character, and its partial value on the floor is what its own constants give.
+
+**Cause 1: integer textures declared as float.** The deferred light shaders test
+`LightingChannelsTexture.Load(..) & LightingChannelMask`. The texture is `R16_UINT`; the
+translation declared every texture `float4` and reinterpreted the float's bits, so the test
+failed and the light was skipped. Fix: texel type of textures read with texel fetches (and
+written with image stores) is inferred like typed buffers (`img_ty`): integer when the
+loaded value is used as an integer. Bitwise logic with a small constant now counts as
+integer evidence; the export tail counts as none.
+
+**Cause 2: integer outputs converted through float.** (a) Every pixel-shader colour export
+ends in `s_nop; s_nop; v_cvt_pkrtz_f16_f32 x2; exp` even for `uint4` outputs, where a
+float-to-half pack of an integer gives 0 (the lighting-channel copy wrote zeros). The tail
+is taken to be a default that the console replaces per render-target format — **inferred
+from the shape, not observed**. The unpacked operands are now exported directly (integers
+for integer elements, full floats otherwise). (b) Vertex-shader integer parameters
+(`PRIMITIVE_ID`) were exported as `(uint)asfloat(bits)`, i.e. always 0, so every pixel
+shader read primitive 0's data. Integer elements now pass the register bits through.
+Opcode 0x2f was mislabelled `v_pack_b32_f16`; it is `v_cvt_pkrtz_f16_f32`.
+
+**Checks.** `cargo test -p tombox-xshader`: 11 pass, including 5 new tests on hand-assembled
+programs (`tests/synthetic.rs`, no game data). All 139 shaders of the lobby frame translate
+and compile with DXC. `xpair --decls`: 2,607 of 4,553 paired shaders agree with the PC
+declarations (was 2,538); no pair is left where the PC declares an integer texture and the
+translation a float one (remaining integer differences: 3 pixel shaders with an integer
+UAV buffer, 1 vertex shader with an integer buffer).
+
+**In the game (one run, lobby).** Scene colour maximum went from 0.16 to about 5; floor and
+character are lit. Not correct yet: the character is cyan with panel lines although the
+base-colour target holds the right skin colours; dropping all light passes and the sky
+pass leaves about half of that cyan, so part of it comes from the base pass (emissive) — possibly the
+game's own "cosmetics still loading" hologram (its log warns the cosmetic loadout is not
+initialised), possibly a consequence of pixel shaders now reading real primitive data.
+Undetermined. Bloom still shows bright blocks along the top edge (infinite values in the
+half-resolution chain).
+
+**New diagnostics (`TOMBOX_RTCAP=1`).**
+- Binding trace (`bindtrace.rs`): descriptor writes and copies are recorded by hooks on the
+  real device's method table (the title also reaches the real device directly, so hooks on
+  the wrapper missed views). For shaders listed in `%TEMP%\tombox_trace_shaders.txt` each
+  draw/dispatch logs every bound table: constant-buffer contents, and for each view the
+  resource and the view's format/stride.
+- Capture: 16-bit depth is decoded as UNORM; `raw <ids>` in the trigger file also writes
+  those targets at full resolution as float32.
+
+Not done: SRVs created before a slot is rebound still show as "no descriptor recorded" in
+some tables (scene depth); `R16_UINT` targets are not decoded by the capture; whole-archive
+DXC sweep not rerun with these changes.

@@ -147,3 +147,17 @@ Honest ledger. Updated continuously.
   console's 64-lane waves (as HLSL permits). FXC fallback cannot compile these.
 - Image atomics other than add/umax, and reductions other than f32 min/max, are refused.
 - DXC-compiled graphics pipelines are untested in the game.
+
+## Shader outputs and texel types (2026-11-19)
+
+- **Colour-export tail is assumed to be replaced per target format on console.** The
+  translator exports the operands of the two pack instructions in front of a compressed
+  colour export instead of the packed halves. Evidence: the same tail appears on `uint4`
+  outputs, where the literal behaviour cannot work. The replacement itself was not observed.
+  Consequence if wrong: float targets get more precision than the console; no other effect.
+- **Texel type of textures is inferred from use** (integer vs float), like typed buffers.
+  No evidence = float. Agrees with the PC declarations on every paired shader checked, but
+  the pairing covers a fraction of the archive.
+- **Binding trace cost.** Diagnostic only; it holds a reference on every buffer and a map
+  entry per descriptor. Not suitable for normal runs as written. The same tracking is what
+  a run-time check of structured-buffer strides would need.
