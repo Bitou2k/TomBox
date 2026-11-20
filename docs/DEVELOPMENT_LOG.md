@@ -981,3 +981,34 @@ synthetic buffers, including truncation. It does not decrypt: package keys belon
 title, and recovering them is outside this project's scope. For shader inspection the
 route that stays in scope is capturing shaders as the running title hands them to the
 graphics API (the capture tool already saves them).
+
+## 2026-11-20 — Second title, shaders only: `shaders.rpf` holds plain Xbox shader containers
+
+Owner-supplied dump of a RAGE-engine title (no executable in the dump yet; nothing was run).
+The table of contents of `shaders.rpf` is high-entropy, but the data area is not encrypted:
+
+* a block tagged `SGD5` (an index: 8-byte records of a 32-bit hash plus type/index bytes;
+  not decoded further);
+* then records each carrying a NUL-terminated shader name (e.g.
+  `VS_BlitGenAmbCube_0cfdb358_Wrapped`), one tag byte, `u32 compressed size, u32 ?, u32
+  compressed size again, u32 inflated size`, and a **raw deflate** stream that inflates to
+  a standard `DXBC` container (`SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV`), shader model 6.6,
+  bitcode stripped, RDNA2 code inside — the same container the first title uses.
+
+Method: a throwaway scan (name + repeated size + inflate + `DXBC` check) over the 412 MB
+file, without the table of contents. It found 26,503 shaders (25,889 distinct by content,
+223 MB of the file); what the remaining bytes hold was not examined, so this is a lower
+bound. By name: 11,092 pixel, 8,329 mesh (`MS_VS_`/`MSNC_VS_`), 2,581 compute, 2,183
+vertex, 195 geometry, 47 domain, 1,462 unclassified.
+
+Existing tools on the first 4,000 distinct shaders in file order (3,415 mesh, 585 vertex):
+every one disassembles to the end with a clean `s_endpgm` landing. Translation: mesh stage
+is not supported at all; of the vertex shaders about a third translate. The failures are
+the resource model, not instructions: these containers carry **no root signature**
+(`rootSig=false`), so descriptor tables have no known kind ("buffer in table of kind
+None"), plus `s_load` with a dynamic offset and `s_buffer_load` from a table pointer.
+Pixel and compute shaders come later in the file and were not sampled.
+
+Not done: a proper extractor in the repo (the scan was a scratch script), pixel/compute
+sampling, the `SGD5` index, mesh-shader translation, and a binding model for shaders
+without root signatures.
