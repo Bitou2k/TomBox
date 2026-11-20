@@ -7,8 +7,16 @@ fn main() -> ExitCode {
         eprintln!("usage: rpf-inspect <file.rpf>");
         return ExitCode::from(2);
     };
-    let data = match std::fs::read(&path) {
-        Ok(d) => d,
+    // Packages run to tens of gigabytes: only the first mebibyte is read and mapped.
+    const PREFIX: u64 = 1 << 20;
+    let (data, total) = match std::fs::File::open(&path).and_then(|f| {
+        use std::io::Read;
+        let total = f.metadata()?.len();
+        let mut d = Vec::new();
+        f.take(PREFIX).read_to_end(&mut d)?;
+        Ok((d, total))
+    }) {
+        Ok(x) => x,
         Err(e) => {
             eprintln!("{path}: {e}");
             return ExitCode::FAILURE;
@@ -21,7 +29,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("{path}: RPF{} , {} bytes", r.version, r.size);
+    println!("{path}: RPF{}, {total} bytes{}", r.version, if total > PREFIX { " (regions below cover the first 1 MiB only)" } else { "" });
     match &r.header {
         Header::V7 { entry_count, names_length, encryption } => {
             let enc = if *encryption == RPF7_OPEN { "OPEN (table is plain)".to_string() } else { format!("{encryption:#010x} (table is encrypted)") };
