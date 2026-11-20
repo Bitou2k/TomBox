@@ -1,97 +1,94 @@
-# TomBox — Xbox Series X|S compatibility runtime (research)
+# TomBox
 
-An attempt to run user-provided, already-dumped/decrypted **Xbox Series X|S** game builds
-natively on Windows x64. The first and only test target is
-**Fortnite Xbox Series X|S 2.0.1461.7919** (v14.50).
+**An Xbox Series X|S compatibility runtime for Windows PCs.**
 
-> **Status (2026-11-17): boots to the lobby; not playable.**
-> The real game executable runs natively, logs in against a private backend, and reaches
-> the Battle Royale lobby. The 2D interface renders correctly. The 3D scene does **not**
-> render correctly yet, there is no audio, and input is only partly usable. See
-> [What works](#what-works) and [Known problems](#known-problems) — nothing beyond those
-> lists is claimed.
+TomBox runs dumped, decrypted Xbox Series X|S game builds on ordinary PC hardware. It is
+not tied to one game: it reimplements the console's platform layer (the Xbox flavour of
+Direct3D 12, its precompiled GPU shaders, unified-memory textures and system libraries),
+so that a console executable can run as a normal Windows process.
+
+It is early. One title has been brought up so far, and it reaches its main menu but is not
+playable. Every number below is measured, and nothing outside the status section is claimed.
+
+## Status
+
+[![TomBox progress](docs/img/progress.svg)](docs/DEVELOPMENT_LOG.md)
+
+<sub>Generated from `tools/progress/progress.json` by `tools/progress/gen.py`. Shader counts
+are for the test title only; "translated" and "compiling" do not mean "renders correctly".</sub>
+
+| Milestone | State |
+|---|---|
+| Console executable loads and runs natively | done |
+| Graphics device, pipelines and presentation | done |
+| First frame from the real game | done |
+| Main menu / lobby reached | done |
+| 3D scene correct | in progress |
+| Input | partial (mouse) |
+| Audio | not started |
+| Gameplay | not started |
+| A second title | not started |
+
+### Tested titles
+
+| Title | Build | Result |
+|---|---|---|
+| Fortnite (Chapter 2 Season 4) | 2.0.1461.7919 | Boots, logs in to a private server, reaches the lobby. 2D interface correct. 3D scene lit but the character material is wrong and bloom shows artefacts. No audio. Not playable. |
+
+No other title has been tried. Expect anything else to stop at the first platform call or
+shader construct this title did not exercise; unsupported features fail with a logged
+error instead of being silently ignored.
 
 ## How it works
 
-The Series X|S CPU is x86-64, so the game's code runs directly on the host CPU: there is
-no CPU emulation and no recompilation of game code. The work is at the platform boundary.
+The Series X|S CPU is x86-64, so game code runs directly on the host CPU. There is no CPU
+emulation and no recompilation of game code. All the work is at the platform boundary.
 
-- **Executable**: the game's PE is started as an ordinary Windows process. Its Xbox-only
-  DLL imports are satisfied by small compatibility DLLs placed next to it.
-- **Graphics (`d3d12_xs`)**: wraps a real PC Direct3D 12 device and presents the Xbox
-  D3D12.x interface the game expects — different vtable layouts, Xbox-only device,
-  command-list and queue methods (`CreatePlacedResourceX`, `PresentX`, frame-pacing
-  events, derived pipeline states, …), each reconstructed from the game's own call sites.
-- **Shaders (`tombox-xshader`)**: the build ships no DXIL. Its shaders are precompiled
-  AMD RDNA2 machine code inside the DXBC containers. The translator disassembles that
-  code and emits HLSL, which is compiled at run time with Microsoft's DXC compiler (shader
-  model 6 DXIL; FXC as fallback) and cached on disk.
-- **Textures**: on console a texture lives at a game-chosen address in unified memory, in
-  a tiled layout. The runtime mirrors that memory into PC textures every frame, using the
-  texture-layout library (`xg_xs.dll`) from the dump itself to compute the layout.
-- **Platform services**: the game runs against Microsoft's PC `xgameruntime.dll`
-  (Gaming Services). Where that cannot serve an unregistered title, local replacements
-  are hooked in: a single offline Xbox user and an empty Microsoft Store that owns nothing.
-- **Network policy (`compat-common::net_guard`)**: by default every DNS lookup, socket
-  connect and WinHTTP connection made by the game fails locally. Optionally all traffic
-  is redirected to one host of your choosing (your own backend). It never talks to Epic.
-
-Details and evidence are in `docs/` (see [Documentation](#documentation)).
-
-## What works
-
-Verified on one machine (Windows 11, x64) with the Fortnite build above:
-
-| Area | State |
+| Layer | What TomBox does |
 |---|---|
-| Process start, engine init, asset loading from the dump | works |
-| Title screen, login screen, text, 2D UI | renders correctly |
-| Login against a private backend (network redirect + local Xbox user) | works |
-| Game-mode select, settings menus | render correctly |
-| Battle Royale lobby | loads; UI correct, **3D scene wrong** |
-| Shader translation (translate only, whole game archive) | 105,506 of 105,506 unique shaders |
-| Translated shaders compile (DXC) | whole-archive sweep in progress; see `docs/DEVELOPMENT_LOG.md` for the current count. Compiling is not the same as rendering correctly |
-| DXC output accepted by Direct3D 12 | checked for 3 compute fixtures (`xpso`); not yet run in the game |
-| Mouse | works (see limitations) |
-| Audio | none |
-| Gameplay / matches | not attempted |
+| **Executable** | The game's PE starts as an ordinary Windows process. Its Xbox-only DLL imports are satisfied by compatibility DLLs placed next to it. |
+| **Graphics** (`d3d12_xs`) | Wraps a real PC Direct3D 12 device and presents the Xbox D3D12.x interface: different method-table layouts and Xbox-only device, command-list and queue methods (`CreatePlacedResourceX`, `PresentX`, frame-pacing events, derived pipeline states), each reconstructed from call sites. |
+| **Shaders** (`tombox-xshader`) | Console builds ship no DXIL. Shaders are precompiled AMD RDNA2 machine code. The translator disassembles it and emits HLSL, compiled at run time with Microsoft's DXC and cached on disk. |
+| **Textures** | On console a texture lives at a game-chosen address in unified memory, in a tiled layout. The runtime mirrors that memory into PC textures, using the layout library (`xg_xs.dll`) from the dump itself. |
+| **Platform services** | Games run against Microsoft's PC `xgameruntime.dll`. Where that cannot serve an unregistered title, local replacements stand in: one offline user and an empty store. |
+| **Network** | A configurable guard on DNS, sockets and HTTP. Three modes: offline (the default), everything redirected to one server of your choice, or unrestricted. |
+
+### What is general and what is title-specific
+
+- **General**: the PE tooling, the shader translator, the Direct3D 12.x translation layer,
+  texture mirroring, memory and storage shims, and the network guard.
+- **Specific to the tested build**: the local user and store hooks locate functions through
+  that build's symbol table and refuse to install on any other executable. One shader rule
+  (the element size of structured buffers) is a heuristic fitted to this title. Both are
+  listed in `docs/TECHNICAL_DEBT.md` with the planned general replacement.
 
 ## Known problems
 
-- **3D rendering is not verified correct.** The lobby now renders as a coherent scene (stage
-  floor with pads, character, backdrop effects), but the character is very dark — direct
-  lighting is suspect — and there is no reference image to compare against.
-- **A shader that fails to compile is fatal.** Every shader now translates, but if the
-  generated HLSL for one does not compile, pipeline creation fails and the engine exits.
-- **First-time shader compiles are slow** (FXC took up to minutes; DXC about a second, not yet measured in the game) and
-  can trip the engine's stall watchdog the first time a screen is opened. Compiled shaders
-  are cached, so a given shader stalls at most once.
-- **Approximations in translated shaders**: texture lookups inside shader loops always use
-  the sharpest mip; whether a typed buffer holds floats or integers is inferred from how
-  the shader uses it (checked against a PC build's declarations, not exact); typed
-  textures are always assumed float; the element size of structured buffers is guessed
-  (D3D12 takes it from the shader, the console from the buffer view).
-- **Texture mirroring is polling-based**: changes are detected by hashing game memory each
-  frame; mips the game has not streamed in yet are left undefined.
-- **Window**: the image is stretched to the window, so resizing it to a non-16:9 shape
-  distorts the picture. The game still thinks it is driving a 3840×2160 display.
-- **No audio, no controller mapping work, no save data.**
-- **Several pieces are specific to this exact Fortnite build**: the local Xbox user and
-  store hooks locate game functions through that build's symbol table and refuse to
-  install on any other executable.
-- Other user-related platform calls (cloud saves, system dialogs) still go to Microsoft's
-  runtime and fail.
+- **3D rendering is not verified correct.** Lighting works, but the lobby character renders
+  with a cyan "hologram" look, bloom produces bright blocks along the top of the screen,
+  and there is no reference image to compare against.
+- **A shader that fails to compile is fatal.** Pipeline creation fails and the engine exits.
+- **First-time shader compiles stall.** Each shader is compiled once and then cached, but the
+  first visit to a screen can trip the engine's stall watchdog.
+- **Approximations in translated shaders.** Whether a buffer or texture holds integers or
+  floats is inferred from how the shader uses it (checked against a PC build's
+  declarations, not exact). Texture lookups inside shader loops use the sharpest mip.
+  Pixel-shader colour outputs assume the console replaces the default output packing per
+  render-target format; that replacement is inferred, not observed.
+- **Texture mirroring is polling-based.** Changes are found by hashing game memory each frame.
+- **Window.** The image is stretched to the window, and the game still believes it drives a
+  3840×2160 display.
+- **No audio, no controller support, no save data.**
 
 The full list of unverified assumptions is in `docs/TECHNICAL_DEBT.md`.
 
 ## Requirements
 
 - Windows 10/11 x64 with a Direct3D 12 GPU.
-- Microsoft Gaming Services installed (provides `xgameruntime.dll`).
-- Rust toolchain (`x86_64-pc-windows-msvc`); Windows SDK (`dxcompiler.dll` + `dxil.dll`, found automatically or via `TOMBOX_DXC_DIR`;
-  `d3dcompiler_47.dll` as fallback).
-- Your own legally obtained, already-decrypted dump of the game. **No game files are
-  provided here**, and the scripts assume the layout below.
+- Microsoft Gaming Services (provides `xgameruntime.dll`).
+- Rust toolchain (`x86_64-pc-windows-msvc`) and the Windows SDK (`dxcompiler.dll` and
+  `dxil.dll`, found automatically or through `TOMBOX_DXC_DIR`).
+- Your own legally obtained, already-decrypted dump. **No game files are provided here.**
 
 ## Build
 
@@ -107,52 +104,53 @@ set RUSTFLAGS=-C target-feature=+crt-static
 cargo build --release -p d3d12_xs -p xmem -p xcrdapi -p acphal -p dxcompiler_xs -p mfplat
 ```
 
-## Running the game
+## Running a title
 
-There is no installer or launcher yet; this is the manual procedure the development
-scripts automate (`tools/dev/iter.sh`, which contains machine-specific paths).
+There is no launcher yet. This is the manual procedure, shown for the tested title; the
+development scripts in `tools/dev/` automate it with machine-specific paths.
 
 1. Extract the dump to `input/extracted/` (game files end up under `input/extracted/Mount/`).
-2. Map that folder to drive `G:` — the game expects its filesystem root there:
+2. Map that folder to drive `G:`, where the game expects its filesystem root:
    `subst G: <repo>\input\extracted\Mount`
-3. Copy the built `acphal.dll`, `d3d12_xs.dll`, `dxcompiler_xs.dll`, `mfplat.dll`,
-   `xcrdapi.dll` and `xmem.dll` from `target/release/` into
-   `G:\FortniteGame\Binaries\XSX\`.
+3. Copy `acphal.dll`, `d3d12_xs.dll`, `dxcompiler_xs.dll`, `mfplat.dll`, `xcrdapi.dll` and
+   `xmem.dll` from `target/release/` into the folder of the game executable
+   (`G:\FortniteGame\Binaries\XSX\`).
 4. Copy the **real** `xg_xs.dll` from the dump (`EmbeddedXvd/Windows/System32/`) into the
-   same folder. Do not use the stub crate of the same name; texture layouts depend on the
-   real library.
-5. Optional: create `G:\FortniteGame\Binaries\XSX\tombox.cfg`:
+   same folder. Texture layouts depend on it; do not use the stub crate of that name.
+5. Optional: create `tombox.cfg` in that folder:
 
    ```
-   net_redirect=<your backend host>   # omit to block all network access
-   gamertag=<name>                    # local offline user (default TomBoxPlayer)
+   net_redirect=<your server>   # send all traffic to one host (omit to stay offline)
+   gamertag=<name>              # local offline user (default TomBoxPlayer)
    xuid=<decimal id>
-   xbl_token=<token string your backend expects>
+   xbl_token=<token string your server expects>
    ```
-6. Run `G:\FortniteGame\Binaries\XSX\FortniteClient-XSX-Shipping.exe`.
+6. Run the game executable (`FortniteClient-XSX-Shipping.exe`).
 
-Logs: compatibility-layer calls go to `%TEMP%\tombox_compat.log` (or `%TOMBOX_LOG%`).
-The game itself only logs through the debugger channel; `tools/dev/mdbg.rs` is a small
-tracer that captures it.
+Compatibility-layer calls are logged to `%TEMP%\tombox_compat.log` (or `%TOMBOX_LOG%`). The
+game logs only through the debugger channel; `tools/dev/mdbg.rs` is a small tracer for it.
 
-Useful environment variables: `TOMBOX_NET_REDIRECT` (same as `net_redirect`),
-`TOMBOX_D3D12_DEBUG=1` (Direct3D validation layer), `TOMBOX_RTCAP=1` (diagnostic
-render-target capture, triggered by creating `%TEMP%\tombox_capture_now`),
-`TOMBOX_OWN_WINDOW=1` (present into a separate window instead of the game's).
+| Variable | Effect |
+|---|---|
+| `TOMBOX_NET_REDIRECT` | Same as `net_redirect` |
+| `TOMBOX_ALLOW_NETWORK=1` | Turn the network guard off (unrestricted access) |
+| `TOMBOX_D3D12_DEBUG=1` | Direct3D validation layer |
+| `TOMBOX_RTCAP=1` | Diagnostics: render-target capture, per-draw trace, shader skip list and override, binding trace (see `docs/DEVELOPMENT_LOG.md`) |
+| `TOMBOX_OWN_WINDOW=1` | Present into a separate window |
 
 ## Repository layout
 
 ```
-crates/tombox-pe         PE32+ parser (bounds-checked, fuzz/truncation tested)
-crates/tombox-cli        pe-inspect and other analysis CLIs
-crates/tombox-archive    safe archive inspection/extraction
+crates/tombox-pe         PE32+ parser (bounds-checked, fuzz and truncation tested)
+crates/tombox-cli        pe-inspect and other analysis tools
+crates/tombox-archive    safe archive inspection and extraction
 crates/tombox-disasm     x86-64 disassembler front end with symbol resolution
-crates/tombox-loader     early loader experiments (not used to run the game)
 crates/tombox-xshader    RDNA2 shader extraction, disassembly and HLSL translation
-crates/compat/*          the compatibility DLLs (d3d12_xs, xmem, xcrdapi, acphal, …)
-                         and compat-common (logging, network policy, local user/store)
-tools/dev/               development scripts and the tracer (not part of the runtime)
-analysis/                shader test fixtures, evidence screenshots, inspection output
+crates/compat/*          the compatibility DLLs (d3d12_xs, xmem, xcrdapi, acphal, ...)
+                         and compat-common (logging, network guard, local user and store)
+tools/dev/               development scripts and the tracer
+tools/progress/          data and generator for the status image
+analysis/                shader test fixtures and inspection output
 docs/                    research and engineering record
 input/                   your dump (git-ignored, never committed)
 ```
@@ -161,22 +159,23 @@ input/                   your dump (git-ignored, never committed)
 
 - `docs/ARCHITECTURE.md` — execution model and subsystem boundaries
 - `docs/XBOX_RESEARCH.md` — platform findings and references
-- `docs/FORTNITE_ANALYSIS.md` — the target build: inventory, modules, dependencies
+- `docs/FORTNITE_ANALYSIS.md` — the first test title: inventory, modules, dependencies
 - `docs/COMPATIBILITY.md` — API matrix and feature status
 - `docs/TECHNICAL_DEBT.md` — unverified assumptions, known bugs, risks
 - `docs/DEVELOPMENT_LOG.md` — chronological log with commands, results and evidence
 - `docs/DECISIONS.md` — architecture decision records
 
 `ARCHITECTURE.md`, `XBOX_RESEARCH.md` and `COMPATIBILITY.md` lag behind the code; the
-development log and technical-debt file are current.
+development log and the technical-debt file are current.
 
 ## Scope and legal
 
 Interoperability research on binaries the user is authorised to analyse.
 
 - No console-security circumvention, key extraction or package decryption.
-- No connection to Epic or Fortnite production services: network access is blocked unless
-  explicitly redirected to a server you operate.
-- The local Xbox user is an offline placeholder, not an Xbox Live account, and the local
-  store grants no entitlements. No anti-cheat code is touched.
+- Network access is the user's choice (offline, redirected or unrestricted). The project's
+  own development and testing never connects to publisher production services.
+- The local user is an offline placeholder, not an Xbox Live account, and the local store
+  grants no entitlements. No anti-cheat code is touched.
 - Game executables and assets are not distributed with this project.
+- Not affiliated with Microsoft or any game publisher. Xbox is a trademark of Microsoft.

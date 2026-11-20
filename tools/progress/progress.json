@@ -1,0 +1,25 @@
+{
+  "updated": "2026-11-19",
+  "bars": [
+    {"label": "Project milestones reached", "done": 14, "total": 19, "note": "main menu / lobby reached; input, gameplay, audio open"},
+    {"label": "Shaders translated (test title, whole archive)", "done": 105506, "total": 105506, "note": "RDNA2 machine code to HLSL; translating is not rendering correctly"},
+    {"label": "Lobby-frame shaders compiling (DXC)", "done": 139, "total": 139, "note": "every shader used by the captured lobby frame"},
+    {"label": "Resource declarations matching a PC build", "done": 2607, "total": 4553, "note": "uniquely paired shaders; most differences are pairing noise"},
+    {"label": "Titles reaching a menu", "done": 1, "total": 1, "note": "only one title tested so far"}
+  ],
+  "areas": [
+    ["Executable loading (native x86-64, import shims)", "works"],
+    ["Direct3D 12.x interface translation", "partial"],
+    ["Shader translation (RDNA2 to HLSL)", "partial"],
+    ["Unified-memory textures", "partial"],
+    ["2D interface", "works"],
+    ["3D scene", "partial"],
+    ["Platform services (user, store)", "partial"],
+    ["Network (blocked or redirected to your server)", "works"],
+    ["Mouse / keyboard", "partial"],
+    ["Controller", "none"],
+    ["Audio", "none"],
+    ["Save data", "none"],
+    ["Gameplay", "none"]
+  ]
+}
