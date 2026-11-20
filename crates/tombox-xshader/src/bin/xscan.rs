@@ -335,13 +335,30 @@ static LIMIT: AtomicUsize = AtomicUsize::new(120);
 /// 1 = compile with fxc.exe (SM5 DXBC) instead of the default DXC (SM6 DXIL).
 static USE_FXC: AtomicUsize = AtomicUsize::new(0);
 
+/// `--mnemonics 1`: also print, per instruction mnemonic, how many shaders use it and how
+/// many of those translate.
+static MNEM: AtomicUsize = AtomicUsize::new(0);
+static MNEM_USE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// Translate (and optionally compile) one container. Returns (stage, result, compiled_now).
 fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
     let r = std::panic::catch_unwind(|| match extract(blob) {
         Err(e) => (String::from("?"), Err(format!("extract: {e}")), false),
         Ok(ex) => {
             let st = stage_name(&ex.stage).to_string();
-            match hlsl::translate(&ex) {
+            let tr = hlsl::translate(&ex);
+            if MNEM.load(Ordering::Relaxed) != 0 {
+                // Instruction usage: (shaders using it, of which translated).
+                let names: std::collections::BTreeSet<String> =
+                    tombox_xshader::rdna2::disassemble(&ex.isa).into_iter().map(|i| i.mnemonic).collect();
+                let mut g = MNEM_USE.lock().unwrap();
+                for n in names {
+                    let e = g.entry(n).or_insert((0u64, 0u64));
+                    e.0 += 1;
+                    e.1 += tr.is_ok() as u64;
+                }
+            }
+            match tr {
                 Err(e) => (st, Err(e), false),
                 Ok(t) if !compile => {
                     let _ = t;
@@ -406,6 +423,7 @@ fn main() -> ExitCode {
             "--limit" => limit = args[i + 1].parse().unwrap_or(usize::MAX),
             "--jobs" => jobs = args[i + 1].parse().unwrap_or(jobs).max(1),
             "--compile" => compile = args[i + 1] == "1",
+            "--mnemonics" => MNEM.store((args[i + 1] == "1") as usize, Ordering::Relaxed),
             "--fxc-limit" => LIMIT.store(args[i + 1].parse().unwrap_or(120), Ordering::Relaxed),
             "--compiler" => USE_FXC.store((args[i + 1] == "fxc") as usize, Ordering::Relaxed),
             other => eprintln!("warning: ignoring {other}"),
@@ -547,6 +565,12 @@ fn main() -> ExitCode {
     println!("--- failure reasons ({} distinct) ---", v.len());
     for (reason, (count, ex)) in v.iter().take(80) {
         println!("{count:>7}  {reason}   [e.g. {ex:016x}]");
+    }
+    if MNEM.load(Ordering::Relaxed) != 0 {
+        println!("--- mnemonics (shaders using, translated) ---");
+        for (n, (used, ok)) in MNEM_USE.lock().unwrap().iter() {
+            println!("MNEM {n} {used} {ok}");
+        }
     }
     ExitCode::SUCCESS
 }
