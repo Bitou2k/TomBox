@@ -27,6 +27,14 @@ fn main() -> ExitCode {
             let enc = if *encryption == RPF7_OPEN { "OPEN (table is plain)".to_string() } else { format!("{encryption:#010x} (table is encrypted)") };
             println!("  entries {entry_count}, names {names_length} bytes, encryption {enc}");
         }
+        Header::V8 { entry_count, names_length, decryption_tag, platform, entries } => {
+            let enc = if *decryption_tag == 0xff { "0xff (table is plain)".to_string() } else { format!("{decryption_tag:#x} (table is encrypted)") };
+            println!("  entries {entry_count}, names {names_length} bytes, platform {platform:#x}, decryption tag {enc}");
+            for e in entries {
+                println!("    {:08X} ext {:#04x}{} offset {:#x} size {:#x} compressor {} key {:#04x}",
+                    e.name_hash, e.ext_id, if e.resource { " resource" } else { "" }, e.offset, e.size_on_disk, e.compressor, e.key_id);
+            }
+        }
         Header::V9 { words } => {
             println!("  header (0x40 bytes, plain); field meanings are not established:");
             for (i, w) in words.iter().enumerate().skip(1) {

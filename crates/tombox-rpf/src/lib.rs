@@ -6,6 +6,10 @@
 //!   header `magic "RPF7" (stored little-endian, so the bytes read "7FPR"), entry count,
 //!   names length, encryption tag`, followed by 16-byte entries and the name table. The tag
 //!   is `OPEN` (plain), or one of two values meaning the table is encrypted.
+//! * **RPF8** (layout as read by the public-domain `rpf-archive-rs` crate, not checked here
+//!   against a real file): `magic, entry count, names length, u16 decryption tag, u16
+//!   platform`, a 256-byte signature, then 24-byte entries from offset 272. A tag of 0xFF
+//!   means the table is plain; anything else means it is encrypted. Plain entries are decoded.
 //! * **RPF9**: observed in exactly one file (8,880 bytes). Its first 0x40 bytes are plain;
 //!   everything after is either high-entropy data or zero padding. The header fields are
 //!   reported by offset. Names given to them below are guesses and are marked as such.
@@ -41,8 +45,25 @@ pub enum RegionKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Header {
     V7 { entry_count: u32, names_length: u32, encryption: u32 },
+    V8 { entry_count: u32, names_length: u32, decryption_tag: u16, platform: u16, entries: Vec<Entry8> },
     /// The sixteen little-endian dwords of the 0x40-byte header, verbatim.
     V9 { words: [u32; 16] },
+}
+
+/// One RPF8 table entry (only decoded when the table is plain).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry8 {
+    pub name_hash: u32,
+    /// 0xFF = not encrypted.
+    pub key_id: u8,
+    /// 0xFE = directory.
+    pub ext_id: u8,
+    pub resource: bool,
+    pub offset: u64,
+    pub size_on_disk: u64,
+    /// 0 = stored.
+    pub compressor: u8,
+    pub last_qword: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +141,30 @@ pub fn inspect(b: &[u8]) -> Result<Rpf, String> {
     let digit = (magic & 0xff) as u8;
     let (header, header_len) = match digit {
         b'7' => (Header::V7 { entry_count: u32_at(b, 4)?, names_length: u32_at(b, 8)?, encryption: u32_at(b, 12)? }, 16),
+        b'8' => {
+            let (entry_count, tag) = (u32_at(b, 4)?, u32_at(b, 12)?);
+            let mut entries = Vec::new();
+            if tag as u16 == 0xff {
+                // Bounded by the file, not by the count the file claims.
+                for i in 0..entry_count as usize {
+                    let o = 272 + i * 24;
+                    let Some(e) = b.get(o..o + 24) else { return Err(format!("truncated: entry {i} of {entry_count} at {o:#x}")) };
+                    let q = |k: usize| u64::from_le_bytes(e[k..k + 8].try_into().unwrap());
+                    let (q0, q1) = (q(0), q(8));
+                    entries.push(Entry8 {
+                        name_hash: q0 as u32,
+                        key_id: (q0 >> 40) as u8,
+                        ext_id: (q0 >> 48) as u8,
+                        resource: (q0 >> 56) & 1 != 0,
+                        size_on_disk: (q1 & 0xfff_ffff) << 4,
+                        offset: ((q1 >> 28) & 0x7fff_ffff) << 4,
+                        compressor: (q1 >> 59) as u8,
+                        last_qword: q(16),
+                    });
+                }
+            }
+            (Header::V8 { entry_count, names_length: u32_at(b, 8)?, decryption_tag: tag as u16, platform: (tag >> 16) as u16, entries }, 272.min(b.len()))
+        }
         b'9' => {
             let mut words = [0u32; 16];
             for (i, w) in words.iter_mut().enumerate() {
@@ -127,7 +172,7 @@ pub fn inspect(b: &[u8]) -> Result<Rpf, String> {
             }
             (Header::V9 { words }, 0x40)
         }
-        d if d.is_ascii_digit() => return Err(format!("RPF version {} is not supported (known: 7, 9)", d as char)),
+        d if d.is_ascii_digit() => return Err(format!("RPF version {} is not supported (known: 7, 8, 9)", d as char)),
         d => return Err(format!("not an RPF file: version byte {d:#04x}")),
     };
     let mut regions = vec![Region { start: 0, end: header_len, kind: RegionKind::Header, entropy: entropy(&b[..header_len]) }];
@@ -180,11 +225,34 @@ mod tests {
     }
 
     #[test]
+    fn rpf8_plain_table_is_decoded_and_encrypted_one_is_not() {
+        let mut b = vec![0u8; 272];
+        b[..4].copy_from_slice(&0x5250_4638u32.to_le_bytes());
+        b[4..8].copy_from_slice(&1u32.to_le_bytes());
+        b[12..14].copy_from_slice(&0xffu16.to_le_bytes());
+        let q0: u64 = 0xdead_beef | (0xff << 40) | (0x07 << 48) | (1 << 56);
+        let q1: u64 = (0x30 >> 4) | ((0x200u64 >> 4) << 28) | (2 << 59);
+        for q in [q0, q1, 0x1234] {
+            b.extend_from_slice(&q.to_le_bytes());
+        }
+        match inspect(&b).unwrap().header {
+            Header::V8 { entries, decryption_tag: 0xff, .. } => {
+                assert_eq!(entries, vec![Entry8 { name_hash: 0xdead_beef, key_id: 0xff, ext_id: 7, resource: true, offset: 0x200, size_on_disk: 0x30, compressor: 2, last_qword: 0x1234 }]);
+            }
+            h => panic!("{h:?}"),
+        }
+        b[12] = 0xc0; // encrypted table: entries are not interpreted
+        assert!(matches!(inspect(&b).unwrap().header, Header::V8 { ref entries, .. } if entries.is_empty()));
+        b[12] = 0xff;
+        assert!(inspect(&b[..280]).unwrap_err().contains("truncated"));
+    }
+
+    #[test]
     fn rejects_other_files_and_truncation() {
         assert!(inspect(b"PK\x03\x04aaaaaaaaaaaa").is_err());
         assert!(inspect(b"9F").is_err());
         assert!(inspect(b"9FPR\x00\x00").unwrap_err().contains("truncated"));
-        assert!(inspect(b"8FPRxxxxxxxxxxxxxxxx").unwrap_err().contains("not supported"));
+        assert!(inspect(b"5FPRxxxxxxxxxxxxxxxx").unwrap_err().contains("not supported"));
         // every prefix of a valid file either parses or fails cleanly
         let mut b = vec![0u8; 0x40];
         b[..4].copy_from_slice(&0x5250_4639u32.to_le_bytes());
