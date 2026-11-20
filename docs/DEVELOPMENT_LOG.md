@@ -1012,3 +1012,28 @@ Pixel and compute shaders come later in the file and were not sampled.
 Not done: a proper extractor in the repo (the scan was a scratch script), pixel/compute
 sampling, the `SGD5` index, mesh-shader translation, and a binding model for shaders
 without root signatures.
+
+## 2026-11-20 — Second title: what is and is not encrypted in the data packages
+
+Read-only survey with scratch scripts (samples of 17–34 MB per file at several offsets;
+not exhaustive).
+
+* **Only the tables of contents are opaque.** Every `RPF9` archive (including archives
+  nested inside `levels.rpf`, `navmeshes.rpf`, `anim.rpf`, …) has a plain 0x40-byte header
+  followed by a high-entropy table. The first bytes of that table are identical across
+  different archives. Not investigated further.
+* **File contents are zlib streams, not encrypted.** Sampled streams inflate cleanly:
+  `levels.rpf` 132 streams (22.8 MB → 88.5 MB), `navmeshes.rpf` 362, `anim.rpf` 857,
+  `data.rpf` 847, `core_bvh4.rpf` 730. Inflated payloads seen: resource objects carrying a
+  `0DRP` tag at +0x10 and pointers of the form `0x5000xxxx` (relocatable resource
+  memory), `PSIN`-tagged metadata blobs (most of `data.rpf`), raw float/index arrays
+  (navigation meshes), and `RSC8`-tagged records stored plain in `audio.rpf` and
+  `story000.rpf` next to readable asset names (`pack:/….clip`).
+* **`.ttpf` (magic `RDS5`)**: plain header (entry count at +4) and a plain 8-byte-per-entry
+  table, then zlib streams of 12–128 KiB that inflate to what look like block-compressed
+  texture pages (repeating 8-byte colour-pair + index blocks). By directory names these
+  are streamed texture databases (maps, terrain, peds, props, UI, …).
+
+Consequence: contents can be listed by scanning for streams, but without the tables there
+are no file names, sizes or boundaries for anything that is not self-describing. Nothing
+here was decrypted and no keys were looked for.
