@@ -6,6 +6,7 @@ members = [
     "crates/tombox-pe",
     "crates/tombox-cli",
     "crates/tombox-archive",
+    "crates/tombox-rpf",
     "crates/tombox-disasm",
     "crates/tombox-xshader",
     "crates/compat/compat-common",

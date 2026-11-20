@@ -154,6 +154,7 @@ game logs only through the debugger channel; `tools/dev/mdbg.rs` is a small trac
 crates/tombox-pe         PE32+ parser (bounds-checked, fuzz and truncation tested)
 crates/tombox-cli        pe-inspect and other analysis tools
 crates/tombox-archive    safe archive inspection and extraction
+crates/tombox-rpf        RAGE package (.rpf) header and region inspector (structure only)
 crates/tombox-disasm     x86-64 disassembler front end with symbol resolution
 crates/tombox-xshader    RDNA2 shader extraction, disassembly and HLSL translation
 crates/compat/*          the compatibility DLLs (d3d12_xs, xmem, xcrdapi, acphal, ...)

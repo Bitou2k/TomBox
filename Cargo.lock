@@ -92,6 +92,10 @@ name = "tombox-pe"
 version = "0.1.0"
 
 [[package]]
+name = "tombox-rpf"
+version = "0.1.0"
+
+[[package]]
 name = "tombox-xshader"
 version = "0.1.0"
 dependencies = [

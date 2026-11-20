@@ -964,3 +964,20 @@ half-resolution chain).
 Not done: SRVs created before a slot is rebound still show as "no descriptor recorded" in
 some tables (scene depth); `R16_UINT` targets are not decoded by the capture; whole-archive
 DXC sweep not rerun with these changes.
+
+## 2026-11-20 — `rpf-inspect`: RAGE package files (structure only)
+
+The owner supplied one package file from another title (`appdata0.rpf`, 8,880 bytes; not in
+the repo). Observed: magic `RPF9`; a plain 0x40-byte header; 0x40..0x550 high entropy
+(7.85 bits/byte); zeros to 0x1000; 0x1000..end high entropy (7.96). No plain table of
+contents, names or data anywhere. Header dword +0x04 = 0x360, +0x08 = 0x340, +0x0c = 0x40
+(equals the header size), +0x1c = 0x150, +0x30 = 0x10; the meanings are not established
+(one file is not enough to tell sizes from counts).
+
+New crate `tombox-rpf` (`rpf-inspect <file>`): bounds-checked header parse for RPF7
+(community-documented 16-byte header) and RPF9 (fields reported by offset, unnamed), plus a
+region map (header / zero padding / high entropy / plain) with entropy. 3 unit tests on
+synthetic buffers, including truncation. It does not decrypt: package keys belong to the
+title, and recovering them is outside this project's scope. For shader inspection the
+route that stays in scope is capturing shaders as the running title hands them to the
+graphics API (the capture tool already saves them).
