@@ -144,6 +144,8 @@ o, y = [], 0
 y, a_done, a_n = section(o, y, "Imported system functions*", imports(), 300)
 y, b_done, b_n = section(o, y, "Direct3D 12.x interface methods", d3d12x(), 170)
 y, c_done, c_n = section(o, y, "RDNA2 shader instructions translated", instructions(), 260)
+stages = {k: [v] for k, v in cfg["stages"].items() if k != "comment"}
+y, d_done, d_n = section(o, y, "Shader stages translated", stages, 60)
 svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 {y:.0f}" width="1000" height="{y:.0f}">\n'
        f'<rect x="0" y="0" width="1000" height="{y:.0f}" fill="{BG}"/>\n' + "\n".join(o) + "\n</svg>\n")
 open(os.path.join(root, "docs", "img", "progress.svg"), "w", encoding="utf-8").write(svg)
@@ -152,5 +154,6 @@ badge("imports", "system functions*", f"{100 * a_done / a_n:.2f}%", pct_colour(1
 badge("d3d12x", "Direct3D 12.x methods", f"{100 * b_done / b_n:.2f}%", pct_colour(100 * b_done / b_n))
 badge("instructions", "RDNA2 instructions", f"{100 * c_done / c_n:.2f}%", pct_colour(100 * c_done / c_n))
 badge("shaders", "shaders translated", f'{s["translated"]:,}/{s["total"]:,}', "#4c1")
+badge("titles", "titles examined", str(cfg.get("titles", 1)), "#007ec6")
 badge("milestones", "milestones", f'{m["done"]}/{m["total"]}', pct_colour(100 * m["done"] / m["total"]))
 print(f"imports {a_done}/{a_n}  d3d12x {b_done}/{b_n}  instructions {c_done}/{c_n}  height {y:.0f}")

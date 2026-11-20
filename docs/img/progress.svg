@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 850" width="1000" height="850">
-<rect x="0" y="0" width="1000" height="850" fill="#0d1117"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 950" width="1000" height="950">
+<rect x="0" y="0" width="1000" height="950" fill="#0d1117"/>
 <text x="4.00" y="21.00" font-family="sans-serif" font-size="16" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Imported system functions*: 94.93% (637/671)</text>
 <g><title>C/C++ runtime: 357/357 (100%)</title>
 <rect x="1.00" y="31.00" width="20.39" height="21.29" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
@@ -1523,5 +1523,46 @@
 <rect x="970.97" y="820.33" width="28.03" height="18.67" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
 <rect x="969.97" y="819.33" width="30.03" height="20.67" fill="none" stroke="#0d1117" stroke-width="2"/>
 <text x="974.97" y="835.33" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">EXP</text>
+</g>
+<text x="4.00" y="871.00" font-family="sans-serif" font-size="16" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Shader stages translated: 75.00% (6/8)</text>
+<g><title>Vertex: 1/1 (100%)</title>
+<rect x="1.00" y="881.00" width="123.00" height="58.00" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="0.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="5.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Vertex</text>
+</g>
+<g><title>Pixel: 1/1 (100%)</title>
+<rect x="126.00" y="881.00" width="123.00" height="58.00" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="125.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="130.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Pixel</text>
+</g>
+<g><title>Compute: 1/1 (100%)</title>
+<rect x="251.00" y="881.00" width="123.00" height="58.00" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="250.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="255.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Compute</text>
+</g>
+<g><title>Geometry: 1/1 (100%)</title>
+<rect x="376.00" y="881.00" width="123.00" height="58.00" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="375.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="380.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Geometry</text>
+</g>
+<g><title>Hull: 1/1 (100%)</title>
+<rect x="501.00" y="881.00" width="123.00" height="58.00" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="500.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="505.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Hull</text>
+</g>
+<g><title>Domain: 1/1 (100%)</title>
+<rect x="626.00" y="881.00" width="123.00" height="58.00" fill="#2ea043" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="625.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="630.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Domain</text>
+</g>
+<g><title>Mesh: 0/1 (0%)</title>
+<rect x="751.00" y="881.00" width="123.00" height="58.00" fill="#6e7681" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="750.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="755.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Mesh</text>
+</g>
+<g><title>Amplification: 0/1 (0%)</title>
+<rect x="876.00" y="881.00" width="123.00" height="58.00" fill="#6e7681" stroke="#0d1117" stroke-width="0.5"/>
+<rect x="875.00" y="880.00" width="125.00" height="60.00" fill="none" stroke="#0d1117" stroke-width="2"/>
+<text x="880.00" y="896.00" font-family="sans-serif" font-size="12" fill="#ffffff" stroke="#0d1117" stroke-width="3" paint-order="stroke">Amplification</text>
 </g>
 </svg>
