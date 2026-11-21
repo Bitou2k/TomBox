@@ -165,9 +165,11 @@ Honest ledger. Updated continuously.
 ## Second title asset tools (tools/rage)
 - Normal encoding chosen per model by fit to face normals because the shader's top-bit branch
   disagrees with the observed data (unresolved).
-- Buffer-record layout in the resource block and same-count tie-breaking by record order are
-  inferred. Model -> texture-pack link found (u64 key in the texture records), but shader
-  parameters -> geometry (which texture on which part) is not decoded.
+- Model structure (`drawable.py`): shader group, shaders, parameter tables, models and
+  geometries decoded by pointer-following; parameter names are hashes, only DiffuseTex and
+  SpecularTex named. Other texture roles (normal, specular, masks, terrain layers 2+, the
+  overlay slot 0x7485dafb of layered shaders) are not applied; layered materials show layer 1.
+  `modelexport.py` (OBJ export) still uses the older vertex-count pairing.
 - Texture packs: 14% of textures use a BC-aware chunk codec (values 1-7 track BC1-BC7) with
   no available decoder; layout choice (d1 bits 24-26: 0 -> 0x2, 1-3 -> 0x105) is from visual
   checks; cube maps not untiled; ~1.8% of records' page spans are smaller than their declared
@@ -178,8 +180,9 @@ Honest ledger. Updated continuously.
   a model only inside multi-model (LOD dictionary) files, whose part -> name split is not
   decoded; ~400k (5,351 files) lie within 250 m of the origin, presumably interiors in local
   space, with no decoded world placement.
-- Map viewer (`tools/rage/mapview`): untextured, no LOD selection (near/far versions overlap),
-  interiors and dictionary models left out; ~18% of model parts skipped (position-buffer
-  pairing ambiguous, or a buffer that looks like meshlets but points past the data).
+- Map viewer (`tools/rage/mapview`): colour texture only (see above), no LOD selection
+  (near/far versions overlap), interiors left out. Texture decode fails for ~12% of sampled
+  colour textures (records shorter than their mip chain - not explained by dropped top mips
+  - and the unsupported chunk codec).
 - Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
 - DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).

@@ -8,6 +8,8 @@ from meshlets import _stream
 
 def triangles(g, base):
     """Triangle vertex indices (n, 3) uint32 of a meshlet buffer."""
+    if base < 0 or base + 12 > len(g):
+        raise ValueError("meshlet buffer outside the GPU block")
     h0, ntri, nref = struct.unpack_from("<III", g, base)
     if not h0 & 0x80000000:
         raise ValueError("not a meshlet buffer")
@@ -35,8 +37,16 @@ def triangles(g, base):
 
 
 def positions(g, base, nv):
+    if base < 0 or base + 0x80 > len(g):
+        raise ValueError("position buffer outside the GPU block")
     d0 = struct.unpack_from("<I", g, base)[0]
     stride, off = (d0 >> 3) & 60, (d0 >> 7) & 0x1FFFFFC
+    if (d0 & 0xF) == 3 and stride == 12:
+        # Plain float x, y, z (header "c0"): flat proxy parts whose extents equal the
+        # drawable's bounding box on the samples checked.
+        if base + off + 12 * nv > len(g):
+            raise ValueError("vertex index beyond the data")
+        return np.frombuffer(g, "<f4", 3 * nv, base + off).reshape(nv, 3).copy()
     bias = np.array(struct.unpack_from("<3f", g, base + 0x60))
     order = struct.unpack_from("<I", g, base + 0x6C)[0]
     scale = np.array(struct.unpack_from("<3f", g, base + 0x70))
@@ -65,6 +75,11 @@ def normals(g, base, pos, tris):
     """As meshlets.normals: 10:10 or 8:8 octahedral, chosen by agreement with face normals."""
     st = _stream(g, base, 2)
     nv = len(pos)
+    if st and st[1] == 12 and st[2] == 3 and base + st[0] + 12 * nv <= len(g):
+        # Float x, y, z normals (with the float position format); kept only if unit length.
+        n = np.frombuffer(g, "<f4", 3 * nv, base + st[0]).reshape(nv, 3).astype(np.float64)
+        l = np.linalg.norm(n, axis=1)
+        return n.astype(np.float32) if np.abs(l - 1).mean() < 0.05 else None
     if not st or st[1] != 4 or base + st[0] + 4 * nv > len(g):
         return None
     d = np.frombuffer(g, "<u4", nv, base + st[0]).astype(np.int64)

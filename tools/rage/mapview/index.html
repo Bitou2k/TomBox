@@ -28,16 +28,19 @@
   <div class="row">tiles loaded <b id="tiles">0</b> · placements shown <b id="shown">0</b></div>
   <div class="row">models decoded <b id="models">0</b> · not decodable <b id="failed">0</b> · pending <b id="pending">0</b></div>
   <div class="row">parts skipped <b id="parterr">0</b> · request errors <b id="neterr">0</b></div>
+  <div class="row">textures loaded <b id="texok">0</b> · not decodable <b id="texbad">0</b></div>
+  <label><input id="tex" type="checkbox" checked> textures (applies to models loaded after the change)</label>
   <div class="row">red points: placements whose model is not in levels.rpf</div>
   <label>load radius <input id="radius" type="range" min="250" max="1500" step="250" value="500"> <b id="rv">500</b> m</label>
   <label><input id="pts" type="checkbox" checked> whole-map point cloud</label>
   <details><summary>what this shows</summary>
-    Positions, rotations and scales are the game's placement records; geometry is decoded on
-    request from the original package. Not shown: textures (texture-to-part mapping is not
-    decoded) and level-of-detail selection (the hierarchy is not decoded, so near and far
+    Positions, rotations and scales are the game's placement records; geometry and colour
+    textures are decoded on request from the original packages. Each part uses its shader's
+    DiffuseTex texture; other maps (normal, specular, masks), shader parameters and blending
+    of layered materials are not applied. Not shown: level-of-detail selection (the hierarchy is not decoded, so near and far
     versions of an object can overlap), interiors (stored near the origin in their own
-    space; where they sit in the world is not decoded), and models packed several to a file.
-    Colours are per model, for telling them apart.
+    space; where they sit in the world is not decoded). Untextured parts are coloured per
+    model, for telling them apart.
   </details>
   <div id="err"></div>
 </div>
@@ -126,6 +129,30 @@ function pump() {
   }
 }
 const request = (url) => new Promise((ok, fail) => { queue.push({ url, ok, fail, tries: 0 }); pump(); });
+// One material per colour texture. It starts grey and gets its texture when the PNG arrives;
+// a texture that fails to decode leaves the part grey (counted).
+const texMats = new Map();
+let nTex = 0, nTexFail = 0;
+function textured(key) {
+  if (texMats.has(key)) return texMats.get(key);
+  const mat = new THREE.MeshLambertMaterial({ color: 0x9a9a9a, side: THREE.DoubleSide });
+  texMats.set(key, mat);
+  request("/api/tex/" + key).then(async (r) => {
+    if (!r.ok) { nTexFail++; return; }
+    const bmp = await createImageBitmap(await r.blob());
+    const t = new THREE.Texture(bmp);
+    t.flipY = false; // game UVs have v pointing down the image
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = 4;
+    t.needsUpdate = true;
+    mat.map = t;
+    mat.color.set(0xffffff);
+    mat.needsUpdate = true;
+    nTex++;
+  }).catch(() => nTexFail++);
+  return mat;
+}
 function loadModel(h) {
   if (models.has(h)) return models.get(h);
   nPending++;
@@ -139,17 +166,19 @@ function loadModel(h) {
     let o = 4 + hl;
     nPartErr += head.errors.length;
     const parts = [];
+    const plain = new THREE.MeshLambertMaterial({ color: hue(h), side: THREE.DoubleSide });
     for (const pt of head.parts) {
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(buf, o, pt.nv * 3), 3)); o += pt.nv * 12;
       if (pt.normals) { g.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(buf, o, pt.nv * 3), 3)); o += pt.nv * 12; }
+      if (pt.uvs) { g.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(buf, o, pt.nv * 2), 2)); o += pt.nv * 8; }
       g.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, o, pt.nt * 3), 1)); o += pt.nt * 12;
       if (!pt.normals) g.computeVertexNormals();
-      parts.push(g);
+      parts.push({ g, mat: pt.tex && $("tex").checked ? textured(pt.tex) : plain });
     }
     if (!parts.length) { nFailed++; return null; }
     nModels++;
-    return { parts, mat: new THREE.MeshLambertMaterial({ color: hue(h), side: THREE.DoubleSide }) };
+    return { parts };
   }).catch((e) => { nPending--; nNetErr++; models.delete(h); $("err").textContent = String(e); return null; });
   models.set(h, p);
   return p;
@@ -185,8 +214,8 @@ async function loadTile(tx, ty) {
   for (const [h, list] of byName) {
     loadModel(h).then((mdl) => {
       if (!mdl || t.dead) return;
-      for (const g of mdl.parts) {
-        const im = new THREE.InstancedMesh(g, mdl.mat, list.length);
+      for (const { g, mat } of mdl.parts) {
+        const im = new THREE.InstancedMesh(g, mat, list.length);
         list.forEach((i, k) => {
           const b = i * 12;
           p.set(f[b], f[b + 1], f[b + 2]);
@@ -248,6 +277,7 @@ function frame(now) {
   $("tiles").textContent = tiles.size; $("shown").textContent = shown;
   $("models").textContent = nModels; $("failed").textContent = nFailed; $("pending").textContent = nPending;
   $("parterr").textContent = nPartErr; $("neterr").textContent = nNetErr;
+  $("texok").textContent = nTex; $("texbad").textContent = nTexFail;
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

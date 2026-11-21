@@ -1235,3 +1235,32 @@ the LOD-parent hierarchy (parent index != 0xffff on part of the records).
   sample. The first page version issued every model request at once and the browser dropped
   them (~33k "failed" in the user's run); requests are now queued (6 at a time, with retries),
   and decode failures and request errors are counted separately.
+
+## 2026-11-21 — Second title: model materials decoded; textured map viewer
+
+- `tools/rage/drawable.py`: model resource structure by pointer-following (layout in its
+  docstring). Shader group -> shaders -> parameter table (joaat name hash, slot code) ->
+  texture slot -> texture record (pack key). Model -> geometries with a u16 shader index each.
+  Each geometry points to its own position buffer (inline record +0x58) and meshlet buffer
+  (+0x40 struct, which also states meshlet and triangle counts). Fragments (`.#ft`) hold
+  their drawable at +0x18; multi-model files are dictionaries (name hashes + drawable
+  pointers).
+- Checks: 4,000 sampled level files - every geometry's meshlet buffer has exactly the stated
+  meshlet and triangle counts (15,866 parts), every shader index in range; all 776 dictionary
+  member hashes equal names stored in their files; 200 of 200 sampled fragments decode via
+  +0x18. Only two parameter hashes matched guessed names (DiffuseTex 0xc8e8c282, SpecularTex
+  0xc6f46e79); DiffuseTex slots hold only sRGB colour formats (BC1/BC7/BC3 sRGB). Shaders
+  without DiffuseTex: the first sRGB-format slot is used (92% of them layer 1 of layered
+  terrain shaders, 0x346394ea).
+- Second vertex format: header "c0" (low nibble 3, stride 12) = float32 x, y, z positions
+  (and float normals); extents equal the drawable bounding box on the samples. 4% of parts.
+- `ttpfexport.untile` takes a mip level; the viewer decodes the largest mip <= 512 px (median
+  29 ms per texture). A8/R8 formats decoded as grey.
+- Short texture records (span < mip chain, ~3.6%): not explained by missing top mips (16 of 218
+  match a cut-down chain exactly); left unsupported.
+- Viewer: per-part colour textures; 400 sampled models near the densest tile all decode
+  (2,677 parts, no part errors; previously 394 models with 18% of parts skipped); 256 of 292
+  tested colour textures decode. Offline renders of signs and a dumpster through the
+  server's own output show correct UV orientation (decals, rust along edges). Stop sign face
+  is missing: it is in the layered shader's overlay slot (0x7485dafb) and uses the unsupported
+  codec.

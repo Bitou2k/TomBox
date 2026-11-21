@@ -16,8 +16,11 @@ from xgtry import computer
 from PIL import Image
 
 
-def untile(data, t, layout):
+def untile(data, t, layout, mip=0):
+    """Linear pixels (or blocks) of one mip level, size (w >> mip, h >> mip), at least 1."""
     w, h, fmt = t["w"], t["h"], t["fmt"]
+    if mip >= max(t["mips"], 1):
+        return None, f"mip {mip} not stored"
     c = computer(w, h, max(t["mips"], 1), fmt, layout, t["arr"])
     if not c:
         return None, "layout computer refused"
@@ -25,12 +28,13 @@ def untile(data, t, layout):
         return None, f"layout needs {c['total']} bytes, pack span is {len(data)}"
     bpe = c["bpe"]
     blk = 4 if fmt in BC else 1
-    we, he = (w + blk - 1) // blk, (h + blk - 1) // blk
+    mw, mh = max(w >> mip, 1), max(h >> mip, 1)
+    we, he = (mw + blk - 1) // blk, (mh + blk - 1) // blk
     out = bytearray(we * he * bpe)
     off = c["off"]
     for y in range(he):
         for x in range(we):
-            o = off(0, x, y)
+            o = off(mip, x, y)
             out[(y * we + x) * bpe:(y * we + x + 1) * bpe] = data[o:o + bpe]
     return bytes(out), None
 
@@ -40,13 +44,15 @@ def untile(data, t, layout):
 SAME_BITS = {29: 28, 72: 71, 75: 74, 78: 77, 99: 98, 91: 87, 93: 87}
 
 
-def to_image(t, px):
+def to_image(t, px, mip=0):
     fmt = SAME_BITS.get(t["fmt"], t["fmt"])
+    if fmt in (61, 65):  # R8_UNORM, A8_UNORM: one byte per pixel, shown as grey
+        return Image.frombytes("L", (max(t["w"] >> mip, 1), max(t["h"] >> mip, 1)), px)
     if fmt == 87:  # B8G8R8A8: swap to R8G8B8A8
         a = bytearray(px)
         a[0::4], a[2::4] = px[2::4], px[0::4]
         px, fmt = bytes(a), 28
-    img = Image.open(io.BytesIO(dds(t["w"], t["h"], fmt, px)))
+    img = Image.open(io.BytesIO(dds(max(t["w"] >> mip, 1), max(t["h"] >> mip, 1), fmt, px)))
     img.load()
     return img if img.mode in ("RGB", "RGBA", "L") else img.convert("RGB")
 
