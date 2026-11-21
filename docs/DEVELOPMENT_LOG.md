@@ -1143,3 +1143,42 @@ there or in the story package, so textured previews use a checker for now.
   Compute shaders now prefer PSV0 over the ISA preamble (the title's preambles say 1,1,1; one
   shader using derivatives failed validation). Fortnite's shaders carry no PSV0 thread counts:
   still 105,506 / 105,506.
+
+## 2026-11-21 — Second title: texture packs (`.ttpf`) read; models linked to their textures; `levels.rpf` geometry
+
+**Texture packs** (`tools/rage/ttpf.py`, `ttpfexport.py`). Not encrypted; layout read off the
+files and cross-checked against inflated sizes (details in the `ttpf.py` docstring):
+- `RDS5` header: chunk count, virtual size, offset/256 of the `ETPF` texture table; then u64
+  chunk entries = file offset/256 (bits 0-25), codec (bits 26-29), virtual 4 KiB page (bits
+  30-51). Inflated chunk lengths equal the gaps between consecutive virtual pages (checked on
+  every chunk read).
+- `ETPF`: count at +8, 16-byte records (width, height, mip count, DXGI format in d1 bits 3-9,
+  array size, first page), then one sorted u64 hash per record. No names stored.
+- Tiling: the title's own layout library (`xg_xs.dll`). Records with mip count 0 use layout
+  0x2, the others 0x105. Chosen by rendering every layout value for sample textures and
+  checking visually (UI pack: logos, photos, car renders come out right; mip-count-0 textures
+  were tile-scrambled with 0x105 and correct with 0x2).
+- 357,067 textures in 57 packs. 306,222 (85.8%) are stored entirely in zlib chunks and
+  decode. The rest touch chunks with codec values 1/3/4/5/6/7, and those values match the
+  BC format of the texture (1 = BC1, 3 = BC3, 4 = BC4, 5 = BC5, 6 = BC6H, 7 = BC7): a
+  BC-aware compressor, plausibly the console's hardware texture decompressor. No decoder for
+  it is in the dump or in Fortnite's binaries; reported as unsupported, not guessed. Worst
+  categories: terrain 67% and UI 65% decodable; vehicles 98%.
+- Some records' page span is smaller than the layout's size for their declared mip count
+  (e.g. a 1024x1024 BC1 with a 36 KiB span); not understood, reported per texture.
+- Uncompressed R8G8B8A8 records (graphics pack, small) have not been confirmed visually.
+
+**Model -> texture link.** A drawable's 32-byte texture records carry, after the joaat name
+hash and pointer, a u64 that is exactly a texture-pack hash: 6,615 of the 7,361 distinct keys
+in the minigame models resolve, and all 766 textures of the minigame's own map pack are
+referenced. `tools/rage/modeltex.py` resolves and decodes them (index of all packs in
+`input/carved2/ttpf_index.json`). The industrial fan resolves to painted-metal, rust and
+normal-map layers: these are tiling layer textures of a blended material, so which texture
+goes on which part (shader parameters -> geometry) is the next structure to decode; the
+earlier guess that model textures sat in the world/story packages is withdrawn.
+
+**`levels.rpf`** (76 GB). Random 1 MiB samples are dense zlib streams with `B@` position
+buffers. `rpf-carve` gained `--start/--len`; one 4 GiB slice (0x2c0000000..0x3c0000000)
+gave 20k+ resources named `levels/americas/...`, and `modelexport.py` exported
+level geometry from it (warehouse curtains, condo parts, car parks, a swing bridge, signs;
+spot-checked by render). Parts are in local coordinates; placement data not decoded.

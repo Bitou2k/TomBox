@@ -166,6 +166,12 @@ Honest ledger. Updated continuously.
 - Normal encoding chosen per model by fit to face normals because the shader's top-bit branch
   disagrees with the observed data (unresolved).
 - Buffer-record layout in the resource block and same-count tie-breaking by record order are
-  inferred; material -> geometry -> texture linkage not decoded.
+  inferred. Model -> texture-pack link found (u64 key in the texture records), but shader
+  parameters -> geometry (which texture on which part) is not decoded.
+- Texture packs: 14% of textures use a BC-aware chunk codec (values 1-7 track BC1-BC7) with
+  no available decoder; layout choice (0x2 for mip-count-0 records, else 0x105) is from visual
+  checks; some records' page spans are smaller than their declared mip chain; R8G8B8A8
+  records unconfirmed; header/record fields marked unknown in `ttpf.py`.
+- `levels.rpf`: only a 4 GiB slice carved; level placement (instances, transforms) not decoded.
 - Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
 - DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).
