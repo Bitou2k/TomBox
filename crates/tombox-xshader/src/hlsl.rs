@@ -4188,6 +4188,23 @@ impl<'a> Emitter<'a> {
                 if !is_uav {
                     return Err("buffer_store_format to a non-UAV table".into());
                 }
+                if ins.mnemonic.contains("_d16_") {
+                    if self.tbuf_ty.get(&(is_uav, slot)).is_some() {
+                        return Err("d16 store to an integer typed buffer unsupported".into());
+                    }
+                    let mut c = vec![];
+                    for k in 0..4u8 {
+                        if k < n {
+                            let o = Opnd::Vgpr(vd + k / 2);
+                            self.touch(&o);
+                            c.push(format!("f16tof32(({} >> {}u) & 0xffffu)", r(&o)?, 16 * (k % 2)));
+                        } else {
+                            c.push("0.0".into());
+                        }
+                    }
+                    self.line(&format!("if (exec_lo & 1u) {nm}[{index}] = float4({});", c.join(", ")));
+                    return Ok(());
+                }
                 let mut c = vec![];
                 for k in 0..4u8 {
                     if k < n {
@@ -4218,6 +4235,18 @@ impl<'a> Emitter<'a> {
                     None => "float4",
                 };
                 self.line(&format!("{ety} t{t} = {nm}[{index}];"));
+                if ins.mnemonic.contains("_d16_") {
+                    // d16: components packed two per register as halves (x|y<<16, z|w<<16).
+                    if ety != "float4" {
+                        return Err("d16 load of an integer typed buffer unsupported".into());
+                    }
+                    for k in 0..n.div_ceil(2) {
+                        let (a, b) = (XYZW[2 * k as usize], XYZW[2 * k as usize + 1]);
+                        let hi = if 2 * k + 1 < n { format!("(f32tof16(t{t}.{b}) << 16)") } else { "0u".to_string() };
+                        self.wv(&Opnd::Vgpr(vd + k), &format!("(f32tof16(t{t}.{a}) | {hi})"))?;
+                    }
+                    return Ok(());
+                }
                 for k in 0..n {
                     let c = XYZW[k as usize];
                     let e = match ety {

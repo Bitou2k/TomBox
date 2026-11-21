@@ -258,6 +258,8 @@ pub fn mubuf(op: u32) -> Option<&'static str> {
         0x37 => "buffer_atomic_smax", 0x38 => "buffer_atomic_umax", 0x39 => "buffer_atomic_and",
         0x3a => "buffer_atomic_or", 0x3b => "buffer_atomic_xor", 0x3c => "buffer_atomic_inc",
         0x3d => "buffer_atomic_dec",
+        // GFX10 d16 typed loads (results packed as half pairs): 0x80-0x83.
+        0x80 => "buffer_load_format_d16_x", 0x81 => "buffer_load_format_d16_xy", 0x82 => "buffer_load_format_d16_xyz", 0x83 => "buffer_load_format_d16_xyzw", 0x84 => "buffer_store_format_d16_x", 0x85 => "buffer_store_format_d16_xy", 0x86 => "buffer_store_format_d16_xyz", 0x87 => "buffer_store_format_d16_xyzw",
         _ => return None,
     })
 }
