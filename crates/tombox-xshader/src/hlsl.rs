@@ -55,6 +55,11 @@ pub struct Options {
     pub heap_index_mask: Option<u32>,
 }
 
+/// Heap mode: samplers whose descriptor is data (read from a buffer) are taken from a fixed
+/// table at this sampler-heap index, indexed by `tb_samp_code` (address modes U/V, linear
+/// filter, linear mip, compare function: 512 entries). The host fills the table.
+pub const SAMPLER_TABLE_BASE: u32 = 1536;
+
 /// Static sampler slots in heap mode are named `samp<STATIC_SAMP_BASE + i>`.
 const STATIC_SAMP_BASE: u32 = 900_000;
 /// Table id used in `Sym::Desc` for descriptors loaded in heap mode (off = load index).
@@ -125,6 +130,9 @@ float tb_cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az 
 float tb_cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? 5.0 : 4.0; if (ay >= ax) return y < 0.0 ? 3.0 : 2.0; return x < 0.0 ? 1.0 : 0.0; }
 float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v = (t - 1.5) * 2.0; int f = (int)round(face); if (f == 0) return float3(1.0, -v, -u); if (f == 1) return float3(-1.0, -v, u); if (f == 2) return float3(u, 1.0, v); if (f == 3) return float3(u, -1.0, -v); if (f == 4) return float3(u, -v, 1.0); return float3(-u, -v, -1.0); }
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
+uint tb_aclass(uint m) { return m == 0u ? 0u : ((m == 1u || m == 4u) ? 1u : ((m == 2u || m == 3u) ? 2u : 3u)); }
+uint tb_samp_code(uint d0, uint d2) { return tb_aclass(d0 & 7u) | (tb_aclass((d0 >> 3) & 7u) << 2) | ((((d2 >> 20) & 3u) != 0u || ((d2 >> 22) & 3u) != 0u) ? 16u : 0u) | (((d2 >> 26) & 3u) == 2u ? 32u : 0u) | (((d0 >> 12) & 7u) << 6); }
+uint tb_quad4(uint a, uint b, uint c, uint d, uint s) { return s == 0u ? a : (s == 1u ? b : (s == 2u ? c : d)); }
 "#;
 
 fn name(o: &Opnd) -> Result<String, String> {
@@ -313,6 +321,8 @@ struct Emitter<'a> {
     /// Heap mode: uses whose buffer descriptor was assembled from a pointer in an SGPR (not
     /// loaded): the pointer value itself is the address (a root constant buffer).
     heap_rawptr: BTreeSet<usize>,
+    /// Heap mode: image ops whose sampler descriptor is data in SGPRs (read from a buffer).
+    heap_rawsamp: BTreeMap<usize, u16>,
     epilog_exp: HashMap<usize, (usize, usize)>,
     /// Index of the instruction being emitted.
     cur_idx: usize,
@@ -323,6 +333,10 @@ struct Emitter<'a> {
     /// Nesting depth of emitted HLSL loops at the current instruction.
     loop_depth: u32,
     is_gs: bool,
+    /// Mesh shader (see `finish_mesh`).
+    is_ms: bool,
+    /// Mesh shader uses group-shared memory (barriers are kept then).
+    ms_lds: bool,
     /// Compute shader uses LDS (groupshared memory).
     uses_lds: bool,
     /// Shader reads constant tables embedded in its code section.
@@ -623,6 +637,7 @@ pub fn translate_with(ex: &ShaderExtract, opts: &Options) -> Result<Translated, 
         Stage::Pixel => ("ps_5_0", true),
         Stage::Compute => ("cs_5_0", false),
         Stage::Geometry => ("gs_5_0", false),
+        Stage::Mesh => ("ms_6_6", false),
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
@@ -653,11 +668,14 @@ pub fn translate_with(ex: &ShaderExtract, opts: &Options) -> Result<Translated, 
         heap_origin: HashMap::new(),
         opts: *opts,
         heap_rawptr: BTreeSet::new(),
+        heap_rawsamp: BTreeMap::new(),
         epilog_exp: HashMap::new(),
         cur_idx: 0,
         sbuf_flat: BTreeSet::new(),
         is_cs: ex.stage == Stage::Compute,
         is_gs: ex.stage == Stage::Geometry,
+        is_ms: ex.stage == Stage::Mesh,
+        ms_lds: false,
         uses_lds: false,
         uses_code: false,
         vreg_array: false,
@@ -681,6 +699,7 @@ pub fn translate_with(ex: &ShaderExtract, opts: &Options) -> Result<Translated, 
         out_params: distinct_regs(ex.output_sig.iter().filter(|e| e.sysval == 0)),
     };
     em.vreg_array = em.insns.iter().any(|i| i.mnemonic.starts_with("v_movrel"));
+    em.ms_lds = em.is_ms && em.insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32");
     // Lane-spill slots beyond the tracked range are function-scope temporaries.
     for ins in em.insns.iter() {
         for o in ins.dst.iter().chain(ins.src.iter()) {
@@ -721,6 +740,7 @@ pub fn translate_with(ex: &ShaderExtract, opts: &Options) -> Result<Translated, 
             Stage::Vertex => "vs_6_6",
             Stage::Pixel => "ps_6_6",
             Stage::Compute => "cs_6_6",
+            Stage::Mesh => "ms_6_6",
             _ => "gs_6_6",
         }
     } else {
@@ -1397,6 +1417,50 @@ impl<'a> Emitter<'a> {
         out
     }
 
+    /// Mesh shader entry point (rules inferred from the second title's mesh shaders, which run
+    /// as 64-wide waves; see the development log):
+    ///  * thread index in the group = the shader's own `waveid * 64 + mbcnt` computation, with
+    ///    the wave id in bits 27:24 of s3 and the lane from `tb_lane`;
+    ///  * v5 = group id * threads per group + thread index (the code derives its meshlet index
+    ///    as `readfirstlane(v5) >> 7` with 128 threads per group);
+    ///  * GS_ALLOC_REQ gives the output counts; position/parameter exports of thread i write
+    ///    vertex i, primitive exports write primitive i.
+    /// All outputs are written after the body, once `SetMeshOutputCounts` has been called in
+    /// uniform control flow as HLSL requires.
+    fn finish_mesh(&mut self, mut h: String) -> Result<String, String> {
+        let ex = self.ex;
+        let ms = ex.ms_info.ok_or("mesh shader without PSV0 mesh info")?;
+        if ms.topology != 2 {
+            return Err(format!("mesh output topology {} unsupported", ms.topology));
+        }
+        let [tx, ty, tz] = ms.numthreads;
+        let (mv, mp) = (ms.max_vertices.max(1), ms.max_primitives.max(1));
+        let _ = writeln!(h, "}};");
+        let _ = writeln!(h, "groupshared uint tb_ms_counts;");
+        let _ = writeln!(h, "[numthreads({tx}, {ty}, {tz})]\n[outputtopology(\"triangle\")]");
+        let _ = writeln!(h, "void main(uint tb_gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices SOut verts[{mv}], out indices uint3 tris[{mp}]) {{");
+        let _ = writeln!(h, "    SOut o = (SOut)0; bool tb_vexp = false, tb_pexp = false; uint tb_prim = 0u; uint tb_lane = tb_gi % 64u;");
+        let _ = writeln!(h, "    if (tb_gi == 0u) tb_ms_counts = 0u;\n    GroupMemoryBarrierWithGroupSync();");
+        let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
+        for r in ["s3", "v5"] {
+            self.regs.insert(r.to_string());
+        }
+        let _ = writeln!(h, "{}", self.reg_decls());
+        if self.heap {
+            let init: String = self.heap_user_init(None).lines().filter(|l| !l.trim_start().starts_with("s3 =")).map(|l| format!("{l}\n")).collect();
+            h.push_str(&init);
+        }
+        let _ = writeln!(h, "    s3 = (tb_gi / 64u) << 24; v5 = gid.x * {}u + tb_gi;", tx * ty * tz);
+        h.push_str(&self.body);
+        let _ = writeln!(h, "    GroupMemoryBarrierWithGroupSync();");
+        let _ = writeln!(h, "    uint tb_nv = min(tb_ms_counts & 0xfffu, {mv}u), tb_np = min((tb_ms_counts >> 12) & 0xfffu, {mp}u);");
+        let _ = writeln!(h, "    SetMeshOutputCounts(tb_nv, tb_np);");
+        let _ = writeln!(h, "    if (tb_vexp && tb_gi < tb_nv) verts[tb_gi] = o;");
+        let _ = writeln!(h, "    if (tb_pexp && tb_gi < tb_np) tris[tb_gi] = (tb_prim & 0x80000000u) != 0u ? uint3(0u, 0u, 0u) : uint3(tb_prim & 0x1ffu, (tb_prim >> 10) & 0x1ffu, (tb_prim >> 20) & 0x1ffu);");
+        let _ = writeln!(h, "}}");
+        Ok(h)
+    }
+
     /// HLSL type of a texture slot.
     fn tex_type(&self, slot: u32, dim: u32) -> Result<String, String> {
         let ty = match dim {
@@ -1817,11 +1881,14 @@ impl<'a> Emitter<'a> {
                                 uses.push((Res::Samp(slot), ss));
                                 self.note_heap_srcs(idx, ss, sym.get(&ss).copied());
                                 slot
+                            } else if self.const_sgprs(idx, ss as u8, 4).is_none() {
+                                // The sampler descriptor is data (e.g. read with s_buffer_load
+                                // from a constant buffer): mapped through `tb_samp_code`.
+                                self.heap_rawsamp.insert(idx, ss);
+                                slot
                             } else {
                                 // A sampler descriptor assembled from constants: a static sampler.
-                                let dw = self.const_sgprs(idx, ss as u8, 4).ok_or_else(|| {
-                                    format!("mimg at {:#x}: s{ss} is neither a loaded nor a constant sampler descriptor", ins.offset)
-                                })?;
+                                let dw = self.const_sgprs(idx, ss as u8, 4).ok_or("unreachable")?;
                                 let k = match self.static_samplers.iter().position(|x| *x == (dw, cmp)) {
                                     Some(k) => k,
                                     None => {
@@ -2340,6 +2407,18 @@ impl<'a> Emitter<'a> {
                     let decl = self.heap_decl(*res, *reg)?;
                     self.line(&decl);
                 }
+                if let (Some(&ss), Some(Res::Samp(slot))) = (self.heap_rawsamp.get(&idx), self.res.get(&idx).and_then(|v| v.get(1)).copied()) {
+                    let (d0, d2) = (Opnd::Sgpr(ss as u8), Opnd::Sgpr(ss as u8 + 2));
+                    self.touch(&d0);
+                    self.touch(&d2);
+                    let (ty, nm) = if self.samp_cmp.contains(&slot) { ("SamplerComparisonState", "scmp") } else { ("SamplerState", "samp") };
+                    let mask = self.opts.heap_index_mask.map(|m| format!(" & {m:#x}u")).unwrap_or_default();
+                    self.line(&format!(
+                        "{ty} {nm}{slot} = SamplerDescriptorHeap[({SAMPLER_TABLE_BASE}u + tb_samp_code({}, {})){mask}];",
+                        r(&d0)?,
+                        r(&d2)?
+                    ));
+                }
                 let out = self.emit_insn(idx, ins, is_ps, br);
                 self.in_heap_wrap = false;
                 self.line("}");
@@ -2390,7 +2469,7 @@ impl<'a> Emitter<'a> {
         }
         match ins.enc {
             Enc::Sopp if ins.op == 0x10 => self.emit_sendmsg(ins),
-            Enc::Sopp if ins.op == 0x0a && self.is_cs => {
+            Enc::Sopp if ins.op == 0x0a && (self.is_cs || (self.is_ms && self.ms_lds)) => {
                 self.line("GroupMemoryBarrierWithGroupSync();");
                 Ok(())
             }
@@ -2571,6 +2650,38 @@ impl<'a> Emitter<'a> {
                         Ok(())
                     }
                     "s_ff1_i32_b32" => self.ws(&d, &format!("firstbitlow({a})")),
+                    "s_ff1_i32_b64" => {
+                        self.touch(&hi(&s[0]));
+                        let ah = r(&hi(&s[0]))?;
+                        self.ws(&d, &format!("(({a}) != 0u ? firstbitlow({a}) : (({ah}) != 0u ? 32u + firstbitlow({ah}) : 0xffffffffu))"))
+                    }
+                    // Leading zeros counted from bit 31; -1 for zero.
+                    "s_flbit_i32_b32" => self.ws(&d, &format!("(({a}) == 0u ? 0xffffffffu : 31u - firstbithigh({a}))")),
+                    "s_not_b64" => {
+                        self.touch(&hi(&s[0]));
+                        let ah = r(&hi(&s[0]))?;
+                        let t = self.tmp;
+                        self.tmp += 1;
+                        self.line(&format!("uint t{t}l = ~({a}); uint t{t}h = ~({ah}); scc = ((t{t}l | t{t}h) != 0u) ? 1u : 0u;"));
+                        self.ws(&d, &format!("t{t}l"))?;
+                        let dh = hi(&d);
+                        self.touch(&dh);
+                        self.ws(&dh, &format!("t{t}h"))
+                    }
+                    // EXEC = S0 & ~EXEC (andn2) / ~S0 & EXEC (andn1); D = the new EXEC.
+                    _ if m.contains("_wrexec_") => {
+                        let e = if m.starts_with("s_andn2") { format!("({a} & ~exec_lo)") } else { format!("(~{a} & exec_lo)") };
+                        let t = self.tmp;
+                        self.tmp += 1;
+                        self.line(&format!("uint t{t} = {e} & 1u; exec_lo = t{t}; scc = t{t};"));
+                        self.ws(&d, &format!("t{t}"))?;
+                        if m.ends_with("_b64") {
+                            let dh = hi(&d);
+                            self.touch(&dh);
+                            self.ws(&dh, "0u")?;
+                        }
+                        Ok(())
+                    }
                     "s_sext_i32_i8" => self.ws(&d, &format!("asuint(asint({a} << 24) >> 24)")),
                     "s_sext_i32_i16" => self.ws(&d, &format!("asuint(asint({a} << 16) >> 16)")),
                     "s_abs_i32" => {
@@ -2599,6 +2710,10 @@ impl<'a> Emitter<'a> {
                             "andn2" => format!("({a} & ~exec_lo)"),
                             "orn2" => format!("({a} | ~exec_lo)"),
                             "andn1" => format!("(~{a} & exec_lo)"),
+                            "orn1" => format!("(~{a} | exec_lo)"),
+                            "nand" => format!("~({a} & exec_lo)"),
+                            "nor" => format!("~({a} | exec_lo)"),
+                            "xnor" => format!("~({a} ^ exec_lo)"),
                             _ => return Err("unsupported saveexec".into()),
                         };
                         let t = self.tmp;
@@ -2842,7 +2957,7 @@ impl<'a> Emitter<'a> {
                 self.emit_gs_lds(ins)
             }
             Enc::Ds
-                if self.is_cs
+                if (self.is_cs || self.is_ms)
                     && matches!(
                         m,
                         "ds_read_b32" | "ds_read2_b32" | "ds_read2st64_b32" | "ds_write_b32" | "ds_write2_b32" | "ds_write2st64_b32"
@@ -2890,7 +3005,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8") => {
+            Enc::Ds if (self.is_cs || self.is_ms) && matches!(m, "ds_write_b16" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8") => {
                 // Sub-word accesses to group-shared memory: tb_lds is addressed in dwords, so
                 // read-modify-write the containing dword.
                 self.uses_lds = true;
@@ -2913,7 +3028,7 @@ impl<'a> Emitter<'a> {
                 return self.wv(&d.ok_or("no dst")?, &e);
             }
             Enc::Ds
-                if self.is_cs
+                if (self.is_cs || self.is_ms)
                     && matches!(
                         m.replace("_rtn", "").as_str(),
                         "ds_add_u32" | "ds_min_u32" | "ds_max_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32"
@@ -2996,6 +3111,41 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_vec(&mut self, ins: &Insn) -> Result<(), String> {
+        if matches!(ins.enc, Enc::Vop1 | Enc::Vop2) && matches!(ins.src.first(), Some(Opnd::Raw(250))) {
+            // DPP16 with a quad permutation (dpp_ctrl 0x00-0xff): source lane i of each quad
+            // reads quad lane perm[i]. The three seen in practice are the quad swaps used for
+            // derivatives (0xb1 = 1,0,3,2 across X; 0x4e = 2,3,0,1 across Y; 0x1b = 3,2,1,0
+            // diagonal). Row masks must be full; other DPP controls are not supported.
+            let dpp = *ins.raw.get(1).ok_or("DPP without its control dword")?;
+            let (vsrc, ctrl, row_mask, bank_mask) = (dpp & 0xff, (dpp >> 8) & 0x1ff, dpp >> 28, (dpp >> 24) & 0xf);
+            if ctrl > 0xff || row_mask != 0xf || bank_mask != 0xf || (dpp >> 20) & 0xf != 0 {
+                return Err(format!("DPP control {ctrl:#x} (row mask {row_mask:#x}, bank mask {bank_mask:#x}, modifiers) unsupported"));
+            }
+            self.uses_wave = true;
+            let v = Opnd::Vgpr(vsrc as u8);
+            self.touch(&v);
+            let x = r(&v)?;
+            let e = match ctrl {
+                0xe4 => x.clone(),
+                0xb1 => format!("QuadReadAcrossX({x})"),
+                0x4e => format!("QuadReadAcrossY({x})"),
+                0x1b => format!("QuadReadAcrossDiagonal({x})"),
+                _ => {
+                    let sel = |i: u32| (ctrl >> (2 * i)) & 3;
+                    format!(
+                        "tb_quad4(QuadReadLaneAt({x}, 0u), QuadReadLaneAt({x}, 1u), QuadReadLaneAt({x}, 2u), QuadReadLaneAt({x}, 3u), uint4({}u, {}u, {}u, {}u)[WaveGetLaneIndex() & 3u])",
+                        sel(0), sel(1), sel(2), sel(3)
+                    )
+                }
+            };
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint tb_s{t} = {e};"));
+            let mut c = ins.clone();
+            c.src[0] = Opnd::Temp(t as u16);
+            c.raw.truncate(1);
+            return self.emit_vec(&c);
+        }
         let mut m = ins.mnemonic.clone();
         let s = &ins.src;
         let d = ins.dst.first().cloned().ok_or("no dst")?;
@@ -3570,6 +3720,10 @@ impl<'a> Emitter<'a> {
             "v_mul_lo_u32" | "v_mul_lo_i32" => format!("({a} * {b})"),
             // Count of mask bits below this lane, plus src1. One invocation = one lane with
             // nothing below it, so the count term is zero.
+            // Mesh shaders compute their thread index from the wave's lane number (mbcnt over
+            // an all-ones mask): the lane within the 64-wide wave of the original program.
+            "v_mbcnt_lo_u32_b32" if self.is_ms && matches!(s[0], Opnd::ConstInt(-1)) => format!("({b} + min(tb_lane, 32u))"),
+            "v_mbcnt_hi_u32_b32" if self.is_ms && matches!(s[0], Opnd::ConstInt(-1)) => format!("({b} + (tb_lane > 32u ? tb_lane - 32u : 0u))"),
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => b,
             "v_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
             "v_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),
@@ -4081,6 +4235,18 @@ impl<'a> Emitter<'a> {
     /// `s_sendmsg`: in a geometry shader, message 2 = GS with op bits (1 = cut, 2 = emit),
     /// message 3 = GS_DONE.
     fn emit_sendmsg(&mut self, ins: &Insn) -> Result<(), String> {
+        if self.is_ms {
+            // GS_ALLOC_REQ (message 9) in a mesh shader: M0 = vertex count | primitive count
+            // << 12 (bits 9:0 / 21:12 in the GFX10 documentation; this title packs counts of
+            // up to 128). A scalar instruction runs once per wave whatever the exec mask; any
+            // lane that reaches it records the same value.
+            let msg = ins.aux.imm as u32 & 0xf;
+            if msg != 9 {
+                return Err(format!("s_sendmsg {msg} in a mesh shader unsupported"));
+            }
+            self.line("tb_ms_counts = m0;");
+            return Ok(());
+        }
         if !self.is_gs {
             return Err("s_sendmsg outside a geometry shader".into());
         }
@@ -4498,6 +4664,19 @@ impl<'a> Emitter<'a> {
     fn emit_exp(&mut self, ins: &Insn, is_ps: bool) -> Result<(), String> {
         let target = ins.aux.imm as u32;
         let en = ins.aux.mask;
+        if self.is_ms {
+            if en == 0 {
+                return Ok(()); // placeholder export with no data (zero-output groups)
+            }
+            if target == 20 {
+                // Primitive export: indices in bits 8:0, 18:10, 28:20, bit 31 = null primitive.
+                self.line(&format!("if (exec_lo & 1u) {{ tb_prim = {}; tb_pexp = true; }}", r(&ins.src[0])?));
+                return Ok(());
+            }
+            if (12..=15).contains(&target) || (32..64).contains(&target) {
+                self.line("if (exec_lo & 1u) tb_vexp = true;");
+            }
+        }
         let compr = ins.aux.imm2 & 1 != 0;
         let mut comp = vec![];
         if compr {
@@ -4575,6 +4754,34 @@ impl<'a> Emitter<'a> {
                 .map(|(i, _)| i)
                 .ok_or_else(|| format!("MRT export {target} has no SV_Target output element"))?;
             assigns.push((ei, "xyzw"[..sig_type(&osig[ei]).1].to_string()));
+        } else if (13..=14).contains(&target) {
+            // POS1 / POS2: clip and cull distances 0-3 / 4-7, clip distances first (the
+            // hardware's packing; the output signature lists them as SV_ClipDistance /
+            // SV_CullDistance elements).
+            let mut slots: Vec<(usize, usize)> = Vec::new();
+            for want in [2u32, 3] {
+                for (ei, e) in osig.iter().enumerate().filter(|(_, e)| e.sysval == want) {
+                    for k in 0..(e.mask.count_ones() as usize) {
+                        slots.push((ei, k));
+                    }
+                }
+            }
+            let mut lines = vec![];
+            for c in 0..4usize {
+                let k = (target as usize - 13) * 4 + c;
+                if (en >> c) & 1 == 0 || k >= slots.len() {
+                    continue;
+                }
+                let (ei, sub) = slots[k];
+                let (ty, n) = sig_type(&osig[ei]);
+                let dst = if n == 1 { format!("o.o{ei}") } else { format!("o.o{ei}.{}", XYZW[sub]) };
+                let _ = ty;
+                lines.push(format!("if (exec_lo & 1u) {dst} = {};", f(&ins.src[c])?));
+            }
+            for l in lines {
+                self.line(&l);
+            }
+            return Ok(());
         } else if (12..=15).contains(&target) {
             if target != 12 {
                 return Err(format!("position export {target} unsupported"));
@@ -4715,7 +4922,7 @@ impl<'a> Emitter<'a> {
                 .collect();
             let _ = writeln!(h, "static const uint tb_code[{}] = {{ {} }};", words.len().max(1), if words.is_empty() { "0".to_string() } else { words.join(", ") });
         }
-        if self.is_cs && self.uses_lds {
+        if (self.is_cs || self.is_ms) && self.uses_lds {
             let _ = writeln!(h, "groupshared uint tb_lds[8192];");
         }
         if self.is_cs {
@@ -4806,6 +5013,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             }
         }
         let no_out = ex.output_sig.is_empty();
+        if self.is_ms {
+            return self.finish_mesh(h);
+        }
         if no_out {
             // No outputs (e.g. depth-only / kill-only pixel shader): HLSL forbids empty structs.
             let cut = h.rfind("struct SOut {").unwrap_or(h.len());

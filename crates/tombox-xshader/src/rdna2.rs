@@ -445,8 +445,8 @@ fn instr_len(enc: Enc, w: u32, next: Option<u32>) -> (usize, bool) {
             (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(w & 0x1ff, 233 | 234 | 250) || matches!(op, 0x20 | 0x21 | 0x2c | 0x2d | 0x37 | 0x38))
         }
         // A trailing dword follows for an inline literal (255) or an SDWA modifier (249).
-        Enc::Vop1 => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA),
-        Enc::Vopc => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA),
+        Enc::Vop1 => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(w & 0x1ff, 233 | 234 | 250)),
+        Enc::Vopc => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(w & 0x1ff, 233 | 234 | 250)),
         // VOP3/VOP3P: 2 dwords.
         Enc::Vop3 => {
             // GFX10 allows a trailing 32-bit literal on VOP3 when any source == 255.

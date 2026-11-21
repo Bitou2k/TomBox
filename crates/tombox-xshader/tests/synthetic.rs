@@ -47,6 +47,7 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         output_sig,
         resources: Vec::new(),
         gs_info: None,
+        ms_info: None,
         root_sig: root,
     }
 }
