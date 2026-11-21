@@ -222,6 +222,7 @@ fn fssm_ps_inputs(ex: &ShaderExtract) -> Option<Vec<Vec<(u32, u32, bool)>>> {
     }
     let f = &ex.fssm;
     let mut out: Vec<Vec<(u32, u32, bool)>> = Vec::new();
+    let mut pending: Vec<(usize, u32, Option<u32>, u32)> = Vec::new();
     let mut p = 0x138;
     while let Some(r) = f.get(p..p + 8) {
         if r[0] != 6 {
@@ -232,15 +233,32 @@ fn fssm_ps_inputs(ex: &ShaderExtract) -> Option<Vec<Vec<(u32, u32, bool)>>> {
             return None; // not the layout this parser knows
         }
         if flags == 0x1a {
-            let mut v = vec![(ra, 0, true)];
-            if rb != 0 && rb != ra {
-                v.push((rb, 2, true));
-            }
-            out.push(v);
+            // Halves taken by the first register: its components up to the highest one that
+            // is read (all of its mask when nothing in it is read), rounded up to whole
+            // channels. Observed: TEXCOORD0.xy read + TEXCOORD8.zw unread in one register put
+            // the next register at half 2; an entirely unread half3 register still takes 4.
+            let els: Vec<&SigElement> = ex.input_sig.iter().filter(|e| e.register == ra && e.sysval == 0).collect();
+            let read = els.iter().fold(0u8, |m, e| m | (e.mask & e.rw_mask));
+            let all = els.iter().fold(0u8, |m, e| m | e.mask);
+            let n = 8 - if read != 0 { read.leading_zeros() } else { all.leading_zeros() };
+            let second_start = n.div_ceil(2).max(1);
+            // The second register: the record's, or (when the record names none, observed as
+            // 0 for a pair starting at register 0) the next 16-bit register no record names.
+            let rb = if rb != 0 && rb != ra { Some(rb) } else { None };
+            out.push(vec![(ra, 0, true)]);
+            pending.push((out.len() - 1, ra, rb, second_start));
         } else {
             out.push(vec![(ra, 0, false)]);
         }
         p += 8;
+    }
+    let named: BTreeSet<u32> = out.iter().flatten().map(|(r, _, _)| *r).chain(pending.iter().filter_map(|p| p.2)).collect();
+    for (at, ra, rb, start) in pending {
+        let half_reg = |r: u32| ex.input_sig.iter().any(|e| e.register == r && e.sysval == 0 && matches!(e.comp_type, 4..=6));
+        let rb = rb.or_else(|| Some(ra + 1).filter(|r| half_reg(*r) && !named.contains(r)));
+        if let Some(rb) = rb {
+            out[at].push((rb, start, true));
+        }
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -3129,12 +3147,31 @@ impl<'a> Emitter<'a> {
                 // values for derivatives. Per pixel: value at quad position (sx, sy) =
                 // v + (sx - px) * ddx_fine(v) + (sy - py) * ddy_fine(v), with (px, py) this
                 // pixel's position in its quad. Treats the register as float (derivative use).
-                if !is_ps {
-                    return Err("ds_swizzle outside a pixel shader".into());
-                }
                 let off = ins.aux.imm as u32;
                 if off & 0x8000 == 0 {
-                    return Err("ds_swizzle without QDMode unsupported".into());
+                    // Bit-mask mode: within each 32 lanes, read lane ((i & and) | or) ^ xor
+                    // (masks in offset bits 4:0, 9:5, 14:10). Lowered to WaveReadLaneAt with a
+                    // per-lane index (assumes 32-lane groups line up with the PC wave).
+                    self.uses_wave = true;
+                    let (and, or, xor) = (off & 31, (off >> 5) & 31, (off >> 10) & 31);
+                    let x = r(&s[0])?;
+                    return self.wv(
+                        &d.ok_or("no dst")?,
+                        &format!("WaveReadLaneAt({x}, (WaveGetLaneIndex() & ~31u) | ((((WaveGetLaneIndex() & 31u) & {and}u) | {or}u) ^ {xor}u))"),
+                    );
+                }
+                if !is_ps {
+                    // Compute / mesh: quads are groups of four consecutive lanes; read the
+                    // selected lane exactly (assumes console and PC lanes line up).
+                    self.uses_wave = true;
+                    let x = r(&s[0])?;
+                    return self.wv(
+                        &d.ok_or("no dst")?,
+                        &format!(
+                            "tb_quad4(QuadReadLaneAt({x}, 0u), QuadReadLaneAt({x}, 1u), QuadReadLaneAt({x}, 2u), QuadReadLaneAt({x}, 3u), ({:#x}u >> ((WaveGetLaneIndex() & 3u) * 2u)) & 3u)",
+                            off & 0xff
+                        ),
+                    );
                 }
                 self.uses_quad = true;
                 let src = f(&s[0])?;

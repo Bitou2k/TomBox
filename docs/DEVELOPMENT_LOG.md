@@ -1037,3 +1037,53 @@ not exhaustive).
 Consequence: contents can be listed by scanning for streams, but without the tables there
 are no file names, sizes or boundaries for anything that is not self-describing. Nothing
 here was decrypted and no keys were looked for.
+
+## 2026-11-21 — Second title: 97% of shaders translate; descriptor-heap mode, mesh shaders; viewer
+
+Corpus: the 25,889 distinct shader containers of the second title's `shaders.rpf`
+(`rpf-shaders` extracts them; no table of contents needed). Translation coverage, measured
+with `xscan` over all of them after each step:
+
+| step | translated |
+|---|---|
+| start (Fortnite-only translator) | 1,792 (6.9%) |
+| heap mode, compares, MTBUF, f16 interpolation, wave ops | 9,566 (37.0%) |
+| mesh shaders | 15,713 (60.7%) |
+| DPP quad swaps, samplers as data, clip distances, SOP1 additions | 20,654 (79.8%) |
+| FSSM pixel-input table | 21,787 (84.2%) |
+| size/LOD queries, image atomics, MUBUF scalar offsets, 16-bit ops, 64-bit compares | 25,214 (97.4%) |
+
+Fortnite's archive stays at 105,506 / 105,506 after every step. Translation is not
+compilation and not correctness: a DXC compile sweep of this corpus is running separately.
+
+What was learned (evidence in the commits and the notes in `hlsl.rs`):
+
+* **No root signature, SM 6.6.** Descriptors are reached through pointers in entry SGPRs, at
+  constant and run-time offsets. Translated as `ResourceDescriptorHeap[address >> 5]`
+  (samplers `>> 4`) declared at each use, with entry SGPRs from a host constant buffer
+  (`TbUserData`, b0 space100) and a binding report per shader (`heap_bindings`). Whether a
+  read-only buffer/image is really an SRV, and whether a scalar-loaded buffer is a constant
+  buffer, is chosen by use (debt).
+* **Sampler descriptors as data** (loaded from a constant buffer): mapped through a 512-entry
+  host sampler table selected by address modes, filter, mip filter and compare function.
+* **Opcode tables corrected from LLVM** (GFX10): VOPC (v_cmpx, 16-/64-bit compares; the old
+  table had 0xd0-0xd7 wrong), VOP3 (f16 interpolation, v_pack_b32_f16, v_cvt_pk_u8_f32,
+  16-bit integer ops), SOP1 (wrexec, 64-bit bit scans), MTBUF formats (`UfmtGFX10`). The
+  decoder mis-sized VOP1/VOPC instructions with DPP sources (fixed).
+* **Mesh shaders** run as 64-wide waves; counts from GS_ALLOC_REQ, vertex/primitive exports
+  per thread, outputs written after the body. Entry registers v5 / s3 are inferred from
+  their use (debt).
+* **PS inputs** come from a table in the FSSM container (16-bit registers packed in pairs);
+  the half offset of the second register of a pair is inferred.
+* Performance: the resource dataflow copied the instruction list per basic block; large
+  shaders went from 11-20 s to under 0.1 s.
+
+`tombox-viewer` runs a translated vertex+pixel (or compute) pair on the host GPU over
+procedural models with made-up inputs and writes the targets as PNG. 73 of 81 pixel shaders
+that link with the title's blit vertex shader ran without a device removal and produced
+finite output; the 8 others write depth only (not handled by the viewer). The images show
+execution, not what the game draws: the harness does not know the title's data.
+
+Not done: the remaining 675 failures (mostly packed 16-bit attribute variants, d16 buffer
+loads, a few addressing forms), compile sweep results, runtime support for heap mode in
+`d3d12_xs` (needs the executable, which the dump does not contain).
