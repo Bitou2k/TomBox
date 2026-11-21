@@ -38,9 +38,16 @@ pub fn classify(d: &[u8]) -> (&'static str, &'static str) {
 
 /// Inflate every zlib stream that starts in `buf` (positions are reported as `base + i`).
 /// A candidate must have a valid zlib header and inflate to completion within `limit` bytes.
-pub fn carve(buf: &[u8], base: u64, limit: usize, mut each: impl FnMut(Carved)) {
+pub fn carve(buf: &[u8], base: u64, limit: usize, each: impl FnMut(Carved)) {
+    carve_range(buf, base, limit, buf.len(), each)
+}
+
+/// As [`carve`], but only streams starting before `starts_before` are tried; they may run on
+/// to the end of `buf`. Used for windowed reads: the bytes after `starts_before` are the
+/// overlap that lets a stream straddling the window edge complete.
+pub fn carve_range(buf: &[u8], base: u64, limit: usize, starts_before: usize, mut each: impl FnMut(Carved)) {
     let mut i = 0usize;
-    while i + 2 <= buf.len() {
+    while i + 2 <= buf.len() && i < starts_before {
         let (cmf, flg) = (buf[i], buf[i + 1]);
         let header = cmf == 0x78 && (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0 && flg & 0x20 == 0;
         if !header {
@@ -94,5 +101,20 @@ mod tests {
         assert_eq!(got[0].offset, 1050);
         assert_eq!(classify(&got[0].data).1, "xml");
         assert_eq!(classify(&got[1].data).1, "psin");
+    }
+
+    #[test]
+    fn range_completes_a_stream_that_starts_before_the_limit() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&data, 6);
+        let mut f = vec![0u8; 10];
+        f.extend(&z);
+        let mut got = vec![];
+        carve_range(&f, 0, 1 << 20, 11, |c| got.push(c));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].data, data);
+        got.clear();
+        carve_range(&f, 0, 1 << 20, 10, |c| got.push(c));
+        assert!(got.is_empty());
     }
 }

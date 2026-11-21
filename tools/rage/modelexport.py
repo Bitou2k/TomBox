@@ -13,13 +13,13 @@ def records(b):
         if a == 4 and c in (8, 9) and n and 0x60000000 <= p < 0x70000000: out.append((p - 0x60000000, n * 4))
     return out
 
-def export(vfile, gfile, out):
-    b = open(vfile, "rb").read()
-    if b[:8] != b"\0" * 8: return []
+def meshes(b, g, label="?"):
+    """Decode the models of one resource: virtual block bytes `b`, GPU block bytes `g`.
+    Returns (name, [(k, result)]) where result is (pos_base, tris, nv) or an error string."""
+    if b[:8] != b"\0" * 8: return None, []
     recs = records(b)
-    if not recs: return []
-    g = open(gfile, "rb").read()
-    m = re.search(rb"([A-Za-z0-9_]+)\.#d", b); name = m.group(1).decode() if m else os.path.basename(vfile)[:-4]
+    if not recs: return None, []
+    m = re.search(rb"([A-Za-z0-9_]+)\.#d", b); name = m.group(1).decode() if m else label
     pos = [(p, sz) for p, sz in recs if p + 0x80 <= len(g) and g[p:p + 2] == b"B@"]
     mls = [(p, sz) for p, sz in recs if p + 12 <= len(g) and struct.unpack_from("<I", g, p)[0] & 0x80000000]
     res = []
@@ -27,7 +27,7 @@ def export(vfile, gfile, out):
         try:
             tris, n = meshlets(g, mp)
         except Exception as e:
-            res.append((name, k, f"meshlets: {e}")); continue
+            res.append((k, f"meshlets: {e}")); continue
         if not tris: continue
         nv = max(max(t) for t in tris) + 1 if tris else 0
         cand = [pp for pp, _ in pos if vertex_count(g, pp) == nv]
@@ -36,11 +36,23 @@ def export(vfile, gfile, out):
         if len(cand) > 1 and k < len(pos) and pos[k][0] in cand:
             cand = [pos[k][0]]  # same vertex count: buffers are listed in the same order (inferred)
         if len(cand) != 1:
-            res.append((name, k, f"{len(cand)} position buffers for {nv} vertices")); continue
-        get, off, st = positions(g, cand[0])
+            res.append((k, f"{len(cand)} position buffers for {nv} vertices")); continue
+        res.append((k, (cand[0], tris, nv)))
+    return name, res
+
+def export(vfile, gfile, out):
+    b = open(vfile, "rb").read()
+    g = open(gfile, "rb").read()
+    name, ms = meshes(b, g, os.path.basename(vfile)[:-4])
+    res = []
+    for k, r in ms:
+        if isinstance(r, str):
+            res.append((name, k, r)); continue
+        base, tris, nv = r
+        get, off, st = positions(g, base)
         path = f"{out}/{name}_{os.path.basename(vfile)[:-4]}_{k}.obj"
         with open(path, "w") as f:
-            nrm, uv = normals(g, cand[0], get, tris), uvs(g, cand[0])
+            nrm, uv = normals(g, base, get, tris), uvs(g, base)
             for i in range(nv): f.write("v %.5f %.5f %.5f\n" % get(i))
             if nrm:
                 for i in range(nv): f.write("vn %.4f %.4f %.4f\n" % nrm(i))
@@ -48,11 +60,11 @@ def export(vfile, gfile, out):
                 for i in range(nv):
                     u = uv(i); f.write("vt %.5f %.5f\n" % (u[0], 1 - u[1]))
             for t in tris:
-                a, b, c = (x + 1 for x in t)
-                if uv and nrm: f.write(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}\n")
-                elif nrm: f.write(f"f {a}//{a} {b}//{b} {c}//{c}\n")
-                elif uv: f.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
-                else: f.write(f"f {a} {b} {c}\n")
+                a, b_, c = (x + 1 for x in t)
+                if uv and nrm: f.write(f"f {a}/{a}/{a} {b_}/{b_}/{b_} {c}/{c}/{c}\n")
+                elif nrm: f.write(f"f {a}//{a} {b_}//{b_} {c}//{c}\n")
+                elif uv: f.write(f"f {a}/{a} {b_}/{b_} {c}/{c}\n")
+                else: f.write(f"f {a} {b_} {c}\n")
         res.append((name, k, f"ok {nv} verts {len(tris)} tris"))
     return res
 

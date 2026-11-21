@@ -22,6 +22,8 @@
 //! in the file.
 
 pub mod carve;
+pub mod files;
+pub mod index;
 pub mod shaders;
 
 /// A contiguous part of the file with one character.
