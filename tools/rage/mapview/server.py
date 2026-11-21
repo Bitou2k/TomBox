@@ -18,8 +18,9 @@ What is shown and what is not (see docs/TECHNICAL_DEBT.md, "Second title asset t
     are left out: their placement in the world is not decoded;
   * only the colour texture: other maps (normal, specular, masks) and shader parameters are
     not applied, and layered materials show their DiffuseTex layer only;
-  * no level-of-detail selection: the LOD hierarchy is not decoded, so near and far versions
-    of the same object can overlap.
+  * level of detail is approximated: the game's parent links are not decoded, so the page
+    shows full-detail models in near tiles, "_lod" models in middle tiles and "_slod" models
+    in far tiles (by model name), never two levels in one tile.
 
 usage: server.py <levels.rpf> <index dir> <ttpf_index.json> [port]
 """
@@ -149,6 +150,11 @@ class Package:
         self.ents = e
         known = np.array(sorted(self.model_file), np.uint32)
         self.resolved = np.isin(e["name"], known)
+        # Detail level from the model's own name: 2 = "slod", 1 = "lod", 0 = anything else.
+        # The game's parent links (placement +0x58/+0x5a) are not decoded, so the page uses
+        # this with distance bands instead (an approximation of the game's switching).
+        lv = {h: (2 if "slod" in n.lower() else 1 if "lod" in n.lower() else 0) for h, (_, n) in self.model_file.items()}
+        self.level = np.array([lv.get(int(h), 0) for h in e["name"]], np.uint8)
         tx = np.floor(e["p"][:, 0] / TILE).astype(np.int64)
         ty = np.floor(e["p"][:, 1] / TILE).astype(np.int64)
         self.tiles = collections.defaultdict(list)
@@ -217,8 +223,10 @@ class Package:
             self.cache.popitem(last=False)
         return out
 
-    def tile(self, tx, ty):
+    def tile(self, tx, ty, level=None):
         idx = self.tiles.get((tx, ty), [])
+        if level is not None:
+            idx = [i for i in idx if self.level[i] == level]
         e = self.ents[idx]
         res = self.resolved[idx]
         a = np.zeros((len(idx), 12), "<f4")
@@ -227,7 +235,8 @@ class Package:
         a[:, 7:9] = e["s"]
         a[:, 9] = e["lod"]
         hdr = struct.pack("<I", len(idx))
-        return hdr + a.tobytes() + e["name"].astype("<u4").tobytes() + res.astype(np.uint8).tobytes()
+        return (hdr + a.tobytes() + e["name"].astype("<u4").tobytes() + res.astype(np.uint8).tobytes()
+                + self.level[idx].tobytes())
 
     def overview(self, step):
         p = self.ents["p"][::step]
@@ -237,7 +246,7 @@ class Package:
         p = self.ents["p"]
         return dict(entities=int(len(self.ents)), resolved=int(self.resolved.sum()), models=len(self.model_file),
                     local_left_out=self.local_count, tile=TILE, min=p.min(0).tolist(), max=p.max(0).tolist(),
-                    tiles=[[x, y, len(v)] for (x, y), v in self.tiles.items()])
+                    tiles=[[x, y] + np.bincount(self.level[v], minlength=3)[:3].tolist() for (x, y), v in self.tiles.items()])
 
 
 def handler(pkg, tex):
@@ -264,7 +273,8 @@ def handler(pkg, tex):
                 elif u.path == "/api/overview":
                     self.send(200, pkg.overview(int(q.get("step", ["4"])[0])), "application/octet-stream")
                 elif u.path == "/api/tile":
-                    self.send(200, pkg.tile(int(q["x"][0]), int(q["y"][0])), "application/octet-stream")
+                    lv = int(q["level"][0]) if "level" in q else None
+                    self.send(200, pkg.tile(int(q["x"][0]), int(q["y"][0]), lv), "application/octet-stream")
                 elif u.path.startswith("/api/model/"):
                     self.send(200, pkg.model(int(u.path.rsplit("/", 1)[1], 16)), "application/octet-stream")
                 elif u.path.startswith("/api/tex/"):

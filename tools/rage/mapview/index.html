@@ -31,14 +31,16 @@
   <div class="row">textures loaded <b id="texok">0</b> · not decodable <b id="texbad">0</b></div>
   <label><input id="tex" type="checkbox" checked> textures (applies to models loaded after the change)</label>
   <div class="row">red points: placements whose model is not in levels.rpf</div>
-  <label>load radius <input id="radius" type="range" min="250" max="1500" step="250" value="500"> <b id="rv">500</b> m</label>
+  <label>full-detail radius <input id="radius" type="range" min="250" max="1500" step="250" value="500"> <b id="rv">500</b> m (lod to 3x, slod to 8x)</label>
   <label><input id="pts" type="checkbox" checked> whole-map point cloud</label>
   <details><summary>what this shows</summary>
     Positions, rotations and scales are the game's placement records; geometry and colour
     textures are decoded on request from the original packages. Each part uses its shader's
     DiffuseTex texture; other maps (normal, specular, masks), shader parameters and blending
-    of layered materials are not applied. Not shown: level-of-detail selection (the hierarchy is not decoded, so near and far
-    versions of an object can overlap), interiors (stored near the origin in their own
+    of layered materials are not applied. Level of detail is approximated: the game's parent links between detailed and
+    low-detail placements are not decoded, so each tile shows full-detail models when near,
+    "_lod" models at middle distance and "_slod" models far away (by model name), which can
+    pop or leave gaps at tile edges. Not shown: interiors (stored near the origin in their own
     space; where they sit in the world is not decoded). Untextured parts are coloured per
     model, for telling them apart.
   </details>
@@ -95,7 +97,7 @@ const info = await (await fetch("/api/info")).json();
 const tileSize = info.tile;
 {
   // start over the densest tile
-  const t = info.tiles.reduce((a, b) => (b[2] > a[2] ? b : a));
+  const t = info.tiles.reduce((a, b) => (b[2] > a[2] ? b : a)); // most full-detail placements
   camera.position.set((t[0] + 0.5) * tileSize, (t[1] + 0.5) * tileSize - 200, 180);
   yaw = Math.PI / 2;
 }
@@ -184,21 +186,32 @@ function loadModel(h) {
   return p;
 }
 
-const tiles = new Map(); // "x,y" -> {group, count}
+// Each tile shows one detail level (0 full, 1 "_lod", 2 "_slod" by model name), chosen by
+// distance; a level's placements and models are fetched the first time it is shown.
+const tiles = new Map(); // "x,y" -> tile
+const tileCounts = new Map(info.tiles.map((t) => [t[0] + "," + t[1], t.slice(2)]));
 let loading = 0;
-async function loadTile(tx, ty) {
-  const key = tx + "," + ty;
-  const t = { group: new THREE.Group(), count: 0, dead: false };
+function newTile(key) {
+  const t = { key, root: new THREE.Group(), levels: [null, null, null], counts: tileCounts.get(key), dead: false, shown: -1 };
   tiles.set(key, t);
-  scene.add(t.group);
+  scene.add(t.root);
+  return t;
+}
+async function buildLevel(t, L) {
+  const grp = new THREE.Group();
+  t.levels[L] = grp;
+  t.root.add(grp);
+  grp.visible = t.shown === L;
+  const [tx, ty] = t.key.split(",");
   loading++;
-  const buf = await (await fetch(`/api/tile?x=${tx}&y=${ty}`)).arrayBuffer();
-  loading--;
+  let buf;
+  try { buf = await (await fetch(`/api/tile?x=${tx}&y=${ty}&level=${L}`)).arrayBuffer(); }
+  finally { loading--; }
+  if (t.dead) return;
   const n = new DataView(buf).getUint32(0, true);
   const f = new Float32Array(buf, 4, n * 12);
   const names = new Uint32Array(buf, 4 + n * 48, n);
   const res = new Uint8Array(buf, 4 + n * 52, n);
-  t.count = n;
   const byName = new Map();
   const missing = [];
   for (let i = 0; i < n; i++) {
@@ -208,7 +221,7 @@ async function loadTile(tx, ty) {
   if (missing.length) {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(missing), 3));
-    t.group.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0xd0453a, size: 4, sizeAttenuation: false })));
+    grp.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0xd0453a, size: 4, sizeAttenuation: false })));
   }
   const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s = new THREE.Vector3();
   for (const [h, list] of byName) {
@@ -224,36 +237,45 @@ async function loadTile(tx, ty) {
           im.setMatrixAt(k, m.compose(p, q, s));
         });
         im.computeBoundingSphere();
-        t.group.add(im);
+        grp.add(im);
       }
     });
   }
 }
+function showLevel(t, L) {
+  // a tile with nothing at the wanted level uses the nearest coarser level, else a finer one
+  const pick = [L, L + 1, L + 2, L - 1, L - 2].find((x) => x >= 0 && x <= 2 && t.counts[x] > 0);
+  if (pick === undefined || t.shown === pick) return;
+  t.shown = pick;
+  if (!t.levels[pick]) { if (loading >= 4) { t.shown = -1; return; } buildLevel(t, pick); }
+  t.levels.forEach((g, i) => g && (g.visible = i === pick));
+}
 function unloadTile(key) {
   const t = tiles.get(key);
   t.dead = true;
-  scene.remove(t.group);
-  t.group.traverse((o) => { if (o.isInstancedMesh) o.dispose(); if (o.isPoints) o.geometry.dispose(); });
+  scene.remove(t.root);
+  t.root.traverse((o) => { if (o.isInstancedMesh) o.dispose(); if (o.isPoints) o.geometry.dispose(); });
   tiles.delete(key);
 }
-const tileSet = new Set(info.tiles.map((t) => t[0] + "," + t[1]));
 function updateTiles() {
-  const R = +$("radius").value;
+  const R = +$("radius").value; // full-detail radius
   $("rv").textContent = R;
+  const RL = R * 3, RS = R * 8; // outer edges of the lod and slod bands
   const cx = camera.position.x, cy = camera.position.y;
-  const want = [];
-  const r = Math.ceil(R / tileSize);
+  const r = Math.ceil(RS / tileSize);
   const x0 = Math.floor(cx / tileSize), y0 = Math.floor(cy / tileSize);
+  const want = [];
   for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) {
-    const tx = x0 + dx, ty = y0 + dy, key = tx + "," + ty;
-    const d = Math.hypot((tx + 0.5) * tileSize - cx, (ty + 0.5) * tileSize - cy);
-    if (d <= R + tileSize * 0.71 && tileSet.has(key) && !tiles.has(key)) want.push([d, tx, ty]);
+    const key = (x0 + dx) + "," + (y0 + dy);
+    if (!tileCounts.has(key)) continue;
+    const d = Math.hypot((x0 + dx + 0.5) * tileSize - cx, (y0 + dy + 0.5) * tileSize - cy);
+    if (d <= RS) want.push([d, key]);
   }
   want.sort((a, b) => a[0] - b[0]);
-  for (const [, tx, ty] of want) { if (loading >= 4) break; loadTile(tx, ty); }
-  for (const key of [...tiles.keys()]) {
+  for (const [d, key] of want) showLevel(tiles.get(key) || newTile(key), d <= R ? 0 : d <= RL ? 1 : 2);
+  for (const [key, t] of [...tiles]) {
     const [tx, ty] = key.split(",").map(Number);
-    if (Math.hypot((tx + 0.5) * tileSize - cx, (ty + 0.5) * tileSize - cy) > R * 1.6 + tileSize) unloadTile(key);
+    if (Math.hypot((tx + 0.5) * tileSize - cx, (ty + 0.5) * tileSize - cy) > RS * 1.25 + tileSize) unloadTile(key);
   }
 }
 setInterval(updateTiles, 400);
@@ -273,7 +295,7 @@ function frame(now) {
   if (keys.has("KeyQ")) camera.position.z -= v;
   renderer.render(scene, camera);
   $("pos").textContent = camera.position.toArray().map((x) => x.toFixed(0)).join(", ");
-  let shown = 0; for (const t of tiles.values()) shown += t.count;
+  let shown = 0; for (const t of tiles.values()) if (t.shown >= 0) shown += t.counts[t.shown];
   $("tiles").textContent = tiles.size; $("shown").textContent = shown;
   $("models").textContent = nModels; $("failed").textContent = nFailed; $("pending").textContent = nPending;
   $("parterr").textContent = nPartErr; $("neterr").textContent = nNetErr;

@@ -180,9 +180,18 @@ Honest ledger. Updated continuously.
   a model only inside multi-model (LOD dictionary) files, whose part -> name split is not
   decoded; ~400k (5,351 files) lie within 250 m of the origin, presumably interiors in local
   space, with no decoded world placement.
-- Map viewer (`tools/rage/mapview`): colour texture only (see above), no LOD selection
-  (near/far versions overlap), interiors left out. Texture decode fails for ~12% of sampled
-  colour textures (records shorter than their mip chain - not explained by dropped top mips
-  - and the unsupported chunk codec).
+- Map viewer (`tools/rage/mapview`): colour texture only (see above); level of detail by
+  model name and distance band per tile, not the game's parent links; interiors left out.
+- Texture chunk codecs other than zlib (14% of textures): no decoder exists in the dump (no
+  BCPack or similar code in any DLL, executable or the OS image); blocked, not guessed.
+- Short texture records (~3.6%): layouts extend past the next texture's first page. Reading
+  past it while avoiding other textures' footprints recovers many, but ~25% of a visual
+  sample stayed garbled even inside their own span; no field separates them. Unsupported.
+- LOD hierarchy: placement +0x58/+0x5a look like (dependency index, parent index); section
+  0x4a of a map is a list of other maps' name hashes (from section 0xd3593fa6, +0x08). The
+  parents found that way are `_lod` models (897/906) but no closer to their children than an
+  off-by-one baseline, and most +0x58 values exceed the list: not decoded.
+- Interiors: 5,278 near-origin files, only 34 with the map header section; no world
+  placement record for them found (the 368-byte section 0xba049770 is not it).
 - Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
 - DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).

@@ -39,6 +39,75 @@ def untile(data, t, layout, mip=0):
     return bytes(out), None
 
 
+def _footprints(pack):
+    """Sorted (start, end) byte ranges each texture of the pack actually occupies: its first
+    page plus its layout's total size (or its page span when the layout is unknown)."""
+    if getattr(pack, "_fp", None) is None:
+        fp = []
+        for t in pack.textures:
+            lo = t["page"] << 12
+            layout = layout_of(t)
+            c = computer(t["w"], t["h"], max(t["mips"], 1), t["fmt"], layout, t["arr"]) if layout is not None else None
+            fp.append((lo, lo + (c["total"] if c else t["bytes"]), t["index"]))
+        fp.sort()
+        pack._fp = fp
+    return pack._fp
+
+
+def decode(pack, t, max_side=1 << 30, overlap=False):
+    """Image of the largest mip level of `t` whose side is <= max_side and whose bytes lie in
+    the texture's own page span (up to the next texture's first page); falls back to smaller
+    mips. Returns (image, mip); raises ValueError with the reason otherwise (CodecError for
+    unsupported chunks).
+
+    ~3.6% of records have a layout larger than their span: other textures start inside it.
+    With overlap=True, bytes past the span are read when they avoid every other texture's
+    footprint. That recovers many of them (small textures do sit in unused parts of larger
+    layouts), but about a quarter of a visual sample came out garbled anyway, for a reason not
+    found (no record field separates them), so it is off by default."""
+    import bisect
+    layout = layout_of(t)
+    if layout is None:
+        raise ValueError("tile layout unknown for this texture record (cube/array or unseen selector)")
+    w, h, fmt, mips = t["w"], t["h"], t["fmt"], max(t["mips"], 1)
+    c = computer(w, h, mips, fmt, layout, t["arr"])
+    if not c:
+        raise ValueError("layout computer refused")
+    bpe, blk, off = c["bpe"], (4 if fmt in BC else 1), c["off"]
+    lo = t["page"] << 12
+    mip = 0
+    while max(w, h) >> mip > max_side and mip + 1 < mips:
+        mip += 1
+    why = None
+    for m in range(mip, mips):
+        mw, mh = max(w >> m, 1), max(h >> m, 1)
+        we, he = (mw + blk - 1) // blk, (mh + blk - 1) // blk
+        offs = [off(m, x, y) for y in range(he) for x in range(we)]
+        end = max(offs) + bpe
+        if end > t["bytes"] and not overlap:
+            why = f"mip {m} extends past the record's page span"
+            continue
+        if end > t["bytes"]:
+            others = [(a - lo, b - lo) for a, b, i in _footprints(pack) if i != t["index"] and a < lo + end and b > lo]
+            starts = sorted(o[0] for o in others)
+            ends = {a: b for a, b in others}
+            hit = False
+            for o in offs:
+                k = bisect.bisect_right(starts, o + bpe - 1) - 1
+                if k >= 0 and ends[starts[k]] > o:
+                    hit = True
+                    break
+            if hit:
+                why = f"mip {m} overlaps another texture's data"
+                continue
+        data = pack.read(lo, end)
+        out = bytearray(we * he * bpe)
+        for i, o in enumerate(offs):
+            out[i * bpe:(i + 1) * bpe] = data[o:o + bpe]
+        return to_image(t, bytes(out), m), m
+    raise ValueError(why or "no readable mip")
+
+
 # Formats Pillow lacks, decoded as the format with the same bit layout (sRGB only changes how
 # the sampler converts the value).
 SAME_BITS = {29: 28, 72: 71, 75: 74, 78: 77, 99: 98, 91: 87, 93: 87}

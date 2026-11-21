@@ -1264,3 +1264,24 @@ the LOD-parent hierarchy (parent index != 0xffff on part of the records).
   server's own output show correct UV orientation (decals, rust along edges). Stop sign face
   is missing: it is in the layered shader's overlay slot (0x7485dafb) and uses the unsupported
   codec.
+
+## 2026-11-21 — Second title: textures, LOD and interiors - what closed, what is blocked
+
+- Unsupported texture codec: searched every DLL/EXE of both dumps and the OS image for a
+  software BCPack (or other) decoder: none. Blocked on a decoder; no guessing.
+- Short texture records: `ttpfexport.decode` (mip fallback, in-span only by default; an
+  `overlap` mode reads past the span avoiding other textures' footprints). Visual samples:
+  small textures do sit in unused parts of larger layouts, but ~25% stay garbled even within
+  their own span under every layout tried, so short records are still refused.
+- Map structure: map resources are a table of hashed sections (header +0x38, count +0x48);
+  0xce501483 = the placement array, 0xd3593fa6 = map header (name hash at +0x08, two
+  bounding boxes, placement count), 0x4a = list of other maps' name hashes. 20,404 map
+  files carry the header.
+- LOD links: (+0x58, +0x5a) tested as (index into 0x4a, index into that map's placements):
+  parents are `_lod` models (897 of 906) but their distance to the children equals an
+  off-by-one baseline; most +0x58 values exceed the list. Not decoded.
+- Viewer LOD: per tile, one detail level by distance (full < R, `_lod` < 3R, `_slod` < 8R,
+  by model name; fallback to the nearest level the tile has); per-level tile fetches. World
+  placements by level: 1,537,819 / 84,102 / 34,152.
+- Interiors: no placement record found (368-byte section 0xba049770 holds bounding boxes and
+  bitmasks, no rotation).
