@@ -281,7 +281,14 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             if let Some(d1) = raw.get(1) {
                 aux.imm = (d1 & 0x1f_ffff) as i64; // 21-bit OFFSET in dword1
             }
-            (vec![ssrc8(sdata as u16, None)], vec![sgpr_pair(sbase as u16)], aux)
+            let mut src = vec![sgpr_pair(sbase as u16)];
+            if let Some(d1) = raw.get(1) {
+                let soffset = (d1 >> 25) as u16;
+                if soffset != 0x7d {
+                    src.push(ssrc8(soffset, None));
+                }
+            }
+            (vec![ssrc8(sdata as u16, None)], src, aux)
         }
         Enc::Vop2 => {
             let vdst = (w >> 17) & 0xff;

@@ -19,6 +19,9 @@ use crate::{ShaderExtract, Stage};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
+mod bindings;
+mod mesh;
+
 pub struct Translated {
     pub hlsl: String,
     pub entry: &'static str,
@@ -28,6 +31,7 @@ pub struct Translated {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sym {
+    Constant(u32),
     Table(u8),
     Desc { table: u8, off: u32, k: u32 },
     /// Dword `k` of one of several descriptors (control-flow join of different `s_load`s,
@@ -60,6 +64,7 @@ enum Res {
     TBuf(u32, bool), // slot, is_uav (typed buffer)
     CbDyn(u32),      // constant buffer read through MUBUF (per-lane offset)
     CodeTbl,         // s_load from the code section (embedded constant table)
+    Raw(u32, bool),
 }
 
 const XYZW: [&str; 4] = ["x", "y", "z", "w"];
@@ -189,6 +194,7 @@ fn semantic(e: &SigElement) -> String {
 
 struct Emitter<'a> {
     ex: &'a ShaderExtract,
+    bindings: Option<bindings::Bindings>,
     insns: Vec<Insn>,
     res: HashMap<usize, Vec<Res>>, // per-instruction resolved resources
     cb_size: BTreeMap<u32, u32>,   // slot -> dwords
@@ -197,6 +203,7 @@ struct Emitter<'a> {
     samp_cmp: BTreeSet<u32>,
     uav: BTreeMap<u32, u32>,       // slot -> dim
     sbuf: BTreeMap<(bool, u32), u32>, // (is_uav, slot) -> element dwords used
+    rawbuf: BTreeSet<(bool, u32)>,
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     /// Inferred integer element type of typed buffers: (is_uav, slot) -> 1 uint, 2 sint.
@@ -238,6 +245,7 @@ struct Emitter<'a> {
     /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
     /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
     dsel_loads: HashMap<usize, (u16, u32)>,
+    dsel_dynamic: HashMap<usize, (u16, u8, u32, u32)>,
     dsel_moves: HashMap<usize, (u16, u16)>,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
@@ -296,11 +304,44 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<(), String> {
         let off = insns[first].offset;
         let bad = |what: &str| format!("wave reduction at {off:#x}: {what}");
         let red = insns[first].mnemonic.clone();
-        if !matches!(red.as_str(), "v_min_f32" | "v_max_f32") {
+        if !matches!(red.as_str(), "v_min_f32" | "v_max_f32" | "v_min_u32" | "v_max_u32" | "v_min_i32" | "v_max_i32" | "v_or_b32" | "v_and_b32" | "v_xor_b32") {
             return Err(bad(&format!("unsupported reduction op {red}")));
         }
         let Some(Opnd::Vgpr(vr)) = insns[first].dst.first().copied() else { return Err(bad("no accumulator")) };
-        // Prologue: nand_saveexec, identity move, cndmask.
+        let (a, cm, saved, mask, vin, ident) = if let Some(a) = (first.saturating_sub(5)..first).rev().find(|&i| insns[i].mnemonic == "s_or_saveexec_b64" && insns[i].src.first() == Some(&Opnd::ConstInt(-1))) {
+            let saved = match insns[a].dst.first() { Some(Opnd::Sgpr(s)) => *s, _ => return Err(bad("bad saved exec")) };
+            let cm = first - 1;
+            let c = &insns[cm];
+            let (vin, mask, ident) = match (c.mnemonic.as_str(), c.dst.first(), c.src.first(), c.src.get(1), c.src.get(2)) {
+                ("v_cndmask_b32", Some(Opnd::Vgpr(d)), Some(identity), Some(Opnd::Vgpr(v)), Some(Opnd::Sgpr(m))) if *d == vr => {
+                    let ident = match identity {
+                        Opnd::ConstInt(k) => *k as u32,
+                        Opnd::Literal(k) => *k,
+                        Opnd::Vgpr(r) => {
+                            let mv = &insns[cm - 1];
+                            match (mv.mnemonic.as_str(), mv.dst.first(), mv.src.first()) {
+                                ("v_mov_b32", Some(Opnd::Vgpr(d)), Some(Opnd::Literal(k))) if d == r => *k,
+                                _ => return Err(bad("unresolved reduction identity")),
+                            }
+                        }
+                        _ => return Err(bad("unsupported reduction identity")),
+                    };
+                    (*v, *m, ident)
+                }
+                _ => return Err(bad("unexpected integer reduction select")),
+            };
+            let mut start = a + 1;
+            if mask != saved {
+                let and = &insns[start];
+                if and.mnemonic != "s_and_b64" || and.dst.first() != Some(&Opnd::Sgpr(mask)) || and.src.get(1) != Some(&Opnd::Sgpr(saved)) {
+                    return Err(bad("unexpected integer reduction mask"));
+                }
+                start += 1;
+            }
+            if !insns[start..cm].iter().enumerate().all(|(i,x)| x.mnemonic == "s_waitcnt" || x.mnemonic == "s_nop" || (start+i == cm-1 && matches!(c.src.first(),Some(Opnd::Vgpr(_))) && x.mnemonic == "v_mov_b32")) {
+                return Err(bad("unexpected reduction prologue instruction"));
+            }            (a, cm, saved, mask, vin, ident)
+        } else {
         if first < 3 {
             return Err(bad("no prologue"));
         }
@@ -321,6 +362,8 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<(), String> {
                 *x
             }
             _ => return Err(bad("unexpected select before the reduction")),
+        };
+        (a, cm, saved, saved, vin, ident)
         };
         // Body up to the exec restore.
         let mut end = None;
@@ -365,9 +408,9 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<(), String> {
         let x = &mut insns[last];
         x.enc = Enc::Vop3;
         x.op = OP_WAVE_REDUCE;
-        x.mnemonic = if red == "v_min_f32" { "tb_wave_min_f32".into() } else { "tb_wave_max_f32".into() };
+        x.mnemonic = format!("tb_wave_{}", &red[2..]);
         x.dst = vec![Opnd::Sgpr(res)];
-        x.src = vec![Opnd::Vgpr(vin), Opnd::Sgpr(saved)];
+        x.src = vec![Opnd::Vgpr(vin), Opnd::Sgpr(mask)];
         x.aux.imm = ident as i64;
         at = end + 1;
     }
@@ -447,11 +490,32 @@ fn lower_lane_spills(insns: &mut [Insn]) -> Result<(), String> {
 }
 
 pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
+    translate_inner(ex, None)
+}
+
+pub fn translate_with_pso(
+    ex: &ShaderExtract,
+    layouts: &[crate::psocache::BindingLayout],
+) -> Result<Translated, String> {
+    if ex.root_sig.is_some() || layouts.is_empty() {
+        return translate(ex);
+    }
+    let bindings = bindings::Bindings::from_layout(&layouts[0], &ex.resources, ex.stage);
+    if layouts[1..].iter().any(|layout| {
+        bindings != bindings::Bindings::from_layout(layout, &ex.resources, ex.stage)
+    }) {
+        return Err("PSO bindings: shader hash has conflicting layouts".into());
+    }
+    translate_inner(ex, Some(bindings))
+}
+
+fn translate_inner(ex: &ShaderExtract, bindings: Option<bindings::Bindings>) -> Result<Translated, String> {
     let (profile, is_ps) = match ex.stage {
         Stage::Vertex => ("vs_5_0", false),
         Stage::Pixel => ("ps_5_0", true),
         Stage::Compute => ("cs_5_0", false),
         Stage::Geometry => ("gs_5_0", false),
+        Stage::Mesh => ("ms_6_5", false),
         other => return Err(format!("stage {other:?} not supported yet")),
     };
     let mut insns = disassemble(&ex.isa);
@@ -460,6 +524,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
     let mut em = Emitter {
         loop_depth: 0,
         ex,
+        bindings,
         insns,
         res: HashMap::new(),
         cb_size: BTreeMap::new(),
@@ -468,6 +533,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         samp_cmp: BTreeSet::new(),
         uav: BTreeMap::new(),
         sbuf: BTreeMap::new(),
+        rawbuf: BTreeSet::new(),
         tbuf: BTreeSet::new(),
         tbuf_uint: BTreeSet::new(),
         tbuf_ty: BTreeMap::new(),
@@ -487,6 +553,7 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
         msel: HashMap::new(),
         bsel: HashMap::new(),
         dsel_loads: HashMap::new(),
+        dsel_dynamic: HashMap::new(),
         dsel_moves: HashMap::new(),
         live: Vec::new(),
         uses_quad: false,
@@ -531,6 +598,17 @@ pub fn translate(ex: &ShaderExtract) -> Result<Translated, String> {
 }
 
 impl<'a> Emitter<'a> {
+    fn binding(&self, table: u8, offset: u32, resource_types: &[u32]) -> Result<Option<bindings::Binding>, String> {
+        self.bindings.as_ref().map(|bindings| bindings.get(table, offset, resource_types)).transpose()
+    }
+
+    fn register(&self, class: char, slot: u32) -> String {
+        match self.bindings.as_ref().and_then(|bindings| bindings.address(slot)) {
+            Some((register, space)) => format!("register({class}{register}, space{space})"),
+            None => format!("register({class}{slot})"),
+        }
+    }
+
     /// Root-signature range type (0 SRV, 1 UAV, 2 CBV, 3 Sampler) of the descriptor table
     /// whose pointer lives in user SGPR `sgpr` at shader entry. The FSSM register table
     /// maps user SGPR (base + i) to root parameter i, with base 8 for graphics stages and
@@ -620,6 +698,7 @@ impl<'a> Emitter<'a> {
             self.samp_cmp.clone(),
             self.uav.clone(),
             self.sbuf.clone(),
+            self.rawbuf.clone(),
             self.tbuf.clone(),
             self.tbuf_uint.clone(),
         );
@@ -691,7 +770,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        (self.res, self.cb_size, self.tex, self.samp, self.samp_cmp, self.uav, self.sbuf, self.tbuf, self.tbuf_uint) = saved;
+        (self.res, self.cb_size, self.tex, self.samp, self.samp_cmp, self.uav, self.sbuf, self.rawbuf, self.tbuf, self.tbuf_uint) = saved;
 
         // TB_DFDEBUG=<sgpr>: print that register's symbol at every block entry (diagnostics).
         if let Some(reg) = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u16>().ok()) {
@@ -1016,8 +1095,26 @@ impl<'a> Emitter<'a> {
 
     /// Resource a MUBUF instruction addresses when its descriptor is `slot` of `table`
     /// (also records declaration requirements).
-    fn mubuf_res(&mut self, ins: &Insn, slot: u32, table: u8) -> Result<Res, String> {
-        let is_uav = match self.table_kind(table) {
+    fn mubuf_res(&mut self, ins: &Insn, offset: u32, table: u8) -> Result<Res, String> {
+        let is_atomic = ins.mnemonic.contains("_atomic_");
+        let is_typed = ins.mnemonic.contains("_format_");
+        let is_write = is_atomic || ins.mnemonic.starts_with("buffer_store");
+        let allowed_types: &[u32] = match (is_write, is_typed) {
+            (true, _) if is_atomic => &[6, 7, 8, 9],
+            (true, true) => &[6],
+            (true, false) => &[7, 8, 9],
+            (false, true) => &[2, 3, 6],
+            (false, false) => &[2, 4, 5, 7, 8, 9],
+        };
+        let binding = self.binding(table, offset, allowed_types)?;
+        let slot = binding.map_or(offset / 32, |value| value.slot);
+        if matches!(binding.map(|value| value.resource_type), Some(4 | 7)) {
+            let is_uav = binding.unwrap().kind == 1;
+            self.rawbuf.insert((is_uav, slot));
+            return Ok(Res::Raw(slot, is_uav));
+        }
+        let table_kind = binding.map(|value| value.kind).or_else(|| self.table_kind(table));
+        let is_uav = match table_kind {
             Some(0) => false,
             Some(1) => true,
             Some(2) => {
@@ -1028,13 +1125,16 @@ impl<'a> Emitter<'a> {
             }
             other => return Err(format!("mubuf at {:#x}: buffer in table of kind {other:?}", ins.offset)),
         };
-        if ins.mnemonic.contains("_atomic_") {
+        if is_atomic {
             if !is_uav {
                 return Err(format!("mubuf at {:#x}: atomic on a non-UAV buffer", ins.offset));
             }
             // PSV0 tells typed (6) from structured (8) UAVs. Atomics need a uint element, so
             // a typed UAV used atomically is declared RWBuffer<uint>.
-            let structured = self.ex.resources.iter().any(|p| p.res_type == 8 && p.lower <= slot && slot <= p.upper);
+            let structured = binding.map_or_else(
+                || self.ex.resources.iter().any(|p| p.res_type == 8 && p.lower <= slot && slot <= p.upper),
+                |value| matches!(value.resource_type, 8 | 9),
+            );
             if structured {
                 let e = self.sbuf.entry((true, slot)).or_insert(0);
                 *e = (*e).max(ins.aux.imm as u32 / 4 + 1);
@@ -1044,7 +1144,7 @@ impl<'a> Emitter<'a> {
             self.tbuf_uint.insert(slot);
             return Ok(Res::TBuf(slot, true));
         }
-        if ins.mnemonic.contains("_format_") {
+        if is_typed {
             // Typed buffer (Buffer<T> / RWBuffer<T>), addressed by element index.
             self.tbuf.insert((is_uav, slot));
             return Ok(Res::TBuf(slot, is_uav));
@@ -1122,6 +1222,12 @@ impl<'a> Emitter<'a> {
                 _ => None,
             };
             match ins.enc {
+                Enc::Sopk if ins.mnemonic == "s_movk_i32" => {
+                    if let Some(d) = ins.dst.first().and_then(sg) {
+                        sym.insert(d, Sym::Constant(ins.aux.imm as i16 as i32 as u32));
+                        written.insert(d);
+                    }
+                }
                 Enc::Sop1 if ins.mnemonic == "s_mov_b32" => {
                     if let Some(d) = ins.dst.first().and_then(sg) {
                         match ins.src.first().and_then(sg).and_then(|s| sym.get(&s).cloned()) {
@@ -1134,6 +1240,15 @@ impl<'a> Emitter<'a> {
                                 match s {
                                     Some(s) if !written.contains(&s) => {
                                         sym.insert(d, Sym::Table(s as u8));
+                                    }
+                                    _ if matches!(ins.src.first(), Some(Opnd::ConstInt(_) | Opnd::Literal(_) | Opnd::ConstF32(_))) => {
+                                        let value = match ins.src[0] {
+                                            Opnd::ConstInt(value) => value as u32,
+                                            Opnd::Literal(value) => value,
+                                            Opnd::ConstF32(value) => value.to_bits(),
+                                            _ => unreachable!(),
+                                        };
+                                        sym.insert(d, Sym::Constant(value));
                                     }
                                     _ => {
                                         sym.remove(&d);
@@ -1252,7 +1367,25 @@ impl<'a> Emitter<'a> {
                         }
                     };
                     if (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d {
-                        return Err(format!("s_load at {:#x}: dynamic soffset unsupported", ins.offset));
+                        let candidates = self.bindings.as_ref().map(|bindings| bindings.candidates(table, n))
+                            .filter(|candidates| !candidates.is_empty())
+                            .ok_or_else(|| format!("s_load at {:#x}: dynamic soffset requires PSO descriptor bindings", ins.offset))?;
+                        let set = if let Some(set) = self.multi_sets.iter().position(|other| *other == candidates) {
+                            set
+                        } else {
+                            self.multi_sets.push(candidates);
+                            self.multi_sets.len() - 1
+                        };
+                        if set > u16::MAX as usize {
+                            return Err("too many dynamic descriptor candidate sets".into());
+                        }
+                        let soff = ins.raw[1] >> 25;
+                        self.dsel_dynamic.insert(idx, (d, table, soff, ins.aux.imm as u32));
+                        for k in 0..n {
+                            sym.insert(d + k as u16, Sym::Multi { set: set as u16, k });
+                            written.insert(d + k as u16);
+                        }
+                        continue;
                     }
                     for k in 0..n {
                         sym.insert(d + k as u16, Sym::Desc { table, off: ins.aux.imm as u32, k });
@@ -1266,6 +1399,20 @@ impl<'a> Emitter<'a> {
                     let d = ins.dst.first().and_then(sreg_num).map(u16::from).ok_or("s_buffer_load: bad dst")?;
                     // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table offset
                     // 0x20 in MainOnePassPointLightPS).
+                    let direct_table = match sym.get(&b) {
+                        Some(Sym::Table(table)) => Some(*table),
+                        None if !written.contains(&b) => Some(b as u8),
+                        _ => None,
+                    };
+                    if let Some(binding) = direct_table.and_then(|table| self.bindings.as_ref()?.direct(table)) {
+                        self.rawbuf.insert((false, binding.slot));
+                        self.res.insert(idx, vec![Res::Raw(binding.slot, false)]);
+                        for k in 0..n {
+                            sym.remove(&(d + k as u16));
+                            written.insert(d + k as u16);
+                        }
+                        continue;
+                    }
                     let cands = self.desc_candidates(sym.get(&b)).ok_or_else(|| {
                         format!("s_buffer_load at {:#x}: base s{b} is not a buffer descriptor ({:?})", ins.offset, sym.get(&b))
                     })?;
@@ -1282,8 +1429,16 @@ impl<'a> Emitter<'a> {
                     // descriptors the load is still treated as a constant buffer (debt).
                     let buffer_kind = if cands.len() == 1 { self.table_kind(cands[0].0).filter(|k| *k <= 1) } else { None };
                     for (table, off) in &cands {
-                        let slot = off / 32;
-                        if let Some(k) = buffer_kind {
+                        let binding = self.binding(*table, *off, &[2, 4, 5, 7, 8, 9])?;
+                        let slot = binding.map_or(off / 32, |value| value.slot);
+                        if matches!(binding.map(|value| value.resource_type), Some(4 | 7)) {
+                            let is_uav = binding.unwrap().kind == 1;
+                            self.rawbuf.insert((is_uav, slot));
+                            out.push((((*table as u32) << 24) | off, Res::Raw(slot, is_uav)));
+                            continue;
+                        }
+                        let kind = binding.map(|value| value.kind).filter(|kind| *kind <= 1).or(buffer_kind);
+                        if let Some(k) = kind {
                             let key = (k == 1, slot);
                             let e = self.sbuf.entry(key).or_insert(0);
                             *e = (*e).max(4);
@@ -1309,12 +1464,22 @@ impl<'a> Emitter<'a> {
                 Enc::Mubuf if ins.op == 0x71 || ins.op == 0x72 => {}
                 Enc::Mubuf => {
                     let rs = ins.src.get(1).and_then(sg).ok_or("mubuf: bad srsrc")?;
+                    let direct_table = match sym.get(&rs) {
+                        Some(Sym::Table(table)) => Some(*table),
+                        None if !written.contains(&rs) => Some(rs as u8),
+                        _ => None,
+                    };
+                    if let Some(binding) = direct_table.and_then(|table| self.bindings.as_ref()?.direct(table)) {
+                        self.rawbuf.insert((false, binding.slot));
+                        self.res.insert(idx, vec![Res::Raw(binding.slot, false)]);
+                        continue;
+                    }
                     let cands = self.desc_candidates(sym.get(&rs)).ok_or_else(|| {
                         format!("mubuf at {:#x}: s{rs} not a buffer descriptor ({:?})", ins.offset, sym.get(&rs))
                     })?;
                     let mut out: Vec<(u32, Res)> = Vec::new();
                     for (table, off) in &cands {
-                        out.push((((*table as u32) << 24) | off, self.mubuf_res(ins, off / 32, *table)?));
+                        out.push((((*table as u32) << 24) | off, self.mubuf_res(ins, *off, *table)?));
                     }
                     self.res.insert(idx, vec![out[0].1]);
                     if out.len() > 1 {
@@ -1331,8 +1496,17 @@ impl<'a> Emitter<'a> {
                     })?;
                     let mut tex_res: Vec<(u32, Res)> = Vec::new();
                     for (ttable, off) in &tex_c {
-                        let tslot = off / 32;
-                        let is_uav = self.table_kind(*ttable) == Some(1);
+                        let allowed_types: &[u32] = if ins.mnemonic.starts_with("image_sample")
+                            || ins.mnemonic.starts_with("image_gather") {
+                            &[3]
+                        } else if ins.mnemonic.starts_with("image_store") || ins.mnemonic.starts_with("image_atomic_") {
+                            &[6]
+                        } else {
+                            &[3, 6]
+                        };
+                        let binding = self.binding(*ttable, *off, allowed_types)?;
+                        let tslot = binding.map_or(off / 32, |value| value.slot);
+                        let is_uav = binding.map_or_else(|| self.table_kind(*ttable) == Some(1), |value| value.kind == 1);
                         if is_uav && ins.mnemonic.starts_with("image_atomic_") {
                             self.uav_uint.insert(tslot);
                         }
@@ -1346,11 +1520,30 @@ impl<'a> Emitter<'a> {
                     }
                     let mut samp_res: Vec<(u32, Res)> = Vec::new();
                     if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") {
-                        let samp_c = self.desc_candidates(sym.get(&ss)).ok_or_else(|| {
-                            format!("mimg at {:#x}: s{ss} not a sampler descriptor ({:?})", ins.offset, sym.get(&ss))
-                        })?;
+                        let inline_words: Option<Vec<u32>> = (0..4u16).map(|offset| {
+                            match sym.get(&(ss + offset)) {
+                                Some(Sym::Constant(value)) => Some(*value),
+                                _ => None,
+                            }
+                        }).collect();
+                        let inline = inline_words.and_then(|words| {
+                            self.bindings.as_ref()?.sampler(words.try_into().ok()?)
+                        });
+                        let samp_c = if let Some(binding) = inline {
+                            if ins.op & 8 != 0 {
+                                self.samp_cmp.insert(binding.slot);
+                            } else {
+                                self.samp.insert(binding.slot);
+                            }
+                            samp_res.push((0, Res::Samp(binding.slot)));
+                            Vec::new()
+                        } else {
+                            self.desc_candidates(sym.get(&ss)).ok_or_else(|| {
+                                format!("mimg at {:#x}: s{ss} not a sampler descriptor ({:?})", ins.offset, sym.get(&ss))
+                            })?
+                        };
                         for (stable, off) in &samp_c {
-                            let sslot = off / 16;
+                            let sslot = self.binding(*stable, *off, &[1])?.map_or(off / 16, |value| value.slot);
                             // Depth-compare variants (opcode bit 3) need a comparison sampler.
                             if ins.op & 8 != 0 {
                                 self.samp_cmp.insert(sslot);
@@ -1752,12 +1945,14 @@ impl<'a> Emitter<'a> {
             "eq" => format!("({x} == {y})"),
             "le" => format!("({x} <= {y})"),
             "gt" => format!("({x} > {y})"),
+            "lg" if ty == "f16" || ty == "f32" =>
+                format!("(!isnan({x}) && !isnan({y}) && ({x} != {y}))"),
             "lg" | "ne" => format!("({x} != {y})"),
             "ge" => format!("({x} >= {y})"),
-            "o" => format!("({x} == {x} && {y} == {y})"),
-            "u" => format!("({x} != {x} || {y} != {y})"),
+            "o" => format!("(!isnan({x}) && !isnan({y}))"),
+            "u" => format!("(isnan({x}) || isnan({y}))"),
             "nge" => format!("(!({x} >= {y}))"),
-            "nlg" => format!("(!({x} != {y}))"),
+            "nlg" => format!("(isnan({x}) || isnan({y}) || ({x} == {y}))"),
             "ngt" => format!("(!({x} > {y}))"),
             "nle" => format!("(!({x} <= {y}))"),
             "neq" => format!("(!({x} == {y}))"),
@@ -1798,6 +1993,11 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         if !self.msel.is_empty() || !self.bsel.is_empty() {
+            if let Some(&(d, table, soff, immediate)) = self.dsel_dynamic.get(&idx) {
+                self.regs.insert(format!("tb_dsel{d}"));
+                self.regs.insert(ssrc_name(soff)?);
+                self.line(&format!("tb_dsel{d} = {:#x}u | ({} + {immediate}u);", (table as u32) << 24, ssrc_name(soff)?));
+            }
             if let Some(&(d, id)) = self.dsel_loads.get(&idx) {
                 self.regs.insert(format!("tb_dsel{d}"));
                 self.line(&format!("tb_dsel{d} = {id:#x}u;"));
@@ -1841,7 +2041,7 @@ impl<'a> Emitter<'a> {
         }
         match ins.enc {
             Enc::Sopp if ins.op == 0x10 => self.emit_sendmsg(ins),
-            Enc::Sopp if ins.op == 0x0a && self.is_cs => {
+            Enc::Sopp if ins.op == 0x0a && (self.is_cs || self.ex.stage == Stage::Mesh) => {
                 self.line("GroupMemoryBarrierWithGroupSync();");
                 Ok(())
             }
@@ -2146,6 +2346,22 @@ impl<'a> Emitter<'a> {
                 let soff = ins.raw.get(1).copied().unwrap_or(0) >> 25;
                 let slot = match self.res.get(&idx).and_then(|v| v.first()).copied() {
                     Some(Res::Cb(s)) => s,
+                    Some(Res::Raw(slot, is_uav)) => {
+                        let buffer = if is_uav { "uraw" } else { "sraw" };
+                        let dynamic = if soff != 0x7d { format!(" + {}", ssrc_name(soff)?) } else { String::new() };
+                        let temp = self.tmp;
+                        self.tmp += 1;
+                        self.line(&format!("uint t{temp} = {:#x}u{dynamic};", ins.aux.imm as u32));
+                        for k in 0..n {
+                            self.line(&format!("uint t{temp}_{k} = {buffer}{slot}.Load(t{temp} + {}u);", k * 4));
+                        }
+                        for k in 0..n {
+                            let dst = sreg_opnd(base + k as u8);
+                            self.touch(&dst);
+                            self.ws(&dst, &format!("t{temp}_{k}"))?;
+                        }
+                        return Ok(());
+                    }
                     Some(Res::Buf(slot, is_uav)) => {
                         // Structured buffer read by byte offset (see `tb_sbw_*`).
                         let nm = if is_uav { "ubuf" } else { "sbuf" };
@@ -2453,14 +2669,24 @@ impl<'a> Emitter<'a> {
             // See `lower_wave_reductions`. Every invocation computes the same value; lanes
             // that were inactive contribute the identity.
             self.uses_wave = true;
-            let f = if m == "tb_wave_min_f32" { "WaveActiveMin" } else { "WaveActiveMax" };
+            let (f, cast) = match m.as_str() {
+                "tb_wave_min_f32" => ("WaveActiveMin", "asfloat"),
+                "tb_wave_max_f32" => ("WaveActiveMax", "asfloat"),
+                "tb_wave_min_i32" => ("WaveActiveMin", "asint"),
+                "tb_wave_max_i32" => ("WaveActiveMax", "asint"),
+                "tb_wave_min_u32" => ("WaveActiveMin", "uint"),
+                "tb_wave_max_u32" => ("WaveActiveMax", "uint"),
+                "tb_wave_or_b32" => ("WaveActiveBitOr", "uint"),
+                "tb_wave_and_b32" => ("WaveActiveBitAnd", "uint"),
+                "tb_wave_xor_b32" => ("WaveActiveBitXor", "uint"),
+                _ => return Err(format!("unsupported wave reduction {m}")),
+            };
             let e = format!(
-                "asuint({f}((({} & 1u) != 0u) ? asfloat({}) : asfloat({:#x}u)))",
+                "asuint({f}((({} & 1u) != 0u) ? {cast}({}) : {cast}({:#x}u)))",
                 r(&s[1])?,
                 r(&s[0])?,
                 ins.aux.imm as u32
-            );
-            return self.ws(&d, &e);
+            );            return self.ws(&d, &e);
         }
         // ---- half-float arithmetic: operands are f16 in the low 16 bits (inline float
         // constants denote the half-float of that value); the result is written as f16.
@@ -2923,6 +3149,8 @@ impl<'a> Emitter<'a> {
             "v_mul_lo_u32" | "v_mul_lo_i32" => format!("({a} * {b})"),
             // Count of mask bits below this lane, plus src1. One invocation = one lane with
             // nothing below it, so the count term is zero.
+            "v_mbcnt_lo_u32_b32" if self.ex.stage == Stage::Mesh => format!("({b} + countbits({a} & ((tid % 64u >= 32u) ? 0xffffffffu : ((1u << (tid % 32u)) - 1u))))"),
+            "v_mbcnt_hi_u32_b32" if self.ex.stage == Stage::Mesh => format!("({b} + countbits({a} & ((tid % 64u < 32u) ? 0u : ((1u << (tid % 32u)) - 1u))))"),
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => b,
             "v_mul_hi_u32" => format!("tb_mulhi_u32({a}, {b})"),
             "v_mul_hi_i32" => format!("tb_mulhi_i32({a}, {b})"),
@@ -2976,6 +3204,35 @@ impl<'a> Emitter<'a> {
     /// immediate the byte offset inside the element. Dynamic offsets (OFFEN / SOFFSET
     /// register) are not handled yet and fail explicitly.
     fn emit_mubuf(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
+        if let Some(Res::Raw(slot, is_uav)) = self.res.get(&idx).and_then(|items| items.first()).copied() {
+            if ins.aux.mask & 2 != 0 || ins.mnemonic.contains("_atomic_") || ins.mnemonic.contains("_format_") {
+                return Err(format!("raw buffer addressing unsupported at {:#x}", ins.offset));
+            }
+            let offset = if ins.aux.mask & 1 != 0 { r(&ins.src[0])? } else { "0u".into() };
+            let soff = r(&ins.src[2])?;
+            let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("raw buffer operation unsupported")?;
+            let Some(Opnd::Vgpr(vd)) = ins.dst.first().copied() else { return Err("raw buffer has no vector data".into()) };
+            let buffer = if is_uav { "uraw" } else { "sraw" };
+            let temp = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{temp} = {offset} + {soff} + {}u;", ins.aux.imm as u32));
+            if ins.mnemonic.starts_with("buffer_store") {
+                if !is_uav { return Err("raw store requires a UAV".into()) }
+                for k in 0..n {
+                    let value = Opnd::Vgpr(vd + k as u8);
+                    self.touch(&value);
+                    self.line(&format!("if (exec_lo & 1u) {buffer}{slot}.Store(t{temp} + {}u, {});", k * 4, r(&value)?));
+                }
+            } else {
+                for k in 0..n {
+                    self.line(&format!("uint t{temp}_{k} = {buffer}{slot}.Load(t{temp} + {}u);", k * 4));
+                }
+                for k in 0..n {
+                    self.wv(&Opnd::Vgpr(vd + k as u8), &format!("t{temp}_{k}"))?;
+                }
+            }
+            return Ok(());
+        }
         if let Some(Res::CbDyn(slot)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
             let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
             if (idxen && offen) || !matches!(ins.src[2], Opnd::ConstInt(0)) || !ins.mnemonic.starts_with("buffer_load_dword") {
@@ -3311,6 +3568,9 @@ impl<'a> Emitter<'a> {
     /// `s_sendmsg`: in a geometry shader, message 2 = GS with op bits (1 = cut, 2 = emit),
     /// message 3 = GS_DONE.
     fn emit_sendmsg(&mut self, ins: &Insn) -> Result<(), String> {
+        if self.ex.stage == Stage::Mesh {
+            return self.mesh_sendmsg(ins);
+        }
         if !self.is_gs {
             return Err("s_sendmsg outside a geometry shader".into());
         }
@@ -3726,6 +3986,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_exp(&mut self, ins: &Insn, is_ps: bool) -> Result<(), String> {
+        if self.ex.stage == Stage::Mesh {
+            return self.mesh_exp(ins);
+        }
         let target = ins.aux.imm as u32;
         let en = ins.aux.mask;
         let compr = ins.aux.imm2 & 1 != 0;
@@ -3875,8 +4138,12 @@ impl<'a> Emitter<'a> {
         let mut h = String::new();
         let _ = writeln!(h, "// Generated by tombox-xshader from RDNA2 microcode ({:?}, {} instrs).", ex.stage, self.insns.len());
         h.push_str(CUBE_HELPERS);
+        for (is_uav, slot) in &self.rawbuf {
+            let (ty, name, class) = if *is_uav { ("RWByteAddressBuffer", "uraw", 'u') } else { ("ByteAddressBuffer", "sraw", 't') };
+            let _ = writeln!(h, "{ty} {name}{slot} : {};", self.register(class, *slot));
+        }
         for (slot, dwords) in &self.cb_size {
-            let _ = writeln!(h, "cbuffer CB{slot} : register(b{slot}) {{ uint4 cb{slot}[{}]; }};", dwords.div_ceil(4).max(1));
+            let _ = writeln!(h, "cbuffer CB{slot} : {} {{ uint4 cb{slot}[{}]; }};", self.register('b', *slot), dwords.div_ceil(4).max(1));
         }
         for (slot, dim) in &self.tex {
             let ty = match dim {
@@ -3894,21 +4161,21 @@ impl<'a> Emitter<'a> {
                 Some(_) => "uint4",
                 None => "float4",
             };
-            let _ = writeln!(h, "{ty}<{e}> tex{slot} : register(t{slot});");
+            let _ = writeln!(h, "{ty}<{e}> tex{slot} : {};", self.register('t', *slot));
         }
         for slot in &self.samp {
-            let _ = writeln!(h, "SamplerState samp{slot} : register(s{slot});");
+            let _ = writeln!(h, "SamplerState samp{slot} : {};", self.register('s', *slot));
         }
         for slot in &self.samp_cmp {
             if self.samp.contains(slot) {
                 return Err(format!("sampler s{slot} used both as a regular and a comparison sampler"));
             }
-            let _ = writeln!(h, "SamplerComparisonState scmp{slot} : register(s{slot});");
+            let _ = writeln!(h, "SamplerComparisonState scmp{slot} : {};", self.register('s', *slot));
         }
         for (is_uav, slot) in self.sbuf.keys() {
-            let (ty, nm, reg) = if *is_uav { ("RWStructuredBuffer", "ubuf", "u") } else { ("StructuredBuffer", "sbuf", "t") };
+            let (ty, nm, reg) = if *is_uav { ("RWStructuredBuffer", "ubuf", 'u') } else { ("StructuredBuffer", "sbuf", 't') };
             let _ = writeln!(h, "struct TbElem_{nm}{slot} {{ uint w[{}]; }};
-{ty}<TbElem_{nm}{slot}> {nm}{slot} : register({reg}{slot});", self.sbuf_words((*is_uav, *slot)));
+{ty}<TbElem_{nm}{slot}> {nm}{slot} : {};", self.sbuf_words((*is_uav, *slot)), self.register(reg, *slot));
             if self.sbuf_flat.contains(&(*is_uav, *slot)) {
                 // Word at a byte offset: the element stride is a property of the view, not of
                 // the shader, so it is queried.
@@ -3917,7 +4184,7 @@ impl<'a> Emitter<'a> {
         }
         for (is_uav, slot) in &self.tbuf {
             let _ = if *is_uav && self.tbuf_uint.contains(slot) {
-                writeln!(h, "RWBuffer<uint> utb{slot} : register(u{slot});")
+                writeln!(h, "RWBuffer<uint> utb{slot} : {};", self.register('u', *slot))
             } else {
                 let e = match self.tbuf_ty.get(&(*is_uav, *slot)) {
                     Some(2) => "int4",
@@ -3925,9 +4192,9 @@ impl<'a> Emitter<'a> {
                     None => "float4",
                 };
                 if *is_uav {
-                    writeln!(h, "RWBuffer<{e}> utb{slot} : register(u{slot});")
+                    writeln!(h, "RWBuffer<{e}> utb{slot} : {};", self.register('u', *slot))
                 } else {
-                    writeln!(h, "Buffer<{e}> stb{slot} : register(t{slot});")
+                    writeln!(h, "Buffer<{e}> stb{slot} : {};", self.register('t', *slot))
                 }
             };
         }
@@ -3947,7 +4214,7 @@ impl<'a> Emitter<'a> {
                 (5, true) => "RWTexture2DArray<uint>".to_string(),
                 _ => return Err(format!("UAV dim {dim} unsupported")),
             };
-            let _ = writeln!(h, "{ty} uav{slot} : register(u{slot});");
+            let _ = writeln!(h, "{ty} uav{slot} : {};", self.register('u', *slot));
         }
         if self.uses_code {
             // Constant tables embedded after the program in the code section. Code pointers
@@ -3962,6 +4229,10 @@ impl<'a> Emitter<'a> {
                 .map(|c| format!("{:#x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
                 .collect();
             let _ = writeln!(h, "static const uint tb_code[{}] = {{ {} }};", words.len().max(1), if words.is_empty() { "0".to_string() } else { words.join(", ") });
+        }
+        if ex.stage == Stage::Mesh {
+            self.mesh_finish(&mut h)?;
+            return Ok(h);
         }
         if self.is_cs && self.uses_lds {
             let _ = writeln!(h, "groupshared uint tb_lds[8192];");
@@ -4142,5 +4413,54 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
         h.push_str(&self.body);
         h.push_str(if no_out || self.is_gs { "}\n" } else { "    return o;\n}\n" });
         Ok(h)
+    }
+}
+
+#[cfg(test)]
+mod wave_reduction_tests {
+    use super::*;
+
+    #[test]
+    fn saved_exec_mask_and_literal_identity_reductions() {
+        for float in [false, true] {
+            let mut words = vec![0xbe8025c1u32];
+            if float { words.extend([0x7e0202ff, 0x7f800000]); }
+            words.extend([0xd5010001, if float {0x00024301} else {0x00024280}]);
+            let op = if float {0x1e000000} else {0x38000000};
+            words.extend([op|0x000202e9,0xde54c101,op|0x000202e9,0x93601201,
+                op|0x000202e9,0x00092401,op|0x000202fa,0xff094001,
+                0xd7780002,0x02010101,op|0x00020302,
+                0xd7600002,0x00014101,op|0x00020202,
+                0xd7600004,0x00010101,0xbefe0400]);
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut insns = disassemble(&bytes);
+            lower_wave_reductions(&mut insns).unwrap();
+            let reduced = insns.iter().find(|x| x.op == OP_WAVE_REDUCE).unwrap();
+            assert_eq!(reduced.src, vec![Opnd::Vgpr(33),Opnd::Sgpr(0)]);
+            assert_eq!(reduced.aux.imm as u32, if float {0x7f800000} else {0});
+        }
+    }
+    #[test]
+    fn gta_integer_reduction_preserves_mask_and_type() {
+        for (op, identity, name) in [(0x26u32, 0xc1u32, "tb_wave_min_u32"), (0x28, 0x80, "tb_wave_max_u32"), (0x38, 0x80, "tb_wave_or_b32")] {
+            let words = [0xbe8225c1, 0x87860240, 0xd5010005, 0x001a5e00 | identity,
+                (op << 24) | 0x000a0ae9, 0xde54c105,
+                (op << 24) | 0x000a0ae9, 0x93601205,
+                (op << 24) | 0x000a0ae9, 0x00092405,
+                (op << 24) | 0x000a0afa, 0xff094005,
+                0xd7780006, 0x02010105,
+                (op << 24) | 0x000a0b06,
+                0xd7600006, 0x00014105,
+                (op << 24) | 0x000a0a06,
+                0xd7600051, 0x00010105, 0xbefe0402];
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut insns = disassemble(&bytes);
+            lower_wave_reductions(&mut insns).unwrap();
+            let reduced = insns.iter().find(|x| x.op == OP_WAVE_REDUCE).unwrap();
+            assert_eq!(reduced.mnemonic, name);
+            assert_eq!(reduced.dst, vec![Opnd::Sgpr(81)]);
+            assert_eq!(reduced.src, vec![Opnd::Vgpr(47), Opnd::Sgpr(6)]);
+            assert_eq!(reduced.aux.imm as u32, if identity == 0xc1 { u32::MAX } else { 0 });
+        }
     }
 }

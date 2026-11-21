@@ -20,6 +20,8 @@ pub mod meta;
 pub mod decls;
 pub mod uearchive;
 pub mod rdna2;
+pub mod rpf;
+pub mod psocache;
 
 /// Little-endian readers with explicit bounds checks.
 fn u32_at(b: &[u8], off: usize) -> Result<u32, String> {
@@ -65,11 +67,12 @@ impl Dxbc {
         let mut chunks = Vec::with_capacity(nchunks);
         for i in 0..nchunks {
             let off = u32_at(b, 32 + i * 4)? as usize;
-            let size = u32_at(b, off + 4)? as usize;
-            if off + 8 + size > b.len() {
+            let tail = b.get(off..).ok_or_else(|| format!("chunk {i} offset {off:#x} exceeds blob"))?;
+            let size = u32_at(tail, 4)? as usize;
+            if size > tail.len() - 8 {
                 return Err(format!("chunk {i} at {off:#x} size {size} exceeds blob"));
             }
-            chunks.push(Chunk { fourcc: fourcc_at(b, off)?, offset: off + 8, size });
+            chunks.push(Chunk { fourcc: fourcc_at(tail, 0)?, offset: off + 8, size });
         }
         Ok(Dxbc { digest, total_size, chunks })
     }
@@ -139,6 +142,7 @@ pub struct ShaderExtract {
     pub resources: Vec<meta::PsvResource>,
     /// Geometry-shader info from PSV0 (only meaningful for `Stage::Geometry`).
     pub gs_info: Option<meta::GsInfo>,
+    pub mesh_info: Option<meta::MeshPipelineInfo>,
     pub root_sig: Option<meta::RootSig>,
 }
 
@@ -239,6 +243,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         output_sig: chunk_body(b"OSG1").and_then(|b| meta::parse_signature(b).ok()).unwrap_or_default(),
         resources: chunk_body(b"PSV0").and_then(|b| meta::parse_psv0(b).ok()).unwrap_or_default(),
         gs_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_gs),
+        mesh_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_mesh_pipeline),
         root_sig: chunk_body(b"RTS0").and_then(|b| meta::parse_rts0(b).ok()),
     })
 }

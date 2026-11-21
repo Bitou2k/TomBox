@@ -14,6 +14,10 @@ name = "xshader"
 path = "src/bin/xshader.rs"
 
 [[bin]]
+name = "xshader-rpf"
+path = "src/bin/xshader-rpf.rs"
+
+[[bin]]
 name = "xscan"
 path = "src/bin/xscan.rs"
 
