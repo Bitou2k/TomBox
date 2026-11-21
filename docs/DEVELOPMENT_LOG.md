@@ -1087,3 +1087,23 @@ execution, not what the game draws: the harness does not know the title's data.
 Not done: the remaining 675 failures (mostly packed 16-bit attribute variants, d16 buffer
 loads, a few addressing forms), compile sweep results, runtime support for heap mode in
 `d3d12_xs` (needs the executable, which the dump does not contain).
+
+## 2026-11-21 — Second title: asset carving without the package table of contents
+
+- `rpf-carve` (crates/tombox-rpf): finds zlib streams in an RPF9 data area, inflates them,
+  joins consecutive 64 KiB streams into one file, classifies by leading bytes. Unit test with
+  streams between noise. Observed: data areas are compressed, not encrypted; only the table of
+  contents is encrypted, so file names are not recoverable except where a format embeds them.
+- Resource blocks: virtual data based at `0x50000000`, GPU data at `0x60000000` in the block
+  that follows. Texture dictionaries parsed (`tools/rage/txd.py`, field offsets inferred from
+  1,356 dictionaries: pointer array at +0x30, texture name/size/format/mips/GPU offset).
+- Untiling uses the title's own `xg_xs.dll` (`XGCreateTextureComputer`) through
+  `tools/rage/xgtry.py`; layout value `0x105` decodes every format checked by eye (uncompressed
+  gradient map, BC1/3/7 icons, normal maps). `tools/rage/texexport.py` exported 4,409 of the
+  texture package's textures to PNG (Pillow BC decoding). Not exported: 195 whose GPU data falls
+  outside the carved block, ~150 in formats Pillow does not decode (RGBA16F, R8, BC1 sRGB...).
+  Only mip 0 / slice 0 is written.
+- Models: drawable resources found (bounding box, LOD distances, names). Their GPU buffers are
+  not plain vertex/index buffers: each starts with a `B@` header and the bounding box, followed
+  by packed data, consistent with meshlet data for the mesh shaders. Not decoded yet.
+- Exported assets live under the git-ignored `input/`; nothing from the title is committed.
