@@ -108,6 +108,9 @@ unsafe fn blob_bytes(blob: *mut c_void) -> Vec<u8> {
 
 /// Shader-model 6.0 profile for a translator profile such as `ps_5_0` / `ps_5_1`.
 pub fn profile_for(fxc_profile: &str) -> String {
+    if fxc_profile.contains("_6_") {
+        return fxc_profile.to_string(); // already a shader-model 6 profile (heap mode: 6.6)
+    }
     format!("{}_6_0", fxc_profile.split('_').next().unwrap_or("ps"))
 }
 

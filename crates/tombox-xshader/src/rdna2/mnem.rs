@@ -44,32 +44,52 @@ pub fn vop1(op: u32) -> Option<&'static str> {
 }
 
 pub fn vopc(op: u32) -> Option<&'static str> {
-    const F: [&str; 16] = [
-        "v_cmp_f_f32", "v_cmp_lt_f32", "v_cmp_eq_f32", "v_cmp_le_f32", "v_cmp_gt_f32",
-        "v_cmp_lg_f32", "v_cmp_ge_f32", "v_cmp_o_f32", "v_cmp_u_f32", "v_cmp_nge_f32",
-        "v_cmp_nlg_f32", "v_cmp_ngt_f32", "v_cmp_nle_f32", "v_cmp_neq_f32", "v_cmp_nlt_f32",
-        "v_cmp_tru_f32",
+    // GFX10 opcode assignment, from LLVM's VOPCInstructions.td (gfx10 real instructions).
+    // f16 compares are split over two ranges (F..O at 0xc8/0xd8, U..TRU at 0xe8/0xf8).
+    const F32: [&str; 16] = [
+        "v_cmp_f_f32", "v_cmp_lt_f32", "v_cmp_eq_f32", "v_cmp_le_f32", "v_cmp_gt_f32", "v_cmp_lg_f32", "v_cmp_ge_f32", "v_cmp_o_f32",
+        "v_cmp_u_f32", "v_cmp_nge_f32", "v_cmp_nlg_f32", "v_cmp_ngt_f32", "v_cmp_nle_f32", "v_cmp_neq_f32", "v_cmp_nlt_f32", "v_cmp_tru_f32",
     ];
-    const H: [&str; 16] = [
-        "v_cmp_f_f16", "v_cmp_lt_f16", "v_cmp_eq_f16", "v_cmp_le_f16", "v_cmp_gt_f16",
-        "v_cmp_lg_f16", "v_cmp_ge_f16", "v_cmp_o_f16", "v_cmp_u_f16", "v_cmp_nge_f16",
-        "v_cmp_nlg_f16", "v_cmp_ngt_f16", "v_cmp_nle_f16", "v_cmp_neq_f16", "v_cmp_nlt_f16",
-        "v_cmp_tru_f16",
+    const F32X: [&str; 16] = [
+        "v_cmpx_f_f32", "v_cmpx_lt_f32", "v_cmpx_eq_f32", "v_cmpx_le_f32", "v_cmpx_gt_f32", "v_cmpx_lg_f32", "v_cmpx_ge_f32", "v_cmpx_o_f32",
+        "v_cmpx_u_f32", "v_cmpx_nge_f32", "v_cmpx_nlg_f32", "v_cmpx_ngt_f32", "v_cmpx_nle_f32", "v_cmpx_neq_f32", "v_cmpx_nlt_f32", "v_cmpx_tru_f32",
     ];
-    const I: [&str; 8] = [
-        "v_cmp_f_i32", "v_cmp_lt_i32", "v_cmp_eq_i32", "v_cmp_le_i32", "v_cmp_gt_i32",
-        "v_cmp_ne_i32", "v_cmp_ge_i32", "v_cmp_t_i32",
+    const F16: [&str; 16] = [
+        "v_cmp_f_f16", "v_cmp_lt_f16", "v_cmp_eq_f16", "v_cmp_le_f16", "v_cmp_gt_f16", "v_cmp_lg_f16", "v_cmp_ge_f16", "v_cmp_o_f16",
+        "v_cmp_u_f16", "v_cmp_nge_f16", "v_cmp_nlg_f16", "v_cmp_ngt_f16", "v_cmp_nle_f16", "v_cmp_neq_f16", "v_cmp_nlt_f16", "v_cmp_tru_f16",
     ];
-    const U: [&str; 8] = [
-        "v_cmp_f_u32", "v_cmp_lt_u32", "v_cmp_eq_u32", "v_cmp_le_u32", "v_cmp_gt_u32",
-        "v_cmp_ne_u32", "v_cmp_ge_u32", "v_cmp_t_u32",
+    const F16X: [&str; 16] = [
+        "v_cmpx_f_f16", "v_cmpx_lt_f16", "v_cmpx_eq_f16", "v_cmpx_le_f16", "v_cmpx_gt_f16", "v_cmpx_lg_f16", "v_cmpx_ge_f16", "v_cmpx_o_f16",
+        "v_cmpx_u_f16", "v_cmpx_nge_f16", "v_cmpx_nlg_f16", "v_cmpx_ngt_f16", "v_cmpx_nle_f16", "v_cmpx_neq_f16", "v_cmpx_nlt_f16", "v_cmpx_tru_f16",
     ];
+    const I32: [&str; 8] = ["v_cmp_f_i32", "v_cmp_lt_i32", "v_cmp_eq_i32", "v_cmp_le_i32", "v_cmp_gt_i32", "v_cmp_ne_i32", "v_cmp_ge_i32", "v_cmp_t_i32"];
+    const I32X: [&str; 8] = ["v_cmpx_f_i32", "v_cmpx_lt_i32", "v_cmpx_eq_i32", "v_cmpx_le_i32", "v_cmpx_gt_i32", "v_cmpx_ne_i32", "v_cmpx_ge_i32", "v_cmpx_t_i32"];
+    const U32: [&str; 8] = ["v_cmp_f_u32", "v_cmp_lt_u32", "v_cmp_eq_u32", "v_cmp_le_u32", "v_cmp_gt_u32", "v_cmp_ne_u32", "v_cmp_ge_u32", "v_cmp_t_u32"];
+    const U32X: [&str; 8] = ["v_cmpx_f_u32", "v_cmpx_lt_u32", "v_cmpx_eq_u32", "v_cmpx_le_u32", "v_cmpx_gt_u32", "v_cmpx_ne_u32", "v_cmpx_ge_u32", "v_cmpx_t_u32"];
+    const I16: [&str; 6] = ["v_cmp_lt_i16", "v_cmp_eq_i16", "v_cmp_le_i16", "v_cmp_gt_i16", "v_cmp_ne_i16", "v_cmp_ge_i16"];
+    const I16X: [&str; 6] = ["v_cmpx_lt_i16", "v_cmpx_eq_i16", "v_cmpx_le_i16", "v_cmpx_gt_i16", "v_cmpx_ne_i16", "v_cmpx_ge_i16"];
+    const U16: [&str; 6] = ["v_cmp_lt_u16", "v_cmp_eq_u16", "v_cmp_le_u16", "v_cmp_gt_u16", "v_cmp_ne_u16", "v_cmp_ge_u16"];
+    const U16X: [&str; 6] = ["v_cmpx_lt_u16", "v_cmpx_eq_u16", "v_cmpx_le_u16", "v_cmpx_gt_u16", "v_cmpx_ne_u16", "v_cmpx_ge_u16"];
+    let i = op as usize;
     Some(match op {
-        0x00..=0x0f => F[op as usize],
-        0x80..=0x87 => I[(op - 0x80) as usize],
-        0xc0..=0xc7 => U[(op - 0xc0) as usize],
+        0x00..=0x0f => F32[i],
+        0x10..=0x1f => F32X[i - 0x10],
+        0x80..=0x87 => I32[i - 0x80],
         0x88 => "v_cmp_class_f32",
-        0xc8..=0xd7 => H[(op - 0xc8) as usize],
+        0x89..=0x8e => I16[i - 0x89],
+        0x8f => "v_cmp_class_f16",
+        0x90..=0x97 => I32X[i - 0x90],
+        0x98 => "v_cmpx_class_f32",
+        0x99..=0x9e => I16X[i - 0x99],
+        0x9f => "v_cmpx_class_f16",
+        0xa9..=0xae => U16[i - 0xa9],
+        0xb9..=0xbe => U16X[i - 0xb9],
+        0xc0..=0xc7 => U32[i - 0xc0],
+        0xc8..=0xcf => F16[i - 0xc8],
+        0xd0..=0xd7 => U32X[i - 0xd0],
+        0xd8..=0xdf => F16X[i - 0xd8],
+        0xe8..=0xef => F16[i - 0xe8 + 8],
+        0xf8..=0xff => F16X[i - 0xf8 + 8],
         _ => return None,
     })
 }
@@ -99,6 +119,8 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x344 => "v_perm_b32", 0x351 => "v_min3_f16", 0x354 => "v_max3_f16", 0x357 => "v_med3_f16",
         0x360 => "v_readlane_b32", 0x361 => "v_writelane_b32", 0x363 => "v_bfm_b32", 0x364 => "v_bcnt_u32_b32",
         0x34b => "v_fma_f16",
+        0x15e => "v_cvt_pk_u8_f32", 0x311 => "v_pack_b32_f16",
+        0x342 => "v_interp_p1ll_f16", 0x343 => "v_interp_p1lv_f16", 0x35a => "v_interp_p2_f16",
         0x40e => "v_pk_fma_f16", 0x40f => "v_pk_add_f16", 0x410 => "v_pk_mul_f16", 0x411 => "v_pk_min_f16", 0x412 => "v_pk_max_f16",
         0x421 => "v_fma_mixlo_f16", 0x422 => "v_fma_mixhi_f16",
         0x420 => "v_fma_mix_f32", // VOP3P opcode 0x20 (see rdna2.rs: VOP3P opcodes are offset by 0x400)
@@ -238,6 +260,8 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
         Enc::Smem => smem(op),
         Enc::Mimg => mimg(op),
         Enc::Mubuf => mubuf(op),
+        Enc::Mtbuf => Some(["tbuffer_load_format_x", "tbuffer_load_format_xy", "tbuffer_load_format_xyz", "tbuffer_load_format_xyzw",
+            "tbuffer_store_format_x", "tbuffer_store_format_xy", "tbuffer_store_format_xyz", "tbuffer_store_format_xyzw"][(op & 7) as usize]),
         Enc::Exp => Some("exp"),
         Enc::Flat => match op & 0x7f {
             0x0c => Some("flat_load_dword"),
