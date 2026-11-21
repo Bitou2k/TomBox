@@ -48,7 +48,10 @@ def texture_png(entry, out_path):
         data = p.texture_bytes(t)
     except CodecError:
         return "chunk codec not supported"
-    px, why = untile(data, t, layout_of(t))
+    layout = layout_of(t)
+    if layout is None:
+        return "tile layout unknown for this record (cube/array or unseen selector)"
+    px, why = untile(data, t, layout)
     if px is None:
         return why
     try:

@@ -1154,10 +1154,15 @@ files and cross-checked against inflated sizes (details in the `ttpf.py` docstri
   every chunk read).
 - `ETPF`: count at +8, 16-byte records (width, height, mip count, DXGI format in d1 bits 3-9,
   array size, first page), then one sorted u64 hash per record. No names stored.
-- Tiling: the title's own layout library (`xg_xs.dll`). Records with mip count 0 use layout
-  0x2, the others 0x105. Chosen by rendering every layout value for sample textures and
-  checking visually (UI pack: logos, photos, car renders come out right; mip-count-0 textures
-  were tile-scrambled with 0x105 and correct with 0x2).
+- Tiling: the title's own layout library (`xg_xs.dll`). Record field d1 bits 24-26 select it:
+  0 -> layout 0x2, 1-3 -> 0x105. Chosen by rendering every layout value for sample textures
+  and checking visually (UI pack logos, photos and car renders; a ped decal and a monitor
+  screen that were tile-scrambled under 0x105 are correct under 0x2). A first rule keyed on
+  mip count 0 fixed the UI cases but not the decals, which is how the field was found.
+- Cube maps (array size 6, selector 4 plus higher bits) do not untile with any 2D or 3D layout
+  value tried (their 860,160-byte span is not any computed size); rejected explicitly. Under
+  1% of records. About 1.8% of a 3,600-record sample have a page span shorter than their
+  mip chain; also rejected (the following pages may belong to another texture).
 - 357,067 textures in 57 packs. 306,222 (85.8%) are stored entirely in zlib chunks and
   decode. The rest touch chunks with codec values 1/3/4/5/6/7, and those values match the
   BC format of the texture (1 = BC1, 3 = BC3, 4 = BC4, 5 = BC5, 6 = BC6H, 7 = BC7): a

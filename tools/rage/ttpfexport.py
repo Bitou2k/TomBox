@@ -2,8 +2,9 @@
 console layout library, wrap it in a DDS, decode with Pillow.
 
 Tile layout (chosen by comparing every layout value on sample textures, see the development
-log): records with a mip-count field of 0 hold mip 0 only and use layout 0x2; the others use
-0x105. Uncompressed R8G8B8A8 records (graphics pack) have not been confirmed visually.
+log): record field d1 bits 24-26 = 0 -> layout 0x2, 1-3 -> 0x105. Other values (cube maps have
+4 plus higher bits) and array/cube records are rejected: no layout tried reproduces them.
+Uncompressed R8G8B8A8 records (graphics pack) have not been confirmed visually.
 
 usage: ttpfexport.py <pack.ttpf> <out dir> [limit] [first index] [stride]
 """
@@ -51,7 +52,11 @@ def to_image(t, px):
 
 
 def layout_of(t):
-    return 0x2 if t["mips"] == 0 else 0x105
+    """Layout value for the console layout library, or None if not known for this record."""
+    sel = (t["d1"] >> 24) & 7
+    if t["arr"] > 1 or t["d1"] >> 27:
+        return None
+    return {0: 0x2, 1: 0x105, 2: 0x105, 3: 0x105}.get(sel)
 
 
 def export(pack_path, out, limit=1 << 30, first=0, stride=1):
@@ -69,7 +74,11 @@ def export(pack_path, out, limit=1 << 30, first=0, stride=1):
         except ValueError as e:
             fails[f"read: {str(e)[:50]}"] += 1
             continue
-        px, why = untile(data, t, layout_of(t))
+        layout = layout_of(t)
+        if layout is None:
+            fails[f"layout unknown (d1 {t['d1'] >> 24:#x}, array {t['arr']})"[:40]] += 1
+            continue
+        px, why = untile(data, t, layout)
         if px is None:
             fails[why.split(",")[0]] += 1
             continue

@@ -16,8 +16,8 @@ docs/DEVELOPMENT_LOG.md 2026-11-21):
         bits 52-63  unknown
   'ETPF' block: 'ETPF', u32 0x27a (version?), u32 count, u32 unknown, then 16-byte records:
         d0: bits 0-13 width-1, bits 14-27 height-1, bits 28-31 mip count
-        d1: bits 0-2 unknown (0/1/3), bits 3-9 DXGI format, bits 10-15 array size - 1 (6 on cube
-            maps); higher bits unknown
+        d1: bits 0-2 unknown (0/1/3), bits 3-9 DXGI format, bits 10-15 array size - 1 (5 on cube
+            maps), bits 24-26 tile-layout selector (see ttpfexport.layout_of); other bits unknown
         d2: bits 0-19 first virtual page; higher bits unknown
         d3: unknown (non-zero on some mipmapped textures)
   then a sorted table of u64 name hashes, one per record (names themselves are not stored).

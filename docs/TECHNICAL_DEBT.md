@@ -169,9 +169,9 @@ Honest ledger. Updated continuously.
   inferred. Model -> texture-pack link found (u64 key in the texture records), but shader
   parameters -> geometry (which texture on which part) is not decoded.
 - Texture packs: 14% of textures use a BC-aware chunk codec (values 1-7 track BC1-BC7) with
-  no available decoder; layout choice (0x2 for mip-count-0 records, else 0x105) is from visual
-  checks; some records' page spans are smaller than their declared mip chain; R8G8B8A8
-  records unconfirmed; header/record fields marked unknown in `ttpf.py`.
+  no available decoder; layout choice (d1 bits 24-26: 0 -> 0x2, 1-3 -> 0x105) is from visual
+  checks; cube maps not untiled; ~1.8% of records' page spans are smaller than their declared
+  mip chain; R8G8B8A8 records unconfirmed; fields marked unknown in `ttpf.py`.
 - `levels.rpf`: only a 4 GiB slice carved; level placement (instances, transforms) not decoded.
 - Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
 - DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).
