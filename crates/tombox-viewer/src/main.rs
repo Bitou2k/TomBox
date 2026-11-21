@@ -1,7 +1,7 @@
 //! tombox-viewer: run translated console shaders on the host GPU and look at what they draw.
 //!
 //! ```text
-//! tombox-viewer --vs <vs.dxbc> --ps <ps.dxbc> [--model sphere|cube|torus|quad] [--size N] [--out DIR]
+//! tombox-viewer --vs <vs.dxbc> --ps <ps.dxbc> [--model sphere|cube|torus|quad] [--size N] [--out DIR] [--fill identity|ones]
 //! tombox-viewer --cs <cs.dxbc> [--groups X,Y,Z] [--out DIR]
 //! ```
 //!
@@ -418,12 +418,12 @@ fn root_signature(dev: &ID3D12Device, samplers: &[([u32; 4], bool)], graphics: b
     }
 }
 
-/// Repeated 4x4 identity matrices (floats).
-fn identity_pattern(bytes: usize) -> Vec<u8> {
+/// Buffer contents: repeated 4x4 identity matrices (`identity`) or every float 1.0 (`ones`).
+fn fill_pattern(bytes: usize, kind: &str) -> Vec<u8> {
     let mut v = Vec::with_capacity(bytes);
     for i in 0..bytes / 4 {
         let k = i % 16;
-        let f: f32 = if k % 5 == 0 { 1.0 } else { 0.0 };
+        let f: f32 = if kind == "ones" || k % 5 == 0 { 1.0 } else { 0.0 };
         v.extend_from_slice(&f.to_bits().to_le_bytes());
     }
     v
@@ -447,7 +447,7 @@ fn kind_format(kind: &str) -> DXGI_FORMAT {
     }
 }
 
-fn build_heaps(gpu: &mut Gpu, stages: &[&Stage]) -> R<Heaps> {
+fn build_heaps(gpu: &mut Gpu, stages: &[&Stage], fill: &str) -> R<Heaps> {
     unsafe {
         let dev = gpu.dev.clone();
         let res: ID3D12DescriptorHeap = hr(dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -462,8 +462,8 @@ fn build_heaps(gpu: &mut Gpu, stages: &[&Stage]) -> R<Heaps> {
         let sh = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: sbase.ptr + (i as usize % HEAP as usize) * sinc };
 
         // Shared resources.
-        let cb = gpu.upload(&identity_pattern(65536))?;
-        let data = gpu.upload(&identity_pattern(1 << 20))?;
+        let cb = gpu.upload(&fill_pattern(65536, fill))?;
+        let data = gpu.upload(&fill_pattern(1 << 20, fill))?;
         let checker: Vec<u8> = (0..64 * 64).flat_map(|i| {
             let (x, y) = (i % 64, i / 64);
             let c = if ((x / 8) + (y / 8)) % 2 == 0 { [230u8, 200, 160, 255] } else { [60u8, 90, 140, 255] };
@@ -687,10 +687,11 @@ struct Args {
     size: u32,
     out: PathBuf,
     groups: [u32; 3],
+    fill: String,
 }
 
 fn args() -> R<Args> {
-    let mut a = Args { vs: None, ps: None, cs: None, model: "sphere".into(), size: 512, out: PathBuf::from("viewer_out"), groups: [8, 8, 1] };
+    let mut a = Args { vs: None, ps: None, cs: None, model: "sphere".into(), size: 512, out: PathBuf::from("viewer_out"), groups: [8, 8, 1], fill: "identity".into() };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < v.len() {
@@ -702,6 +703,7 @@ fn args() -> R<Args> {
             "--model" => a.model = val,
             "--size" => a.size = val.parse().map_err(|_| "bad --size")?,
             "--out" => a.out = val.into(),
+            "--fill" => a.fill = val,
             "--groups" => {
                 let g: Vec<u32> = val.split(',').filter_map(|x| x.parse().ok()).collect();
                 for k in 0..3 {
@@ -748,7 +750,7 @@ fn run() -> R<()> {
         samplers = ps.t.static_samplers.clone();
     }
     let root = root_signature(&gpu.dev, &samplers, true)?;
-    let heaps = build_heaps(&mut gpu, &[&vs, &ps])?;
+    let heaps = build_heaps(&mut gpu, &[&vs, &ps], &a.fill)?;
     let m = model(&a.model)?;
 
     // Vertex input: one float4/uint4 per input-signature element, interleaved.
@@ -864,7 +866,7 @@ fn run_compute(gpu: &mut Gpu, a: &Args, path: &Path) -> R<()> {
         return Err("only shaders without a root signature (descriptor-heap mode) are supported by the viewer so far".into());
     }
     let root = root_signature(&gpu.dev, &cs.t.static_samplers, false)?;
-    let heaps = build_heaps(gpu, &[&cs])?;
+    let heaps = build_heaps(gpu, &[&cs], &a.fill)?;
     let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: unsafe { std::mem::transmute_copy(&root) },
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.dxil.as_ptr() as *const _, BytecodeLength: cs.dxil.len() },
