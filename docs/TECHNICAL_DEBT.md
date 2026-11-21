@@ -172,7 +172,14 @@ Honest ledger. Updated continuously.
   no available decoder; layout choice (d1 bits 24-26: 0 -> 0x2, 1-3 -> 0x105) is from visual
   checks; cube maps not untiled; ~1.8% of records' page spans are smaller than their declared
   mip chain; R8G8B8A8 records unconfirmed; fields marked unknown in `ttpf.py`.
-- `levels.rpf`: only a 4 GiB slice carved. Placement records found by scanning, not via the map
-  resource header; LOD hierarchy, flags and the per-file constant undecoded.
+- `levels.rpf`: indexed in full by `rpf-index` (no extraction), but placement records are found
+  by scanning, not via the map resource header; LOD hierarchy, flags and the per-file constant
+  undecoded. 5.5% of world placements name a model carried by no file in the package; 110k name
+  a model only inside multi-model (LOD dictionary) files, whose part -> name split is not
+  decoded; ~400k (5,351 files) lie within 250 m of the origin, presumably interiors in local
+  space, with no decoded world placement.
+- Map viewer (`tools/rage/mapview`): untextured, no LOD selection (near/far versions overlap),
+  interiors and dictionary models left out; ~18% of model parts skipped (position-buffer
+  pairing ambiguous, or a buffer that looks like meshlets but points past the data).
 - Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
 - DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).

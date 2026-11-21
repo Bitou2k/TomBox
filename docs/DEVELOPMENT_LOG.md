@@ -1207,3 +1207,31 @@ Evidence:
   panels form level bands with the conjugate and zigzag without it.
 Unknown: header/array pointers of the map resource, the per-file constant at +0x70, flags,
 the LOD-parent hierarchy (parent index != 0xffff on part of the records).
+
+## 2026-11-21 — Second title: whole `levels.rpf` mount index; streaming map viewer
+
+- `tombox_rpf::files::each_file`: windowed stream carving with 64 KiB-continuation joining,
+  shared by `rpf-carve` and the new `rpf-index`. Fixes a carver bug: the stream straddling each
+  64 MiB window was dropped (the overlap was read but never scanned). On the 4 GiB slice the new
+  reader finds 56 files the old one missed, all starting just before a window edge. Tests:
+  `carve_range` limit, joining across a range end (12 crate tests pass).
+- `rpf-index <package> <out>`: one pass, 4 threads at below-normal priority, writes
+  `files.tsv` (offset, extent, size, tag, kind, `name.#ext` strings) and `entities.bin`
+  (placement records, scanner ported from `placements.py`). Slice check against the Python
+  scanner: 354,753 records in common; the 15,683 only Python reported are overlapping false
+  positives (flags 0 / float-like); the 58 only Rust reported are flag-0x18 records from
+  recovered files. Full package: 878,673 files, 235,788 named, 2,250,307 records (2,057,950
+  with the 0x18/0x1c flag form) in 219 s.
+- Names: in a 4,000-file sample, half of the model resources carry their `name.#dr` after the
+  first 16 KiB, so names are searched in whole files. 97% of named files carry one name; the
+  rest hold several `_lod`/`_slod` models. Using single-name `.#dr` and `.#ft` files,
+  1,544,464 of 1,656,073 world placements resolve to a model file.
+- `meshnp.py`: numpy decoder, identical to `meshlets.py` on 4,018 model parts (positions,
+  triangles, normals, UVs compared).
+- `tools/rage/mapview`: `server.py` (127.0.0.1 only) loads the index and, per request,
+  inflates a model's two files from `levels.rpf` by offset and decodes them; `index.html`
+  (three.js) streams 250 m tiles around a fly camera and instances models by placement.
+  Sampled 400 models near the densest tile: 394 decode; 1,387 of 1,697 parts in a 200-model
+  sample. The first page version issued every model request at once and the browser dropped
+  them (~33k "failed" in the user's run); requests are now queued (6 at a time, with retries),
+  and decode failures and request errors are counted separately.
