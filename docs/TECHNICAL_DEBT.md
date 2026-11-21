@@ -172,6 +172,7 @@ Honest ledger. Updated continuously.
   no available decoder; layout choice (d1 bits 24-26: 0 -> 0x2, 1-3 -> 0x105) is from visual
   checks; cube maps not untiled; ~1.8% of records' page spans are smaller than their declared
   mip chain; R8G8B8A8 records unconfirmed; fields marked unknown in `ttpf.py`.
-- `levels.rpf`: only a 4 GiB slice carved; level placement (instances, transforms) not decoded.
+- `levels.rpf`: only a 4 GiB slice carved. Placement records found by scanning, not via the map
+  resource header; LOD hierarchy, flags and the per-file constant undecoded.
 - Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
 - DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).

@@ -1187,3 +1187,23 @@ buffers. `rpf-carve` gained `--start/--len`; one 4 GiB slice (0x2c0000000..0x3c0
 gave 20k+ resources named `levels/americas/...`, and `modelexport.py` exported
 level geometry from it (warehouse curtains, condo parts, car parks, a swing bridge, signs;
 spot-checked by render). Parts are in local coordinates; placement data not decoded.
+
+## 2026-11-21 — Second title: map placement records found
+
+`tools/rage/placements.py`. Placement ("entity") records are 0x90 bytes inside map resources in
+`levels.rpf`: quaternion at +0x0c, position at +0x34, joaat(model name) at +0x40 (equals a
+drawable's own name), flags at +0x44, scale XY/Z at +0x50/+0x54, index/parent at +0x58,
+draw distance at +0x5c. How it was found: object-type (archetype) records gave a name-hash
+pattern; an area file (`sb_38`) held the same name hashes inside 0x90-strided records with
+unit quaternions and world-sized positions. Not yet read through the resource's own header;
+found by a validated scan (unit quaternion, plausible scales, neighbouring record valid).
+
+Evidence:
+- 4 GiB slice: 352,071 records with the `0x0018xxxx`/`0x001cxxxx` flag form. Plotted from
+  above they draw the city (~5.1 x 5.8 km: street grid, coastline, islands, a port). Only
+  8,317 name a model inside the same slice; the rest name models elsewhere in the 76 GB.
+- Balusters around a pool (172 records) form continuous balustrades with curved corners.
+- Rotation convention: the stored quaternion is the inverse rotation. Hotel facade glass
+  panels form level bands with the conjugate and zigzag without it.
+Unknown: header/array pointers of the map resource, the per-file constant at +0x70, flags,
+the LOD-parent hierarchy (parent index != 0xffff on part of the records).
