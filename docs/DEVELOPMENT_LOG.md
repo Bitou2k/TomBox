@@ -1107,3 +1107,39 @@ loads, a few addressing forms), compile sweep results, runtime support for heap 
   not plain vertex/index buffers: each starts with a `B@` header and the bounding box, followed
   by packed data, consistent with meshlet data for the mesh shaders. Not decoded yet.
 - Exported assets live under the git-ignored `input/`; nothing from the title is committed.
+
+## 2026-11-21 — Second title: meshlet geometry decoded; translator fixes from a DXC sample
+
+**Geometry** (`tools/rage/meshlets.py`, `modelexport.py`, `objshot.py`). Model GPU data is
+packed meshlets; the layout is read from the title's own mesh shaders (RDNA2 disassembly of
+`MS_VS_Transform_PositionOnly` and textured `MS_VS_Transform` variants), not guessed:
+- Meshlet buffer: header `0x80000000 | count`, triangle-dword total, vertex-reference total;
+  16-byte records from byte 12 (vertex count-1 and triangle count-1 in 7 bits each, 17-bit
+  vertex/triangle bases); triangles = three 7-bit local indices per dword; u16 vertex refs.
+- Position buffer (`B@`): header words = streams (offset `(w>>7)&0x1fffffc`, stride
+  `(w>>3)&60`). Positions 24/24/16-bit quantized, scale/bias at +0x70/+0x60, axis-order code at
+  +0x6c. Word 2 normals (octahedral), word 3 UVs (`16_16_SNORM` x float at +0x7c, or 2 x f32).
+- Checks: every meshlet's local indices in range; position buffers paired with meshlet
+  buffers by exact vertex count (header stream offsets); normals: 10:10 encoding matched the
+  sample terrain's face normals (mean dot 0.986), although the shader's branch reads as if
+  that data were 8:8 — unresolved, so the encoding is picked per model by the face-normal fit;
+  UVs: checker renders are continuous on terrain and a fan.
+- Minigame package: 13,437 geometries exported to OBJ (names from the resource); 1,718 not
+  (492 buffers with the meshlet flag that fail the checks, the rest ambiguous pairings of tiny
+  parts). Material -> texture linkage is not decoded (texture refs are joaat hashes in 32-byte
+  records; generic `blank_*` maps confirmed by hash).
+
+**Packages.** In the world package most of the 1.3 GB is neither zlib, raw deflate nor gzip,
+4 KiB-aligned with no recognisable leading bytes. Possibly per-file encryption, possibly an
+unidentified compressor; not pursued further (no decryption). Models' own textures are likely
+there or in the story package, so textured previews use a checker for now.
+
+**Translator** (400-shader random DXC sample of the second title: 359 compiled, 39 failed,
+3 translate failures; 9 hit the 300 s per-shader timeout):
+- SMEM SOFFSET register was not counted as an entry read: 14 shaders had an undeclared `sN`.
+  Fixed, regression test `smem_soffset_register_is_entry_live`.
+- PSV0 NumThreads offsets were wrong (40/44/48 instead of 36/40/44): mesh shaders declared
+  `numthreads(1, 1, name offset)`; 17 failed validation and the rest ran with one thread.
+  Compute shaders now prefer PSV0 over the ISA preamble (the title's preambles say 1,1,1; one
+  shader using derivatives failed validation). Fortnite's shaders carry no PSV0 thread counts:
+  still 105,506 / 105,506.

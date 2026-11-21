@@ -161,3 +161,11 @@ Honest ledger. Updated continuously.
 - **Binding trace cost.** Diagnostic only; it holds a reference on every buffer and a map
   entry per descriptor. Not suitable for normal runs as written. The same tracking is what
   a run-time check of structured-buffer strides would need.
+
+## Second title asset tools (tools/rage)
+- Normal encoding chosen per model by fit to face normals because the shader's top-bit branch
+  disagrees with the observed data (unresolved).
+- Buffer-record layout in the resource block and same-count tie-breaking by record order are
+  inferred; material -> geometry -> texture linkage not decoded.
+- Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
+- DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).
