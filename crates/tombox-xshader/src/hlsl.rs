@@ -199,7 +199,50 @@ fn hi(o: &Opnd) -> Opnd {
 
 /// Name of the SGPR used as an SMEM dynamic offset (SOFFSET field).
 fn ssrc_name(code: u32) -> Result<String, String> {
-    if code <= 105 { Ok(format!("s{code}")) } else { Err(format!("unsupported SOFFSET register code {code}")) }
+    match code {
+        0..=105 => Ok(format!("s{code}")),
+        106 => Ok("vcc_lo".into()),
+        107 => Ok("vcc_hi".into()),
+        124 => Ok("m0".into()),
+        _ => Err(format!("unsupported SOFFSET register code {code}")),
+    }
+}
+
+/// The PS input table stored in the FSSM container (observed in the second title's pixel
+/// shaders at FSSM offset 0x138): 8-byte records `06, register, channel mask, attribute,
+/// 0, second register, parameter offset, flags`, ending at the first record not starting with
+/// 6. Flags 0x1a mark a pair of 16-bit registers sharing the attribute (first register in
+/// halves 0-3, second in 4-7; a second register equal to the first, or 0, means none),
+/// 0x02 an interpolated 32-bit register, 0x01 a flat one. Unread registers can appear (as
+/// half of a pair) and read ones can be absent (eliminated by the compiler): the table, not
+/// the signature, is authoritative. Returns None when no such table is present.
+fn fssm_ps_inputs(ex: &ShaderExtract) -> Option<Vec<Vec<(u32, u32, bool)>>> {
+    if ex.stage != Stage::Pixel {
+        return None;
+    }
+    let f = &ex.fssm;
+    let mut out: Vec<Vec<(u32, u32, bool)>> = Vec::new();
+    let mut p = 0x138;
+    while let Some(r) = f.get(p..p + 8) {
+        if r[0] != 6 {
+            break;
+        }
+        let (ra, attr, rb, flags) = (r[1] as u32, r[3] as usize, r[5] as u32, r[7]);
+        if attr != out.len() || out.len() > 32 {
+            return None; // not the layout this parser knows
+        }
+        if flags == 0x1a {
+            let mut v = vec![(ra, 0, true)];
+            if rb != 0 && rb != ra {
+                v.push((rb, 2, true));
+            }
+            out.push(v);
+        } else {
+            out.push(vec![(ra, 0, false)]);
+        }
+        p += 8;
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// PS attribute layout. Attributes are the read input registers in order (a register counts
@@ -217,6 +260,9 @@ fn ssrc_name(code: u32) -> Result<String, String> {
 ///   share an attribute with the halves in channels 2-3;
 /// * integer (flat) registers always start their own attribute.
 fn ps_attr_list(ex: &ShaderExtract) -> Vec<Vec<(u32, u32, bool)>> {
+    if let Some(t) = fssm_ps_inputs(ex) {
+        return t;
+    }
     let regs = distinct_regs(ex.input_sig.iter().filter(|e| {
         e.sysval == 0 && ex.input_sig.iter().any(|o| o.register == e.register && o.rw_mask != 0)
     }));
@@ -1875,7 +1921,7 @@ impl<'a> Emitter<'a> {
                         let mut v = vec![tres];
                         let mut uses = vec![(tres, rs)];
                         self.note_heap_srcs(idx, rs, sym.get(&rs).copied());
-                        if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") {
+                        if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") || ins.mnemonic == "image_get_lod" {
                             let cmp = ins.op & 8 != 0;
                             let sslot = if self.desc_candidates(sym.get(&ss)).is_some() {
                                 uses.push((Res::Samp(slot), ss));
@@ -1925,7 +1971,7 @@ impl<'a> Emitter<'a> {
                         tex_res.push((((*ttable as u32) << 24) | off, if is_uav { Res::Uav(tslot, dim) } else { Res::Tex(tslot, dim) }));
                     }
                     let mut samp_res: Vec<(u32, Res)> = Vec::new();
-                    if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") {
+                    if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") || ins.mnemonic == "image_get_lod" {
                         let samp_c = self.desc_candidates(sym.get(&ss)).ok_or_else(|| {
                             format!("mimg at {:#x}: s{ss} not a sampler descriptor ({:?})", ins.offset, sym.get(&ss))
                         })?;
@@ -2326,6 +2372,25 @@ impl<'a> Emitter<'a> {
             "u32" => (r(a)?, r(b)?),
             // 16-bit integer compares use the low half of each operand.
             "i16" => (format!("(asint({} << 16) >> 16)", r(a)?), format!("(asint({} << 16) >> 16)", r(b)?)),
+            "u64" | "i64" => {
+                // Register pairs (lo, hi): compare the high words (signed for i64), then the low.
+                let (al, ah, bl, bh) = (r(a)?, r(&hi(a))?, r(b)?, r(&hi(b))?);
+                let (h1, h2) = if ty == "i64" { (format!("asint({ah})"), format!("asint({bh})")) } else { (ah.clone(), bh.clone()) };
+                let lt = format!("(({h1} < {h2}) || ({ah} == {bh} && {al} < {bl}))");
+                let gt = format!("(({h1} > {h2}) || ({ah} == {bh} && {al} > {bl}))");
+                let eq = format!("({ah} == {bh} && {al} == {bl})");
+                return Ok(match cc {
+                    "f" => "false".into(),
+                    "lt" => lt,
+                    "eq" => eq,
+                    "le" => format!("(!{gt})"),
+                    "gt" => gt,
+                    "ne" => format!("(!{eq})"),
+                    "ge" => format!("(!{lt})"),
+                    "t" => "true".into(),
+                    other => return Err(format!("compare cond {other} unsupported")),
+                });
+            }
             "u16" => (format!("({} & 0xffffu)", r(a)?), format!("({} & 0xffffu)", r(b)?)),
             other => return Err(format!("compare type {other} unsupported")),
         };
@@ -3411,6 +3476,14 @@ impl<'a> Emitter<'a> {
         }
         // Compares (VOPC, and VOP3 with a scalar mask destination).
         if m.starts_with("v_cmp_") || m.starts_with("v_cmpx_") {
+            if m.ends_with("64") {
+                for o in [&s[0], &s[1]] {
+                    let h = hi(o);
+                    if matches!(h, Opnd::Vgpr(_) | Opnd::Sgpr(_)) {
+                        self.touch(&h);
+                    }
+                }
+            }
             let c = match m.as_str() {
                 // Floating-point class test against a 10-bit class mask (see tb_cmp_class).
                 "v_cmp_class_f32" | "v_cmpx_class_f32" => format!("tb_cmp_class({}, {})", r(&s[0])?, r(&s[1])?),
@@ -3613,6 +3686,43 @@ impl<'a> Emitter<'a> {
             };
             let e = format!("({} | ({} << 16))", half(0, 11)?, half(1, 12)?);
             return self.wv(&d, &e);
+        }
+        if matches!(m.as_str(), "v_add_nc_u16" | "v_sub_nc_u16" | "v_mul_lo_u16" | "v_lshrrev_b16" | "v_ashrrev_i16" | "v_max_u16"
+            | "v_max_i16" | "v_min_u16" | "v_min_i16" | "v_add_nc_i16" | "v_sub_nc_i16" | "v_lshlrev_b16")
+        {
+            // 16-bit integer ops (VOP3 with op_sel): sources are the low half, or the high half
+            // with op_sel bits 11 / 12; the result goes to the low half with the high half
+            // zeroed, or to the high half (low kept) with op_sel bit 14.
+            if ins.raw[1] >> 29 != 0 {
+                return Err(format!("{m} with neg modifiers unsupported"));
+            }
+            let half = |i: usize, bit: u32| -> Result<String, String> {
+                let x = r(&s[i])?;
+                Ok(if ins.raw[0] & (1 << bit) != 0 { format!("(({x}) >> 16)") } else { format!("(({x}) & 0xffffu)") })
+            };
+            let (a, b) = (half(0, 11)?, half(1, 12)?);
+            let sa = format!("(asint(({a}) << 16) >> 16)");
+            let sb = format!("(asint(({b}) << 16) >> 16)");
+            let v = match m.as_str() {
+                "v_add_nc_u16" | "v_add_nc_i16" => format!("({a} + {b})"),
+                "v_sub_nc_u16" | "v_sub_nc_i16" => format!("({a} - {b})"),
+                "v_mul_lo_u16" => format!("({a} * {b})"),
+                "v_lshrrev_b16" => format!("({b} >> ({a} & 15u))"),
+                "v_lshlrev_b16" => format!("({b} << ({a} & 15u))"),
+                "v_ashrrev_i16" => format!("asuint({sb} >> ({a} & 15u))"),
+                "v_max_u16" => format!("max({a}, {b})"),
+                "v_min_u16" => format!("min({a}, {b})"),
+                "v_max_i16" => format!("asuint(max({sa}, {sb}))"),
+                _ => format!("asuint(min({sa}, {sb}))"),
+            };
+            let v = format!("(({v}) & 0xffffu)");
+            return if ins.raw[0] & (1 << 14) != 0 {
+                self.touch(&d);
+                let cur = r(&d)?;
+                self.wv(&d, &format!("((({cur}) & 0xffffu) | ({v} << 16))"))
+            } else {
+                self.wv(&d, &v)
+            };
         }
         if m == "v_cvt_pk_u8_f32" {
             // Byte (src1 & 3) of src2 replaced by src0 converted to u8 (round to nearest, clamp).
@@ -4090,9 +4200,15 @@ impl<'a> Emitter<'a> {
         // Address = element index (IDXEN: first address register) * stride + byte offset
         // (OFFEN: the next address register, or the first when there is no index) + imm.
         let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-        if !matches!(ins.src[2], Opnd::ConstInt(0)) {
-            return Err("MUBUF with a dynamic SOFFSET is unsupported".into());
-        }
+        // SOFFSET: a scalar byte offset added to the address (0 / null when unused).
+        let soff = match ins.src[2] {
+            Opnd::ConstInt(0) | Opnd::Null => None,
+            Opnd::Sgpr(_) | Opnd::M0 | Opnd::VccLo => {
+                self.touch(&ins.src[2]);
+                Some(r(&ins.src[2])?)
+            }
+            other => return Err(format!("MUBUF SOFFSET {other:?} unsupported")),
+        };
         let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
         let a0 = ins.src[0];
         let a1 = match a0 {
@@ -4107,6 +4223,11 @@ impl<'a> Emitter<'a> {
                 self.touch(&a1);
                 Some(r(&a1)?)
             }
+        };
+        let voff = match (voff, soff) {
+            (Some(v), Some(s)) => Some(format!("({v} + {s})")),
+            (None, Some(s)) => Some(s),
+            (v, None) => v,
         };
         let w0 = ins.aux.imm as u32 / 4;
         let vd = match ins.dst[0] {
@@ -4288,7 +4409,7 @@ impl<'a> Emitter<'a> {
     fn emit_mimg(&mut self, idx: usize, ins: &Insn) -> Result<(), String> {
         let rs = self.res.get(&idx).cloned().ok_or("unresolved image")?;
         // Texel-addressed ops (no sampler): image_load / image_store, on SRVs or UAVs.
-        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store" | "image_atomic_add" | "image_atomic_umax") {
+        if matches!(ins.mnemonic.as_str(), "image_load" | "image_load_mip" | "image_store") || ins.mnemonic.starts_with("image_atomic_") {
             let with_mip = ins.mnemonic == "image_load_mip";
             let (slot, dim, is_uav) = match rs.first() {
                 Some(Res::Tex(t, d)) => (*t, *d, false),
@@ -4325,13 +4446,31 @@ impl<'a> Emitter<'a> {
                 if !as_uint {
                     return Err("image atomic on a non-UAV table".into());
                 }
-                let func = if ins.mnemonic == "image_atomic_add" { "InterlockedAdd" } else { "InterlockedMax" };
                 let o = Opnd::Vgpr(vd);
                 self.touch(&o);
                 let t = self.tmp;
                 self.tmp += 1;
+                let texel = format!("uav{slot}[uint{ncoord}({})]", c.join(", "));
                 self.line(&format!("uint t{t} = 0u;"));
-                self.line(&format!("if (exec_lo & 1u) {func}(uav{slot}[uint{ncoord}({})], {}, t{t});", c.join(", "), r(&o)?));
+                if ins.mnemonic == "image_atomic_cmpswap" {
+                    // vdata = {new value, compare value}; the old value comes back in vdata.
+                    let o2 = Opnd::Vgpr(vd + 1);
+                    self.touch(&o2);
+                    self.line(&format!("if (exec_lo & 1u) InterlockedCompareExchange({texel}, {}, {}, t{t});", r(&o2)?, r(&o)?));
+                    return self.wv(&o, &format!("t{t}"));
+                }
+                let (func, arg) = match ins.mnemonic.as_str() {
+                    "image_atomic_add" => ("InterlockedAdd", r(&o)?),
+                    "image_atomic_sub" => ("InterlockedAdd", format!("(0u - {})", r(&o)?)),
+                    "image_atomic_umax" => ("InterlockedMax", r(&o)?),
+                    "image_atomic_umin" => ("InterlockedMin", r(&o)?),
+                    "image_atomic_and" => ("InterlockedAnd", r(&o)?),
+                    "image_atomic_or" => ("InterlockedOr", r(&o)?),
+                    "image_atomic_xor" => ("InterlockedXor", r(&o)?),
+                    "image_atomic_swap" => ("InterlockedExchange", r(&o)?),
+                    other => return Err(format!("{other} unsupported (signed min/max need an int texture)")),
+                };
+                self.line(&format!("if (exec_lo & 1u) {func}({texel}, {arg}, t{t});"));
                 return self.wv(&o, &format!("t{t}"));
             }
             if ins.mnemonic == "image_store" && as_uint {
@@ -4440,6 +4579,42 @@ impl<'a> Emitter<'a> {
             }
             return Ok(());
         }
+        if ins.mnemonic == "image_get_resinfo" {
+            // Size query: vaddr = mip level; the result is (width, height, depth or layers,
+            // mip count) for the components in dmask.
+            let (name, dim, is_uav) = match rs.first() {
+                Some(Res::Tex(t, d)) => (format!("tex{t}"), *d, false),
+                Some(Res::Uav(t, d)) => (format!("uav{t}"), *d, true),
+                _ => return Err("unresolved image".into()),
+            };
+            let mip = r(&ins.src[0])?;
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t}w = 1u, t{t}h = 1u, t{t}d = 1u, t{t}m = 1u;"));
+            let q = match (dim, is_uav) {
+                (0, false) => format!("{name}.GetDimensions({mip}, t{t}w, t{t}m);"),
+                (4, false) => format!("{name}.GetDimensions({mip}, t{t}w, t{t}d, t{t}m);"),
+                (1 | 3, false) => format!("{name}.GetDimensions({mip}, t{t}w, t{t}h, t{t}m);"),
+                (2 | 5, false) => format!("{name}.GetDimensions({mip}, t{t}w, t{t}h, t{t}d, t{t}m);"),
+                (6, false) => format!("{name}.GetDimensions(t{t}w, t{t}h, t{t}m);"),
+                (1, true) => format!("{name}.GetDimensions(t{t}w, t{t}h);"),
+                (2 | 5, true) => format!("{name}.GetDimensions(t{t}w, t{t}h, t{t}d);"),
+                _ => return Err(format!("size query on image dim {dim} unsupported")),
+            };
+            self.line(&q);
+            let vd = match ins.dst[0] {
+                Opnd::Vgpr(n) => n,
+                _ => return Err("bad vdata".into()),
+            };
+            let mut n = 0u8;
+            for (ch, v) in ["w", "h", "d", "m"].iter().enumerate() {
+                if (ins.aux.mask >> ch) & 1 != 0 {
+                    self.wv(&Opnd::Vgpr(vd + n), &format!("t{t}{v}"))?;
+                    n += 1;
+                }
+            }
+            return Ok(());
+        }
         let (tslot, dim) = match rs.first() {
             Some(Res::Tex(t, d)) => (*t, *d),
             _ => return Err("unresolved image".into()),
@@ -4448,6 +4623,40 @@ impl<'a> Emitter<'a> {
             Some(Res::Samp(s)) => *s,
             _ => return Err("image op without sampler unsupported".into()),
         };
+        if ins.mnemonic == "image_get_lod" {
+            // LOD query: x = clamped LOD, y = unclamped (CalculateLevelOfDetail[Unclamped]).
+            let ncoord = match dim {
+                0 => 1usize,
+                1 | 5 => 2,
+                2 | 3 => 3,
+                _ => return Err(format!("LOD query on image dim {dim} unsupported")),
+            };
+            let nsa = ins.aux.imm2 as usize;
+            let first = match ins.src[0] {
+                Opnd::Vgpr(n) => n,
+                _ => return Err("bad vaddr".into()),
+            };
+            let mut c = vec![];
+            for i in 0..ncoord {
+                let o = if nsa > 0 { ins.src[i] } else { Opnd::Vgpr(first + i as u8) };
+                self.touch(&o);
+                c.push(f(&o)?);
+            }
+            let coord = if ncoord == 1 { c[0].clone() } else { format!("float{ncoord}({})", c.join(", ")) };
+            let smp = if self.samp_cmp.contains(&sslot) { format!("scmp{sslot}") } else { format!("samp{sslot}") };
+            let vd = match ins.dst[0] {
+                Opnd::Vgpr(n) => n,
+                _ => return Err("bad vdata".into()),
+            };
+            let mut n = 0u8;
+            for (ch, func) in ["CalculateLevelOfDetail", "CalculateLevelOfDetailUnclamped"].iter().enumerate() {
+                if (ins.aux.mask >> ch) & 1 != 0 {
+                    self.wv(&Opnd::Vgpr(vd + n), &format!("asuint(tex{tslot}.{func}({smp}, {coord}))"))?;
+                    n += 1;
+                }
+            }
+            return Ok(());
+        }
         // RDNA2 sample/gather family. Opcode = family base (0x20 sample, 0x40 gather4) +
         // modifier (0 none, 1 cl, 2 d, 3 d_cl, 4 l, 5 b, 6 b_cl, 7 lz) + 8 (depth compare)
         // + 0x10 (texel offset). Address operands arrive in this order:
