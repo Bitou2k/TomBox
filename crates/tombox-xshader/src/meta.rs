@@ -101,8 +101,26 @@ pub fn parse_psv0_ms(body: &[u8]) -> Option<MsInfo> {
         max_vertices: u16::from_le_bytes([info[12], info[13]]),
         max_primitives: u16::from_le_bytes([info[14], info[15]]),
         topology: info[27],
-        numthreads: [u32_at(info, 40).ok()?, u32_at(info, 44).ok()?, u32_at(info, 48).ok()?],
+        // PSVRuntimeInfo2 NumThreadsX/Y/Z at 36/40/44 (offset 48 is RuntimeInfo3's entry-name
+        // offset; reading 40..52 gave (1, 1, name offset), e.g. a 178-thread Z size).
+        numthreads: [u32_at(info, 36).ok()?, u32_at(info, 40).ok()?, u32_at(info, 44).ok()?],
     })
+}
+
+/// `NumThreadsX/Y/Z` of `PSVRuntimeInfo2` (info offsets 36/40/44; present when the runtime
+/// info is at least 48 bytes). Only meaningful for compute, mesh and amplification shaders;
+/// None when absent or zero.
+pub fn parse_psv0_numthreads(body: &[u8]) -> Option<[u32; 3]> {
+    let info_size = u32_at(body, 0).ok()? as usize;
+    if info_size < 48 {
+        return None;
+    }
+    let info = body.get(4..4 + info_size)?;
+    let t = [u32_at(info, 36).ok()?, u32_at(info, 40).ok()?, u32_at(info, 44).ok()?];
+    if t.iter().any(|&x| x == 0) || t.iter().product::<u32>() > 1024 {
+        return None;
+    }
+    Some(t)
 }
 
 pub fn parse_psv0_gs(body: &[u8]) -> Option<GsInfo> {

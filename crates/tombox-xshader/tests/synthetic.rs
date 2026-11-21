@@ -48,6 +48,7 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         resources: Vec::new(),
         gs_info: None,
         ms_info: None,
+        psv_numthreads: None,
         root_sig: root,
     }
 }
@@ -171,4 +172,29 @@ fn texel_type_follows_the_use_of_the_loaded_value() {
     let t = translate(&ex).expect("translate (float use)");
     assert!(t.hlsl.contains("Texture2D<float4> tex0 : register(t0);"), "{}", t.hlsl);
     assert!(t.hlsl.contains("float4 t0 = tex0.Load("), "{}", t.hlsl);
+}
+
+/// A scalar constant-buffer load whose byte offset comes from an entry SGPR (SOFFSET field,
+/// not a decoded source operand) must count that register as read at entry; it was left
+/// undeclared, and DXC rejected the shader (second title, PS_CascadeShadows_texture).
+#[test]
+fn smem_soffset_register_is_entry_live() {
+    let root = Some(RootSig { version: 2, flags: 1, params: vec![table(2, 16, 5)], num_static_samplers: 0 });
+    let words = [
+        0xf408_0004, // s_load_dwordx4 s0, s8 [off=0]: constant buffer descriptor
+        0xfa00_0000,
+        0xf420_0100, // s_buffer_load_dword s4, s0 [off=0], soffset = s13
+        0x1a00_0000,
+        0x7e04_0204, // v_mov_b32 v2, s4
+        PACK_V0_V2_V2,
+        PACK_V1_V2_V2,
+        EXP_MRT0_COMPR[0],
+        EXP_MRT0_COMPR[1],
+        S_ENDPGM,
+    ];
+    let ex = shader(Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], root);
+    let t = translate(&ex).expect("translate");
+    let live = t.hlsl.lines().find(|l| l.starts_with("// entry-live registers")).expect("live line");
+    assert!(live.split_whitespace().any(|r| r == "s13"), "{live}\n{}", t.hlsl);
+    assert!(t.hlsl.contains("+ s13) >> 2"), "{}", t.hlsl);
 }

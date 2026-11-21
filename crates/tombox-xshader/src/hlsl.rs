@@ -2051,6 +2051,14 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            // An SMEM load's SOFFSET register (dword 1 bits 31:25, 0x7d = none) is a read too
+            // that is not among the decoded sources.
+            if ins.enc == Enc::Smem {
+                let so = ins.raw.get(1).copied().unwrap_or(0x7d << 25) >> 25;
+                if so < 106 && !written.contains(&format!("s{so}")) {
+                    live.insert((0, so));
+                }
+            }
             // Multi-register destinations: SMEM loads, MIMG results, 64-bit scalar ops.
             let extra = match ins.enc {
                 Enc::Smem => (1u32 << (ins.op & 7)) - 1,
@@ -2915,6 +2923,9 @@ impl<'a> Emitter<'a> {
                 if soff != 0x7d {
                     // Dynamic byte offset = imm + SGPR[soffset].
                     let so = ssrc_name(soff)?;
+                    if soff < 106 {
+                        self.touch(&Opnd::Sgpr(soff as u8)); // declare it (it may only be read here)
+                    }
                     let t = self.tmp;
                     self.tmp += 1;
                     self.line(&format!("uint t{t} = ({:#x}u + {so}) >> 2;", ins.aux.imm as u32));
@@ -4827,7 +4838,8 @@ impl<'a> Emitter<'a> {
                 (Some(o), None) => format!(", {o}"),
                 (o, Some(c)) => {
                     if noff == 0 {
-                        return Err("LOD clamp on a cube image unsupported".into());
+                        // Cube images take no offset: the clamp follows the location directly.
+                        return Ok(format!(", {c}"));
                     }
                     format!(", {}, {c}", o.clone().unwrap_or_else(|| zero_off.clone()))
                 }
@@ -5204,8 +5216,14 @@ impl<'a> Emitter<'a> {
             // Compute ABI (from ClearCS + FSSM metadata): local thread id in v0..v2, the
             // thread-group id in the three SGPRs following the user-data (root-parameter)
             // registers, thread-group size in the ISA preamble dwords 1..3.
+            // PSV0's NumThreads (DXIL metadata) when present; else the ISA preamble. The second
+            // title's compute shaders have (1, 1, 1) in the preamble words but e.g. (32, 1, 1)
+            // in PSV0, and one using derivatives failed DXC validation with (1, 1, 1).
             let p = ex.isa_preamble;
-            let (tx, ty_, tz) = (p[1].max(1), p[2].max(1), p[3].max(1));
+            let (tx, ty_, tz) = match ex.psv_numthreads {
+                Some([x, y, z]) => (x, y, z),
+                None => (p[1].max(1), p[2].max(1), p[3].max(1)),
+            };
             let g = match ex.root_sig.as_ref() {
                 Some(r) => 4 + r.params.len(),
                 // Heap mode: the group id follows the user-data SGPRs. Taken as the SGPR after
