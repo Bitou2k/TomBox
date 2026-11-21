@@ -17,6 +17,10 @@ path = "src/bin/rpf-inspect.rs"
 name = "rpf-shaders"
 path = "src/bin/rpf-shaders.rs"
 
+[[bin]]
+name = "rpf-carve"
+path = "src/bin/rpf-carve.rs"
+
 [dependencies]
 # Only an inflater (deflate-compressed shader records); everything else is hand-checked parsing.
 miniz_oxide = "0.8"
