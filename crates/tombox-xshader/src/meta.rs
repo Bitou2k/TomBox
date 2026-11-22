@@ -136,6 +136,52 @@ pub fn parse_psv0_gs(body: &[u8]) -> Option<GsInfo> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshPipelineInfo {
+    Mesh {
+        threads: Option<[u32; 3]>,
+        payload_bytes: u32,
+        max_vertices: u16,
+        max_primitives: u16,
+        topology: &'static str,
+    },
+    Amplification {
+        threads: Option<[u32; 3]>,
+        payload_bytes: u32,
+    },
+}
+
+/// Read the mesh pipeline fields from the versioned DXIL PSV runtime header.
+pub fn parse_psv0_mesh_pipeline(body: &[u8]) -> Option<MeshPipelineInfo> {
+    let size = u32_at(body, 0).ok()? as usize;
+    let info = body.get(4..)?.get(..size)?;
+    if size < 36 {
+        return None;
+    }
+    let threads = (size >= 48).then(|| {
+        [36, 40, 44].map(|offset| u32::from_le_bytes(info[offset..offset + 4].try_into().unwrap()))
+    });
+    let u16_at = |offset| u16::from_le_bytes([info[offset], info[offset + 1]]);
+    match info[24] {
+        13 => Some(MeshPipelineInfo::Mesh {
+            threads,
+            payload_bytes: u32_at(info, 8).ok()?,
+            max_vertices: u16_at(12),
+            max_primitives: u16_at(14),
+            topology: match info[27] {
+                1 => "line",
+                2 => "triangle",
+                _ => "unknown",
+            },
+        }),
+        14 => Some(MeshPipelineInfo::Amplification {
+            threads,
+            payload_bytes: u32_at(info, 0).ok()?,
+        }),
+        _ => None,
+    }
+}
+
 pub fn parse_psv0(body: &[u8]) -> Result<Vec<PsvResource>, String> {
     let info_size = u32_at(body, 0)? as usize;
     let mut p = 4 + info_size;

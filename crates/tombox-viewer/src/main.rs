@@ -167,7 +167,7 @@ struct Stage {
 fn load(path: &Path) -> R<Stage> {
     let blob = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let ex = tombox_xshader::extract(&blob)?;
-    let t = translate_with(&ex, &Options { heap_index_mask: Some(HEAP - 1) })?;
+    let t = translate_with(&ex, &Options { heap_index_mask: Some(HEAP - 1), infer_mesh_abi: true })?;
     let profile = tombox_xshader::dxc::profile_for(t.profile);
     let dxil = tombox_xshader::dxc::compile(&t.hlsl, &profile).map_err(|e| {
         let _ = std::fs::write(path.with_extension("failed.hlsl"), &t.hlsl);

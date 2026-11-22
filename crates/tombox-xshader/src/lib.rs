@@ -20,6 +20,8 @@ pub mod meta;
 pub mod decls;
 pub mod uearchive;
 pub mod rdna2;
+pub mod rpf;
+pub mod psocache;
 
 /// Little-endian readers with explicit bounds checks.
 fn u32_at(b: &[u8], off: usize) -> Result<u32, String> {
@@ -65,11 +67,12 @@ impl Dxbc {
         let mut chunks = Vec::with_capacity(nchunks);
         for i in 0..nchunks {
             let off = u32_at(b, 32 + i * 4)? as usize;
-            let size = u32_at(b, off + 4)? as usize;
-            if off + 8 + size > b.len() {
+            let tail = b.get(off..).ok_or_else(|| format!("chunk {i} offset {off:#x} exceeds blob"))?;
+            let size = u32_at(tail, 4)? as usize;
+            if size > tail.len() - 8 {
                 return Err(format!("chunk {i} at {off:#x} size {size} exceeds blob"));
             }
-            chunks.push(Chunk { fourcc: fourcc_at(b, off)?, offset: off + 8, size });
+            chunks.push(Chunk { fourcc: fourcc_at(tail, 0)?, offset: off + 8, size });
         }
         Ok(Dxbc { digest, total_size, chunks })
     }
@@ -143,6 +146,7 @@ pub struct ShaderExtract {
     pub ms_info: Option<meta::MsInfo>,
     /// Thread-group size from PSV0 (`PSVRuntimeInfo2`), when the chunk has it.
     pub psv_numthreads: Option<[u32; 3]>,
+    pub mesh_info: Option<meta::MeshPipelineInfo>,
     pub root_sig: Option<meta::RootSig>,
 }
 
@@ -245,6 +249,7 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         gs_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_gs),
         ms_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_ms),
         psv_numthreads: chunk_body(b"PSV0").and_then(meta::parse_psv0_numthreads),
+        mesh_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_mesh_pipeline),
         root_sig: chunk_body(b"RTS0").and_then(|b| meta::parse_rts0(b).ok()),
     })
 }

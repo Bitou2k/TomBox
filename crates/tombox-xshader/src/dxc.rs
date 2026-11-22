@@ -106,12 +106,12 @@ unsafe fn blob_bytes(blob: *mut c_void) -> Vec<u8> {
     if p.is_null() || n == 0 { Vec::new() } else { std::slice::from_raw_parts(p, n).to_vec() }
 }
 
-/// Shader-model 6.0 profile for a translator profile such as `ps_5_0` / `ps_5_1`.
-pub fn profile_for(fxc_profile: &str) -> String {
-    if fxc_profile.contains("_6_") {
-        return fxc_profile.to_string(); // already a shader-model 6 profile (heap mode: 6.6)
+/// Promote legacy translator targets while preserving explicit DXC targets.
+pub fn profile_for(profile: &str) -> String {
+    match profile.split_once("_5_") {
+        Some((stage, "0" | "1")) => format!("{stage}_6_0"),
+        _ => profile.to_owned(),
     }
-    format!("{}_6_0", fxc_profile.split('_').next().unwrap_or("ps"))
 }
 
 /// Compile `hlsl` (entry `main`) to signed DXIL. `profile` is e.g. `cs_6_0`.
@@ -177,4 +177,62 @@ pub fn cache_path(hlsl: &str, profile: &str) -> PathBuf {
     }
     let key = fnv1a(hlsl.as_bytes()) ^ fnv1a(profile.as_bytes()).rotate_left(17);
     std::env::temp_dir().join("tombox_shader_cache").join("by_hlsl").join(format!("{key:016x}.cso"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::{parse_psv0_mesh_pipeline, MeshPipelineInfo};
+    use crate::Dxbc;
+
+    #[test]
+    fn mesh_profiles_keep_shader_model_and_produce_readable_psv() {
+        assert_eq!(profile_for("ps_5_1"), "ps_6_0");
+        assert_eq!(profile_for("ms_6_5"), "ms_6_5");
+        assert_eq!(profile_for("as_6_6"), "as_6_6");
+        if !available() {
+            return;
+        }
+
+        let mesh = r#"
+struct Vertex { float4 position : SV_Position; };
+[numthreads(3, 1, 1)]
+[outputtopology("triangle")]
+void main(uint lane : SV_GroupIndex, out vertices Vertex verts[3], out indices uint3 tris[1]) {
+    SetMeshOutputCounts(3, 1);
+    verts[lane].position = float4(lane == 1, lane == 2, 0, 1);
+    if (lane == 0) tris[0] = uint3(0, 1, 2);
+}
+"#;
+        let amplification = r#"
+struct Data { uint group; };
+groupshared Data data;
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_GroupID) {
+    data.group = id.x;
+    DispatchMesh(1, 1, 1, data);
+}
+"#;
+        for (source, target, expected) in [
+            (mesh, "ms_6_5", MeshPipelineInfo::Mesh {
+                threads: Some([3, 1, 1]),
+                payload_bytes: 0,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: "triangle",
+            }),
+            (amplification, "as_6_6", MeshPipelineInfo::Amplification {
+                threads: Some([1, 1, 1]),
+                payload_bytes: 4,
+            }),
+        ] {
+            let shader = compile(source, &profile_for(target)).unwrap();
+            let container = Dxbc::parse(&shader).unwrap();
+            let psv = container.chunk(b"PSV0").unwrap();
+            assert_eq!(
+                parse_psv0_mesh_pipeline(&shader[psv.offset..psv.offset + psv.size]),
+                Some(expected),
+            );
+        }
+    }
 }

@@ -1285,3 +1285,83 @@ the LOD-parent hierarchy (parent index != 0xffff on part of the records).
   placements by level: 1,537,819 / 84,102 / 34,152.
 - Interiors: no placement record found (368-byte section 0xba049770 holds bounding boxes and
   bitmasks, no rotation).
+
+## 2026-11-22 — DXC coverage of the RPF9 shader archive
+
+`xscan shaders.rpf --compile 1 --fresh 1 --jobs 12 --shader-limit 3` processed
+25,889 distinct containers from the same 26,503 named records on Windows
+with SDK DXC 10.0.26100.0. The pipeline produced DXIL for 1,792 shaders.
+The time limit covers extraction, translation and compilation. It expired
+for 337 records before the worker reported a stage.
+
+| DXIL stage | Compiled | Failed with a stage |
+|---|---:|---:|
+| Geometry | 195 | 0 |
+| Pixel | 928 | 10,841 |
+| Vertex | 664 | 1,527 |
+| Compute | 5 | 2,627 |
+| Mesh | 0 | 8,765 |
+
+The most common translation errors besides unsupported mesh were a dynamic
+scalar descriptor-load offset (6,674), an unknown MUBUF descriptor-table kind
+(2,732), and unsupported integer wave reductions. All 1,792 shaders that
+reached DXC and reported an outcome compiled. Rendering was not measured.
+
+Across the 9,282 mesh records, PSV0 consistently reports 128×1×1 threads,
+triangle topology, up to 128 output vertices and 128 primitives, and zero
+payload bytes. None has an RTS0 chunk. The archive contains no amplification
+program in the named records. Synthetic shader tests exercise DXC at
+`ms_6_5` and `as_6_6`, including reading the compiled PSV0 metadata.
+
+### Matching DXBC to pipeline cache metadata
+
+All 25,889 distinct DXBCs contain PSV0 and none contains RTS0. The
+`shaders.rpf` from build 1.0.2.1 also contains a zlib-compressed
+`PS\x00\x09` cache at archive offset `0x10579000`. Inflating each stream
+and aligning its end to 16 bytes gives 4,205 streams and 275,540,780
+uncompressed bytes. The cache header gives 25,471 graphics PSOs, 2,693
+compute PSOs, 54,576 metadata entries and 21,522 code entries.
+
+Matching the 16-byte DXBC `HASH` payload to `0x43` tags inside indexed
+metadata entries identified candidates for 19,096 distinct DXBCs
+(18,663 distinct matching shader hash values). A hash can occur in
+multiple metadata entries. For `VSPointLight_13aa26a1_Wrapped`, entry
+17852 contains three 32-byte `0x41` records. Their dword offsets
+correspond to the three scalar descriptor loads from `s12` in the ISA.
+The register numbers and resource kinds agree with PSV0.
+
+| Offset from `s12` | PSV0 resource |
+|---|---|
+| `0x60` | Structured SRV, `t320, space1` |
+| `0x1e0` | CBV, `b38, space1` |
+| `0x200` | CBV, `b0, space1` |
+
+This shader reaches `buffer_load_dwordx3` at ISA offset `0x68`. The
+current translator expects one resource kind per descriptor table and
+reports an unknown kind. The metadata above demonstrates why this table
+needs per-entry resource kinds. Dynamic offsets additionally need a
+runtime descriptor index and a mapping to register spaces. See
+[PercyStar's format notes](https://github.com/rpatty-dev/PercyStar/blob/main/docs/breakthroughs.json)
+for the cache layout and metadata tags.
+
+An independent build of [PR #4](https://github.com/drycheetah84/TomBox/pull/4)
+at `991903d` compiled 102 of the 320 shaders in the comparison sample,
+up from 93 at `7e8064f`. The nine additional shaders were all pixel
+shaders. Both runs used empty compiler caches.
+
+## 2026-11-22 — Merge of upstream (PSO-aware bindings, v_cmpx decoding, capture diagnostics)
+
+- Upstream reimplemented parts of the translator in parallel. Resolution in `hlsl.rs`:
+  PSO bindings (`translate_with_pso`, raw buffers, register spaces, inline samplers,
+  dynamic descriptor offsets) kept and combined with heap mode (exclusive: bindings turn heap
+  mode off); my wave-reduction lowering, compare emitter (class f16, 64-bit operands) and
+  typed declarations kept, with declarations routed through upstream's `register()`.
+- Mesh shaders, owner's decision: upstream's strict path (hlsl/mesh.rs: 128 threads, one
+  immediate GS_ALLOC_REQ, no branches, no entry registers) is the default; the inferred-ABI
+  path is behind `Options::infer_mesh_abi` (`xscan --infer-mesh-abi 1`, tombox-viewer on).
+  The runtime uses the default.
+- Upstream test `mesh_allocation_and_triangle_exports_compile_to_dxil` failed on upstream's
+  own branch (asserted `SetMeshOutputCounts(m0 & 0xfffu`, the code emits named counts);
+  assertion corrected, DXC compile part passes.
+- Checks: workspace tests 68 passed, 0 failed; Fortnite archive 105,506 / 105,506 translated
+  (no mesh shaders). Second title corpus not re-measured after the merge.

@@ -98,6 +98,12 @@ pub fn vopc(op: u32) -> Option<&'static str> {
     })
 }
 
+/// GFX10 VOPC opcodes with bit 4 set are the v_cmpx forms, which write EXEC only (LLVM's
+/// `_nosdst` pseudos: no VCC write in e32/SDWA, the e64 SDST field is ignored).
+pub fn is_cmpx(op: u32) -> bool {
+    op < 0x100 && op & 0x10 != 0
+}
+
 pub fn vop3(op: u32) -> Option<&'static str> {
     if op < 0x100 {
         return vopc(op);
