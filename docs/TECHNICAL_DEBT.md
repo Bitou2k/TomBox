@@ -180,6 +180,9 @@ Honest ledger. Updated continuously.
   a model only inside multi-model (LOD dictionary) files, whose part -> name split is not
   decoded; ~400k (5,351 files) lie within 250 m of the origin, presumably interiors in local
   space, with no decoded world placement.
+- UE importer (`ue/Plugins/TomBoxLevelImport`): mirrored transforms not yet checked visually
+  in the editor; opaque materials only (decal alpha not used); no collision or lightmap UVs;
+  synchronous import (about 0.5 s per model).
 - Map viewer (`tools/rage/mapview`): colour texture only (see above); level of detail by
   model name and distance band per tile, not the game's parent links; interiors left out.
 - Texture chunk codecs other than zlib (14% of textures): no decoder exists in the dump (no

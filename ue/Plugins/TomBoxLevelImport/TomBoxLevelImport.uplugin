@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "TomBox Level Import",
+	"Description": "Editor tool: imports an area of a level from a running TomBox map server (tools/rage/mapview) as static meshes, textures, materials and a map. The plugin holds no game data; everything comes from the user's own files through the local server.",
+	"Category": "Editor",
+	"CreatedBy": "TomBox",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "TomBoxLevelImport",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}

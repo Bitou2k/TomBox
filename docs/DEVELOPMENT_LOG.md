@@ -1365,3 +1365,20 @@ shaders. Both runs used empty compiler caches.
   assertion corrected, DXC compile part passes.
 - Checks: workspace tests 68 passed, 0 failed; Fortnite archive 105,506 / 105,506 translated
   (no mesh shaders). Second title corpus not re-measured after the merge.
+
+## 2026-11-22 — Unreal Engine level importer (second title's map)
+
+- `ue/Plugins/TomBoxLevelImport` (UE 5.5 editor module): client of the map server. Imports an
+  area (centre, radius, detail level) as one static mesh per model (one material slot per
+  part, normals from the model or area-weighted face normals), `Texture2D` assets from the
+  server's PNGs, material instances of a two-sided base material, and a map with one HISM
+  actor per model plus sun, sky light, atmosphere and fog. Game right-handed metres -> UE
+  left-handed centimetres by mirroring Y (winding reversed; rotation conj(q) mirrored to
+  (x, -y, z, w)); area re-centred. Tools menu window and a `TomBoxImport` commandlet.
+- Built with UE 5.5 against the VS 2026 toolset (MSVC 14.51); no plugin warnings.
+- Headless test (100 m around -375, -875, full detail): 1,971 placements (2 without a model),
+  367 models built, 0 failed, 1 part skipped, 718 textures, 73 undecodable; 3.5 minutes.
+- Fixed during the test: `-center=X,Y` was cut at the comma (FParse separator); the commandlet's
+  options object was garbage-collected during asset saves (now held by TStrongObjectPtr).
+- Not verified: the result in the editor viewport (orientation of the mirrored transforms has
+  not been checked visually in UE).

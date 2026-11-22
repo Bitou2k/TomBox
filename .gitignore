@@ -22,3 +22,7 @@ analysis/fortnite_symbols.decompressed.bin
 
 # Captured title logs
 analysis/logs/
+
+# Unreal build output of the in-repo plugin (built through input/ue host projects)
+ue/**/Binaries/
+ue/**/Intermediate/
