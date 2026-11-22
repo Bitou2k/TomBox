@@ -668,8 +668,8 @@ unsafe extern "system" fn create_gfx_pso_x(
     if LOGN.fetch_add(1, Ordering::Relaxed) % 32 == 0 {
         let (sok, sfail) = crate::shader_xlat::counts();
         record("d3d12_xs", "CreateGraphicsPSO_X", &format!(
-            "counts: pso_ok={} pso_fail={} untranslatable={} | shaders ok={sok} fail={sfail}",
-            OK.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed), XFAIL.load(Ordering::Relaxed)));
+            "counts: pso_ok={} pso_fail={} untranslatable={} | shaders ok={sok} fail={sfail} (cached without translating: {})",
+            OK.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed), XFAIL.load(Ordering::Relaxed), crate::shader_xlat::blob_hits()));
     }
     hr
 }

@@ -165,6 +165,38 @@ pub fn compile(hlsl: &str, profile: &str) -> Result<Vec<u8>, String> {
 
 /// Location of a compiled shader in the on-disk cache shared by the offline sweep
 /// (`xscan --compile`) and the runtime (`d3d12_xs`). Keyed by the generated HLSL and the
+/// Hash of the translator's source (build.rs): part of every input-keyed cache key.
+pub const TRANSLATOR_REV: &str = env!("TOMBOX_XSHADER_REV");
+
+/// Compiled-shader cache keyed by the *input* (the console shader container) plus the
+/// translator revision and compiler name: a hit skips translation entirely. Shares the
+/// directory root with [`cache_path`] (the runtime and `xscan --compile` both fill it).
+pub fn blob_cache_path(blob: &[u8], compiler: &str) -> PathBuf {
+    fn fnv1a(b: &[u8]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &x in b {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let tag = format!("{TRANSLATOR_REV}/{compiler}");
+    let key = fnv1a(blob) ^ fnv1a(tag.as_bytes()).rotate_left(29);
+    std::env::temp_dir().join("tombox_shader_cache").join("by_blob").join(format!("{key:016x}.cso"))
+}
+
+/// Store `code` under the input-keyed cache (best effort; creates the directory).
+pub fn store_blob_cache(blob: &[u8], compiler: &str, code: &[u8]) {
+    let p = blob_cache_path(blob, compiler);
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, code).is_ok() && std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// profile, so any change to a shader's translation misses the cache.
 pub fn cache_path(hlsl: &str, profile: &str) -> PathBuf {
     fn fnv1a(b: &[u8]) -> u64 {

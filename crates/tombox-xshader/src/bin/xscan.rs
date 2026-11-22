@@ -434,6 +434,14 @@ fn process(blob: &[u8], compile: bool, use_cache: bool, dxc_limit: Option<u64>) 
         Err(e) => (String::from("?"), Err(format!("extract: {e}")), false),
         Ok(ex) => {
             let st = stage_name(&ex.stage).to_string();
+            // Input-keyed cache (same as the runtime): a hit needs no translation. Skipped
+            // with --mnemonics (which needs the translation result).
+            let dxc_path = compile && use_cache && USE_FXC.load(Ordering::Relaxed) == 0;
+            if dxc_path && MNEM.load(Ordering::Relaxed) == 0
+                && std::fs::metadata(tombox_xshader::dxc::blob_cache_path(blob, "dxc")).is_ok_and(|m| m.len() != 0)
+            {
+                return (st, Ok(()), false);
+            }
             // `--infer-mesh-abi 1` (inherited by worker processes through the environment):
             // mesh shaders take the inferred-ABI path instead of the strict one.
             let opts = hlsl::Options { infer_mesh_abi: std::env::var_os("TOMBOX_INFER_MESH_ABI").is_some(), ..Default::default() };
@@ -476,8 +484,13 @@ fn process(blob: &[u8], compile: bool, use_cache: bool, dxc_limit: Option<u64>) 
                     // Default: DXC (shader model 6.0), in process.
                     let profile = tombox_xshader::dxc::profile_for(t.profile);
                     let path = tombox_xshader::dxc::cache_path(&t.hlsl, &profile);
-                    if use_cache && std::fs::metadata(&path).is_ok_and(|m| m.len() != 0) {
-                        return (st, Ok(()), false);
+                    if use_cache {
+                        if let Ok(code) = std::fs::read(&path) {
+                            if !code.is_empty() {
+                                tombox_xshader::dxc::store_blob_cache(blob, "dxc", &code);
+                                return (st, Ok(()), false);
+                            }
+                        }
                     }
                     let compiled = if let Some(limit) = dxc_limit {
                         compile_child(&t.hlsl, &profile, use_cache.then_some(path.as_path()), limit, false)
@@ -494,6 +507,11 @@ fn process(blob: &[u8], compile: bool, use_cache: bool, dxc_limit: Option<u64>) 
                         Ok(secs) => {
                             if secs > 5.0 {
                                 SLOW.lock().unwrap().push((secs, fnv1a(blob), t.hlsl.lines().count()));
+                            }
+                            if use_cache {
+                                if let Ok(code) = std::fs::read(&path) {
+                                    tombox_xshader::dxc::store_blob_cache(blob, "dxc", &code);
+                                }
                             }
                             (st, Ok(()), true)
                         }

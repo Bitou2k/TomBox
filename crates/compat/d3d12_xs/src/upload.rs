@@ -226,6 +226,12 @@ struct Tracked {
     fps: Vec<Footprint>,
     total_bytes: u64,
     hashes: Vec<Option<u64>>,
+    /// Unreadable memory backoff: next pump at which this texture is checked again, and the
+    /// current wait in pumps (doubles up to 256 while unreadable, reset when readable). The
+    /// title commits streamed texture memory late; checking every frame cost one
+    /// VirtualQuery walk per subresource per frame for thousands of textures.
+    retry_at: u64,
+    backoff: u64,
 }
 
 struct Uploader {
@@ -316,7 +322,7 @@ unsafe fn adopt(up: &mut Uploader, res: *mut c_void, p: Placed) -> Result<Tracke
     if fps.iter().any(|f| f.row_size % layout.bpe as u64 != 0) {
         return Err(format!("row size not a multiple of bytes-per-element {}", layout.bpe));
     }
-    Ok(Tracked { res: res as usize, p, layout, fps, total_bytes: total, hashes: vec![None; nsubs as usize] })
+    Ok(Tracked { res: res as usize, p, layout, fps, total_bytes: total, hashes: vec![None; nsubs as usize], retry_at: 0, backoff: 0 })
 }
 
 struct Staged {
@@ -330,7 +336,11 @@ struct Staged {
 /// `fresh_only`: look only at subresources that have never been uploaded.
 unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: bool) -> Option<Staged> {
     let device = up.device;
+    let now = up.pumps;
     let t = &mut up.tracked[idx];
+    if now < t.retry_at {
+        return None;
+    }
     let bpe = t.layout.bpe as usize;
     let mut changed: Vec<(u32, Arc<SubMap>, u64)> = Vec::new();
     let mut unreadable = 0;
@@ -361,6 +371,12 @@ unsafe fn check(up: &mut Uploader, idx: usize, hashed: &mut u64, fresh_only: boo
         if t.hashes[sub as usize] != Some(h) {
             changed.push((sub, map, h));
         }
+    }
+    if unreadable > 0 {
+        t.backoff = (t.backoff * 2).clamp(1, 256);
+        t.retry_at = now + t.backoff;
+    } else {
+        t.backoff = 0;
     }
     up.unreadable += unreadable;
     if changed.is_empty() {

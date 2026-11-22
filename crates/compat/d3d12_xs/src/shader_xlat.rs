@@ -127,6 +127,21 @@ fn disk_cache_dir() -> Option<&'static std::path::PathBuf> {
 }
 
 fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
+    // Input-keyed cache (console container + translator revision + compiler): a hit skips
+    // translation. Not used when a hand-edited override exists for this shader.
+    let use_dxc = tombox_xshader::dxc::available()
+        && std::env::var("TOMBOX_SHADER_COMPILER").map(|v| v != "fxc").unwrap_or(true);
+    let compiler = if use_dxc { "dxc" } else { "fxc" };
+    let override_path = std::env::temp_dir().join("tombox_shader_override").join(format!("{hash:016x}.hlsl"));
+    let overridden = override_path.exists();
+    if !overridden {
+        if let Ok(v) = std::fs::read(tombox_xshader::dxc::blob_cache_path(blob, compiler)) {
+            if !v.is_empty() {
+                BLOB_HITS.fetch_add(1, Ordering::Relaxed);
+                return Ok(v);
+            }
+        }
+    }
     let ex = tombox_xshader::extract(blob).map_err(|e| {
         dump_failure(hash, blob, None, &e);
         format!("extract: {e}")
@@ -137,15 +152,13 @@ fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
     })?;
     // Development aid: `%TEMP%	ombox_shader_override<hash>.hlsl` replaces the generated
     // HLSL for that shader (to instrument a translation while debugging). Logged every time.
-    if let Ok(h) = std::fs::read_to_string(std::env::temp_dir().join("tombox_shader_override").join(format!("{hash:016x}.hlsl"))) {
+    if let Ok(h) = std::fs::read_to_string(&override_path) {
         record("d3d12_xs", "shader_xlat", &format!("OVERRIDE: hash={hash:016x} uses hand-edited HLSL ({} bytes)", h.len()));
         t.hlsl = h;
     }
     // Compiler: DXC (SM6 DXIL) when dxcompiler.dll + dxil.dll are available, otherwise FXC
     // (SM5 DXBC). FXC needs minutes for some of the generated compute shaders; DXC about a
     // second. `TOMBOX_SHADER_COMPILER=fxc` forces the old path.
-    let use_dxc = tombox_xshader::dxc::available()
-        && std::env::var("TOMBOX_SHADER_COMPILER").map(|v| v != "fxc").unwrap_or(true);
     static ANNOUNCED: std::sync::Once = std::sync::Once::new();
     ANNOUNCED.call_once(|| {
         record("d3d12_xs", "shader_xlat", if use_dxc { "compiler: DXC (shader model 6.0, DXIL)" } else { "compiler: FXC (shader model 5, DXBC) - DXC not available or disabled" });
@@ -156,6 +169,9 @@ fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
     if let Some(p) = &cached {
         if let Ok(v) = std::fs::read(p) {
             if !v.is_empty() {
+                if !overridden {
+                    tombox_xshader::dxc::store_blob_cache(blob, compiler, &v);
+                }
                 return Ok(v);
             }
         }
@@ -180,6 +196,9 @@ fn translate_uncached(blob: &[u8], hash: u64) -> Result<Vec<u8>, String> {
         Ok(v) => {
             if let Some(p) = &cached {
                 let _ = std::fs::write(p, &v);
+            }
+            if !overridden {
+                tombox_xshader::dxc::store_blob_cache(blob, compiler, &v);
             }
             Ok(v)
         }
@@ -228,6 +247,13 @@ fn compile_and_record(blob: &[u8], hash: u64) -> Cached {
             Err(Arc::new(e))
         }
     }
+}
+
+/// Shaders served from the input-keyed cache without translating.
+static BLOB_HITS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn blob_hits() -> usize {
+    BLOB_HITS.load(Ordering::Relaxed)
 }
 
 pub fn counts() -> (usize, usize) {

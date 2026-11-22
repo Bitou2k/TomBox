@@ -1423,3 +1423,20 @@ shaders. Both runs used empty compiler caches.
   (picked by sorting on modification time); the conclusions were re-checked on the current
   captures.
 - Not yet verified in the running title (needs a restart with the new DLL).
+
+## 2026-11-22 — Runtime CPU cost: shader cache by input, texture-pump backoff
+
+User report: the title uses about 45% CPU. Two costs identified in the code and the last
+run's log (not yet profiled in a running title):
+- Shader cache keyed by generated HLSL: every launch translated every shader again just to
+  compute the key. New input-keyed cache `by_blob` (console container hash x translator
+  revision x compiler; `TRANSLATOR_REV` = hash of the translator's source, from build.rs):
+  a hit skips extraction and translation. The runtime fills it after every successful
+  compile or HLSL-cache hit; `xscan --compile` fills it too, so a sweep pre-warms launches.
+  Overrides (`tombox_shader_override`) bypass it. The PSO counter line reports the hits.
+- Texture upload pump: never-uploaded textures with unreadable (uncommitted) memory were
+  checked every frame, one VirtualQuery walk per subresource, without counting against the
+  per-frame budget (last run: 15.4 million unreadable skips, about 3,600 per frame). Now
+  each such texture backs off (1, 2, 4 ... 256 pumps) until its memory is readable.
+- The two translator changes of the day (merge, LDS barriers) changed many shaders' HLSL:
+  a sweep recompiled about 15,000 entries in 9.5 minutes.
