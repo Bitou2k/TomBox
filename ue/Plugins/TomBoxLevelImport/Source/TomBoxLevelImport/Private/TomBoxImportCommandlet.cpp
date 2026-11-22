@@ -27,6 +27,11 @@ int32 UTomBoxImportCommandlet::Main(const FString& Params)
 	FParse::Value(*Params, TEXT("map="), Options->MapName);
 	Options->bImportTextures = !FParse::Param(*Params, TEXT("notextures"));
 	Options->bNanite = FParse::Param(*Params, TEXT("nanite"));
+	FParse::Value(*Params, TEXT("surroundings="), Options->SurroundingsMeters);
+	FParse::Value(*Params, TEXT("maxtex="), Options->MaxTextureSize);
+	Options->bNormalMaps = !FParse::Param(*Params, TEXT("nonormals"));
+	Options->bFlipNormalGreen = FParse::Param(*Params, TEXT("flipgreen"));
+	Options->bLumenVolume = !FParse::Param(*Params, TEXT("nolumen"));
 
 	FTomBoxImporter Importer(*Options);
 	FTomBoxImportReport Report;

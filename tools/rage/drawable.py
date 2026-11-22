@@ -36,6 +36,9 @@ import struct
 V, G = 0x50000000, 0x60000000
 DIFFUSE = 0xC8E8C282  # joaat("DiffuseTex")
 SPECULAR = 0xC6F46E79  # joaat("SpecularTex")
+# Normal map slot: name not recovered; identified visually (blue-purple tangent-space normal
+# maps in a sample of shaders, BC1 / BC7 linear formats).
+NORMAL = 0x1E77BF4C
 SRGB_FORMATS = {29, 72, 75, 78, 91, 99}
 
 
@@ -119,6 +122,15 @@ def drawables(b):
     # Fragment (name.#ft): its drawable is at the pointer at +0x18 (200 of 200 sampled
     # fragment files decode this way; +0x10 points elsewhere).
     return [(None, _ptr(b, 0x18))]
+
+
+def normal_texture(tex):
+    """The tangent-space normal map of a shader (slot NORMAL), or None. Placeholder 4x4
+    textures are left to the caller (they decode to a flat colour)."""
+    for t in tex:
+        if t["param"] == NORMAL and t["key"] is not None:
+            return t["key"]
+    return None
 
 
 def colour_texture(tex, fmt_of=None):

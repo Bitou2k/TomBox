@@ -46,16 +46,18 @@ private:
 	};
 
 	bool Get(const FString& Path, TArray<uint8>& Out, FString& Error) const;
-	bool FetchArea(TArray<FPlacement>& Out, FTomBoxImportReport& Report);
+	bool FetchInfo(FTomBoxImportReport& Report);
+	bool FetchArea(int32 Level, double MinRadius, double MaxRadius, TArray<FPlacement>& Out, FTomBoxImportReport& Report);
 	UStaticMesh* BuildModel(uint32 Hash, FString& DisplayName, FTomBoxImportReport& Report);
-	UMaterialInterface* MaterialForTexture(const FString& Key, FTomBoxImportReport& Report);
-	UTexture2D* BuildTexture(const FString& Key, FTomBoxImportReport& Report);
+	UMaterialInterface* MaterialFor(const FString& Colour, const FString& Normal, FTomBoxImportReport& Report);
+	UTexture2D* BuildTexture(const FString& Key, bool bNormal, FTomBoxImportReport& Report);
 	UMaterial* BaseMaterial(bool bTextured);
 	bool BuildMap(const TArray<FPlacement>& Placements, const TMap<uint32, UStaticMesh*>& Meshes,
 		const TMap<uint32, FString>& Names, FTomBoxImportReport& Report);
 
 	const UTomBoxImportOptions& Options;
 	double TileSize = 250.0;
+	TArray<TArray<double>> Tiles;  // [x, y, n_full, n_lod, n_slod]
 	TMap<FString, UMaterialInterface*> MaterialCache;
 	UMaterialInterface* Untextured = nullptr;
 };

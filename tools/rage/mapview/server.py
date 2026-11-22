@@ -38,7 +38,8 @@ ENT = np.dtype([("file", "<u4"), ("at", "<u4"), ("id", "<u8"), ("q", "<f4", 4), 
                 ("name", "<u4"), ("flags", "<u4"), ("s", "<f4", 2), ("idx", "<u2"), ("par", "<u2"),
                 ("lod", "<f4"), ("pad", "<u4")])
 TILE = 250.0  # metres per tile side
-TEX_MAX = 512  # largest texture side sent to the page
+TEX_MAX = 512  # default largest texture side (the page); ?max= raises it up to TEX_LIMIT
+TEX_LIMIT = 4096
 
 
 def joaat(s):
@@ -79,12 +80,13 @@ class Textures:
         self.lock = threading.Lock()
         self.cache = collections.OrderedDict()
 
-    def png(self, key):
-        """PNG of the texture with this pack key, at the largest stored mip <= TEX_MAX."""
+    def png(self, key, max_side=TEX_MAX):
+        """PNG of the texture with this pack key, at the largest stored mip <= max_side."""
         from ttpf import Pack, CodecError
         from ttpfexport import untile, layout_of, to_image
-        if key in self.cache:
-            return self.cache[key]
+        ck = (key, max_side)
+        if ck in self.cache:
+            return self.cache[ck]
         e = self.idx.get(str(key))
         if not e:
             raise KeyError(f"texture key {key:#x} is in no indexed texture pack")
@@ -96,7 +98,7 @@ class Textures:
             except CodecError as ex:
                 raise ValueError(f"texture data uses an unsupported chunk codec ({ex})")
         mip = 0
-        while max(t["w"], t["h"]) >> mip > TEX_MAX and mip + 1 < max(t["mips"], 1):
+        while max(t["w"], t["h"]) >> mip > max_side and mip + 1 < max(t["mips"], 1):
             mip += 1
         layout = layout_of(t)
         if layout is None:
@@ -111,7 +113,7 @@ class Textures:
         buf = io.BytesIO()
         img.save(buf, "PNG", compress_level=1)
         out = buf.getvalue()
-        self.cache[key] = out
+        self.cache[ck] = out
         if len(self.cache) > 1500:
             self.cache.popitem(last=False)
         return out
@@ -206,9 +208,12 @@ class Package:
                 except (ValueError, struct.error) as ex:
                     errors.append(f"model {mi} part {gi}: {ex}")
                     continue
-                key = drawable.colour_texture(S[geo["shader"]], self.fmt_of) if geo["shader"] < len(S) else None
+                sh = S[geo["shader"]] if geo["shader"] < len(S) else []
+                key = drawable.colour_texture(sh, self.fmt_of)
+                nkey = drawable.normal_texture(sh)
                 parts.append(dict(nv=nv, nt=len(t), normals=n is not None, uvs=uv is not None,
-                                  tex=f"{key:016x}" if key is not None and uv is not None else None))
+                                  tex=f"{key:016x}" if key is not None and uv is not None else None,
+                                  normal=f"{nkey:016x}" if nkey is not None and uv is not None else None))
                 blobs.append(p.astype("<f4").tobytes())
                 if n is not None:
                     blobs.append(n.astype("<f4").tobytes())
@@ -278,7 +283,8 @@ def handler(pkg, tex):
                 elif u.path.startswith("/api/model/"):
                     self.send(200, pkg.model(int(u.path.rsplit("/", 1)[1], 16)), "application/octet-stream")
                 elif u.path.startswith("/api/tex/"):
-                    self.send(200, tex.png(int(u.path.rsplit("/", 1)[1], 16)), "image/png")
+                    side = min(max(int(q.get("max", [TEX_MAX])[0]), 16), TEX_LIMIT)
+                    self.send(200, tex.png(int(u.path.rsplit("/", 1)[1], 16), side), "image/png")
                 else:
                     self.send(404, b"not found", "text/plain")
             except KeyError as ex:

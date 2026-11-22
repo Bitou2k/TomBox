@@ -27,6 +27,11 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = "Area", meta = (ClampMin = "0", ClampMax = "2"))
 	int32 DetailLevel = 0;
 
+	/** Also place the next coarser level ("_lod" models when importing full detail) in a ring
+	 *  from Radius out to this distance, so the area has surroundings. 0 = off. */
+	UPROPERTY(EditAnywhere, Config, Category = "Area", meta = (ClampMin = "0", ClampMax = "10000"))
+	double SurroundingsMeters = 1000.0;
+
 	/** Content folder for meshes, textures and materials (shared between imports). */
 	UPROPERTY(EditAnywhere, Config, Category = "Output")
 	FString ContentPath = TEXT("/Game/TomBox");
@@ -38,6 +43,23 @@ public:
 	/** Import textures (colour map of each part); off = grey materials only, much faster. */
 	UPROPERTY(EditAnywhere, Config, Category = "Output")
 	bool bImportTextures = true;
+
+	/** Largest texture side imported (the largest stored mip not above this). */
+	UPROPERTY(EditAnywhere, Config, Category = "Output", meta = (ClampMin = "64", ClampMax = "4096"))
+	int32 MaxTextureSize = 2048;
+
+	/** Import normal maps (shader slot 0x1e77bf4c, identified visually) into the materials. */
+	UPROPERTY(EditAnywhere, Config, Category = "Output")
+	bool bNormalMaps = true;
+
+	/** Invert the normal maps' green channel (if surfaces look lit from the wrong side). */
+	UPROPERTY(EditAnywhere, Config, Category = "Output")
+	bool bFlipNormalGreen = false;
+
+	/** Add an unbound post-process volume that turns on Lumen lighting and reflections in the
+	 *  imported map, whatever the project's renderer defaults. */
+	UPROPERTY(EditAnywhere, Config, Category = "Output")
+	bool bLumenVolume = true;
 
 	/** Build meshes with Nanite enabled (slower import, cheaper rendering of dense areas). */
 	UPROPERTY(EditAnywhere, Config, Category = "Output")

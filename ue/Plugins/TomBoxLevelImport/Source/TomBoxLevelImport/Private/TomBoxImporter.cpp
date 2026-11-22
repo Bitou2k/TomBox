@@ -50,6 +50,7 @@
 #include "Components/SkyLightComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
 #include "Engine/ExponentialHeightFog.h"
+#include "Engine/PostProcessVolume.h"
 #include "Modules/ModuleManager.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogTomBoxImport, Log, All);
@@ -149,7 +150,7 @@ bool FTomBoxImporter::Get(const FString& Path, TArray<uint8>& Out, FString& Erro
 	return true;
 }
 
-bool FTomBoxImporter::FetchArea(TArray<FPlacement>& Out, FTomBoxImportReport& Report)
+bool FTomBoxImporter::FetchInfo(FTomBoxImportReport& Report)
 {
 	TArray<uint8> Data;
 	FString Error;
@@ -166,25 +167,38 @@ bool FTomBoxImporter::FetchArea(TArray<FPlacement>& Out, FTomBoxImportReport& Re
 		return false;
 	}
 	TileSize = Info->GetNumberField(TEXT("tile"));
-	const int32 Level = FMath::Clamp(Options.DetailLevel, 0, 2);
-	const FVector2D C = Options.CenterMeters;
-	const double R = Options.RadiusMeters;
 	for (const TSharedPtr<FJsonValue>& V : Info->GetArrayField(TEXT("tiles")))
 	{
-		const TArray<TSharedPtr<FJsonValue>>& T = V->AsArray();
-		if (T.Num() < 5)
+		TArray<double> Row;
+		for (const TSharedPtr<FJsonValue>& X : V->AsArray())
 		{
-			continue;
+			Row.Add(X->AsNumber());
 		}
-		const int32 TX = int32(T[0]->AsNumber()), TY = int32(T[1]->AsNumber());
-		if (T[2 + Level]->AsNumber() <= 0)
+		if (Row.Num() >= 5)
+		{
+			Tiles.Add(Row);
+		}
+	}
+	return true;
+}
+
+bool FTomBoxImporter::FetchArea(int32 Level, double MinRadius, double MaxRadius, TArray<FPlacement>& Out, FTomBoxImportReport& Report)
+{
+	Level = FMath::Clamp(Level, 0, 2);
+	const FVector2D C = Options.CenterMeters;
+	TArray<uint8> Data;
+	FString Error;
+	for (const TArray<double>& T : Tiles)
+	{
+		const int32 TX = int32(T[0]), TY = int32(T[1]);
+		if (T[2 + Level] <= 0)
 		{
 			continue;
 		}
 		// Closest point of the tile to the centre.
 		const double NX = FMath::Clamp(C.X, TX * TileSize, (TX + 1) * TileSize);
 		const double NY = FMath::Clamp(C.Y, TY * TileSize, (TY + 1) * TileSize);
-		if (FMath::Square(NX - C.X) + FMath::Square(NY - C.Y) > R * R)
+		if (FMath::Square(NX - C.X) + FMath::Square(NY - C.Y) > MaxRadius * MaxRadius)
 		{
 			continue;
 		}
@@ -207,7 +221,8 @@ bool FTomBoxImporter::FetchArea(TArray<FPlacement>& Out, FTomBoxImportReport& Re
 		for (uint32 I = 0; I < Count[0]; ++I)
 		{
 			const float* P = &F[I * 12];
-			if (FMath::Square(P[0] - C.X) + FMath::Square(P[1] - C.Y) > R * R)
+			const double D2 = FMath::Square(P[0] - C.X) + FMath::Square(P[1] - C.Y);
+			if (D2 > MaxRadius * MaxRadius || D2 < MinRadius * MinRadius)
 			{
 				continue;
 			}
@@ -231,7 +246,8 @@ bool FTomBoxImporter::FetchArea(TArray<FPlacement>& Out, FTomBoxImportReport& Re
 
 UMaterial* FTomBoxImporter::BaseMaterial(bool bTextured)
 {
-	const FString Name = bTextured ? TEXT("M_TomBox_Textured") : TEXT("M_TomBox_Plain");
+	// "Lit": colour + normal map parameters (the earlier M_TomBox_Textured had colour only).
+	const FString Name = bTextured ? TEXT("M_TomBox_Lit") : TEXT("M_TomBox_Plain");
 	const FString PackageName = Options.ContentPath / TEXT("Materials") / Name;
 	if (UMaterial* Existing = LoadExisting<UMaterial>(PackageName, Name))
 	{
@@ -248,6 +264,12 @@ UMaterial* FTomBoxImporter::BaseMaterial(bool bTextured)
 		Tex->Texture = LoadObject<UTexture2D>(nullptr, TEXT("/Engine/EngineResources/DefaultTexture.DefaultTexture"));
 		Tex->SamplerType = SAMPLERTYPE_Color;
 		UMaterialEditingLibrary::ConnectMaterialProperty(Tex, TEXT("RGB"), MP_BaseColor);
+		auto* Nrm = Cast<UMaterialExpressionTextureSampleParameter2D>(
+			UMaterialEditingLibrary::CreateMaterialExpression(M, UMaterialExpressionTextureSampleParameter2D::StaticClass(), -400, 300));
+		Nrm->ParameterName = TEXT("NormalTex");
+		Nrm->Texture = LoadObject<UTexture2D>(nullptr, TEXT("/Engine/EngineMaterials/DefaultNormal.DefaultNormal"));
+		Nrm->SamplerType = SAMPLERTYPE_Normal;
+		UMaterialEditingLibrary::ConnectMaterialProperty(Nrm, TEXT("RGB"), MP_Normal);
 	}
 	else
 	{
@@ -267,9 +289,9 @@ UMaterial* FTomBoxImporter::BaseMaterial(bool bTextured)
 	return M;
 }
 
-UTexture2D* FTomBoxImporter::BuildTexture(const FString& Key, FTomBoxImportReport& Report)
+UTexture2D* FTomBoxImporter::BuildTexture(const FString& Key, bool bNormal, FTomBoxImportReport& Report)
 {
-	const FString Name = TEXT("T_") + Key;
+	const FString Name = (bNormal ? TEXT("TN_") : TEXT("T_")) + Key;
 	const FString PackageName = Options.ContentPath / TEXT("Textures") / Name;
 	if (UTexture2D* Existing = LoadExisting<UTexture2D>(PackageName, Name))
 	{
@@ -277,7 +299,7 @@ UTexture2D* FTomBoxImporter::BuildTexture(const FString& Key, FTomBoxImportRepor
 	}
 	TArray<uint8> Png;
 	FString Error;
-	if (!Get(TEXT("/api/tex/") + Key, Png, Error))
+	if (!Get(FString::Printf(TEXT("/api/tex/%s?max=%d"), *Key, Options.MaxTextureSize), Png, Error))
 	{
 		++Report.TexturesFailed;
 		if (Report.Errors.Num() < 20)
@@ -294,11 +316,27 @@ UTexture2D* FTomBoxImporter::BuildTexture(const FString& Key, FTomBoxImportRepor
 		++Report.TexturesFailed;
 		return nullptr;
 	}
+	if (bNormal && Options.bFlipNormalGreen)
+	{
+		for (int64 I = 1; I < Raw.Num(); I += 4)
+		{
+			Raw[I] = 255 - Raw[I];
+		}
+	}
 	UPackage* Package = CreatePackage(*PackageName);
 	UTexture2D* T = NewObject<UTexture2D>(Package, *Name, RF_Public | RF_Standalone);
 	T->Source.Init(Image->GetWidth(), Image->GetHeight(), 1, 1, TSF_BGRA8, Raw.GetData());
-	T->SRGB = true;  // colour maps (DiffuseTex is sRGB-format in every sampled shader)
-	T->CompressionSettings = TC_Default;
+	if (bNormal)
+	{
+		T->SRGB = false;
+		T->CompressionSettings = TC_Normalmap;
+		T->LODGroup = TEXTUREGROUP_WorldNormalMap;
+	}
+	else
+	{
+		T->SRGB = true;  // colour maps (DiffuseTex is sRGB-format in every sampled shader)
+		T->CompressionSettings = TC_Default;
+	}
 	T->PostEditChange();
 	FAssetRegistryModule::AssetCreated(T);
 	SaveAsset(T);
@@ -306,21 +344,23 @@ UTexture2D* FTomBoxImporter::BuildTexture(const FString& Key, FTomBoxImportRepor
 	return T;
 }
 
-UMaterialInterface* FTomBoxImporter::MaterialForTexture(const FString& Key, FTomBoxImportReport& Report)
+UMaterialInterface* FTomBoxImporter::MaterialFor(const FString& Colour, const FString& Normal, FTomBoxImportReport& Report)
 {
-	if (UMaterialInterface** Cached = MaterialCache.Find(Key))
+	const FString CacheKey = Colour + TEXT("_") + Normal;
+	if (UMaterialInterface** Cached = MaterialCache.Find(CacheKey))
 	{
 		return *Cached;
 	}
-	const FString Name = TEXT("MI_") + Key;
+	const FString Name = TEXT("MI_") + Colour + (Normal.IsEmpty() ? FString() : TEXT("_") + Normal);
 	const FString PackageName = Options.ContentPath / TEXT("Materials") / Name;
 	UMaterialInterface* Result = LoadExisting<UMaterialInstanceConstant>(PackageName, Name);
 	if (!Result)
 	{
-		UTexture2D* Tex = BuildTexture(Key, Report);
+		UTexture2D* Tex = BuildTexture(Colour, false, Report);
+		UTexture2D* Nrm = Normal.IsEmpty() ? nullptr : BuildTexture(Normal, true, Report);
 		if (!Tex)
 		{
-			Result = Untextured;  // texture not decodable: grey
+			Result = Untextured;  // colour texture not decodable: grey
 		}
 		else
 		{
@@ -328,13 +368,17 @@ UMaterialInterface* FTomBoxImporter::MaterialForTexture(const FString& Key, FTom
 			UMaterialInstanceConstant* MI = NewObject<UMaterialInstanceConstant>(Package, *Name, RF_Public | RF_Standalone);
 			MI->SetParentEditorOnly(BaseMaterial(true));
 			MI->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(TEXT("BaseColorTex")), Tex);
+			if (Nrm)
+			{
+				MI->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(TEXT("NormalTex")), Nrm);
+			}
 			MI->PostEditChange();
 			FAssetRegistryModule::AssetCreated(MI);
 			SaveAsset(MI);
 			Result = MI;
 		}
 	}
-	MaterialCache.Add(Key, Result);
+	MaterialCache.Add(CacheKey, Result);
 	return Result;
 }
 
@@ -399,8 +443,12 @@ UStaticMesh* FTomBoxImporter::BuildModel(uint32 Hash, FString& DisplayName, FTom
 		const int64 NT = int64(Part->GetNumberField(TEXT("nt")));
 		const bool bNormals = Part->GetBoolField(TEXT("normals"));
 		const bool bUVs = Part->GetBoolField(TEXT("uvs"));
-		FString Tex;
+		FString Tex, NormalKey;
 		const bool bTex = Part->TryGetStringField(TEXT("tex"), Tex);
+		if (!Options.bNormalMaps || !Part->TryGetStringField(TEXT("normal"), NormalKey))
+		{
+			NormalKey.Reset();
+		}
 		TArray<float> P, N, UV;
 		TArray<uint32> Idx;
 		if (!ReadArray(Data, At, NV * 3, P) || (bNormals && !ReadArray(Data, At, NV * 3, N)) || (bUVs && !ReadArray(Data, At, NV * 2, UV))
@@ -426,7 +474,7 @@ UStaticMesh* FTomBoxImporter::BuildModel(uint32 Hash, FString& DisplayName, FTom
 		const FPolygonGroupID Group = Mesh.CreatePolygonGroup();
 		const FName Slot(*FString::Printf(TEXT("Part%d"), PartIndex));
 		SlotNames[Group] = Slot;
-		Materials.Add(bTex && Options.bImportTextures ? MaterialForTexture(Tex, Report) : Untextured);
+		Materials.Add(bTex && Options.bImportTextures ? MaterialFor(Tex, NormalKey, Report) : Untextured);
 
 		TArray<FVertexInstanceID> Instances;
 		Instances.SetNumUninitialized(NV);
@@ -524,6 +572,15 @@ bool FTomBoxImporter::BuildMap(const TArray<FPlacement>& Placements, const TMap<
 	Sky->GetLightComponent()->bRealTimeCapture = true;
 	World->SpawnActor<ASkyAtmosphere>(FVector::ZeroVector, FRotator::ZeroRotator);
 	World->SpawnActor<AExponentialHeightFog>(FVector::ZeroVector, FRotator::ZeroRotator);
+	if (Options.bLumenVolume)
+	{
+		APostProcessVolume* Volume = World->SpawnActor<APostProcessVolume>(FVector::ZeroVector, FRotator::ZeroRotator);
+		Volume->bUnbound = true;
+		Volume->Settings.bOverride_DynamicGlobalIlluminationMethod = true;
+		Volume->Settings.DynamicGlobalIlluminationMethod = EDynamicGlobalIlluminationMethod::Lumen;
+		Volume->Settings.bOverride_ReflectionMethod = true;
+		Volume->Settings.ReflectionMethod = EReflectionMethod::Lumen;
+	}
 
 	FAssetRegistryModule::AssetCreated(World);
 	const bool bSaved = SaveAsset(World);
@@ -539,7 +596,13 @@ bool FTomBoxImporter::BuildMap(const TArray<FPlacement>& Placements, const TMap<
 bool FTomBoxImporter::Run(FTomBoxImportReport& Report)
 {
 	TArray<FPlacement> Placements;
-	if (!FetchArea(Placements, Report))
+	if (!FetchInfo(Report) || !FetchArea(Options.DetailLevel, 0.0, Options.RadiusMeters, Placements, Report))
+	{
+		return false;
+	}
+	// Surroundings: the next coarser level in a ring around the area.
+	if (Options.SurroundingsMeters > Options.RadiusMeters && Options.DetailLevel < 2
+		&& !FetchArea(Options.DetailLevel + 1, Options.RadiusMeters, Options.SurroundingsMeters, Placements, Report))
 	{
 		return false;
 	}

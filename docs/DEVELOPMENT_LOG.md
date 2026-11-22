@@ -1382,3 +1382,19 @@ shaders. Both runs used empty compiler caches.
   options object was garbage-collected during asset saves (now held by TStrongObjectPtr).
 - Not verified: the result in the editor viewport (orientation of the mirrored transforms has
   not been checked visually in UE).
+
+## 2026-11-22 — UE importer: image quality pass
+
+- User report: the imported area looks low quality. Causes: no renderer settings in the
+  host project (no Lumen / virtual shadow maps), textures capped at 512 px, colour map only,
+  nothing outside the import radius.
+- Normal-map slot identified visually: 0x1e77bf4c holds blue-purple tangent-space normal maps
+  (BC1 / BC7 linear) in sampled shaders (`drawable.NORMAL`, `normal_texture`); 0x739e3d0d
+  and SpecularTex (0xc6f46e79) look like packed masks (meaning not decoded, not used).
+- Tile layouts re-checked by smoothness (each texture untiled with every candidate layout):
+  215 of 217 sampled colour/normal textures are smoothest with the current rule.
+- Server: `/api/tex/<key>?max=N` (up to 4096); model parts carry their normal-map key.
+- Plugin: lit base material (colour + normal parameters), normal textures imported linear as
+  TC_Normalmap (optional green flip), `MaxTextureSize` (default 2048), surroundings ring of
+  the next coarser level (default 1 km), unbound post-process volume forcing Lumen GI and
+  reflections. Host project (local) config: DX12, Lumen, virtual shadow maps, TSR.
