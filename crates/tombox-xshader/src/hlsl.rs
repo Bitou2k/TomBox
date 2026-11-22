@@ -415,6 +415,14 @@ struct Emitter<'a> {
     strict_mesh: bool,
     /// Mesh shader uses group-shared memory (barriers are kept then).
     ms_lds: bool,
+    /// Compute shader of at most one console wave (<= 64 threads) that uses LDS without any
+    /// `s_barrier`: the console program relies on the wave executing in lockstep (e.g.
+    /// write a slot, atomically add into it, read it back, with only `s_waitcnt` between).
+    /// A PC GPU may run the group as several waves, so group barriers are inserted at the
+    /// first uniform (top-level) point after each LDS access (see `lds_sync_point`).
+    wave_lds_sync: bool,
+    /// An LDS access was emitted since the last inserted barrier.
+    lds_pending: bool,
     /// Compute shader uses LDS (groupshared memory).
     uses_lds: bool,
     /// Shader reads constant tables embedded in its code section.
@@ -793,6 +801,8 @@ fn translate_inner(ex: &ShaderExtract, opts: &Options, bindings: Option<bindings
         is_gs: ex.stage == Stage::Geometry,
         is_ms: ex.stage == Stage::Mesh && !strict_mesh,
         ms_lds: false,
+        wave_lds_sync: false,
+        lds_pending: false,
         uses_lds: false,
         uses_code: false,
         vreg_array: false,
@@ -818,6 +828,14 @@ fn translate_inner(ex: &ShaderExtract, opts: &Options, bindings: Option<bindings
     };
     em.vreg_array = em.insns.iter().any(|i| i.mnemonic.starts_with("v_movrel"));
     em.ms_lds = em.is_ms && em.insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32");
+    em.wave_lds_sync = em.is_cs
+        && {
+            let p = ex.isa_preamble;
+            let [x, y, z] = ex.psv_numthreads.unwrap_or([p[1].max(1), p[2].max(1), p[3].max(1)]);
+            x.saturating_mul(y).saturating_mul(z) <= 64
+        }
+        && em.insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32")
+        && !em.insns.iter().any(|i| i.enc == Enc::Sopp && i.op == 0x0a);
     // Lane-spill slots beyond the tracked range are function-scope temporaries.
     for ins in em.insns.iter() {
         for o in ins.dst.iter().chain(ins.src.iter()) {
@@ -2262,6 +2280,15 @@ impl<'a> Emitter<'a> {
         live.iter().map(|(k, n)| format!("{}{}", if *k == 1 { "v" } else { "s" }, n)).collect()
     }
 
+    /// Group barrier owed after an LDS access (see `wave_lds_sync`); call only where every
+    /// invocation of the group reaches the code (outside skip blocks and loops).
+    fn lds_sync_point(&mut self) {
+        if self.wave_lds_sync && self.lds_pending && self.loop_depth == 0 {
+            self.line("GroupMemoryBarrierWithGroupSync(); // console wave lockstep (wave_lds_sync)");
+            self.lds_pending = false;
+        }
+    }
+
     fn line(&mut self, s: &str) {
         self.body.push_str("    ");
         self.body.push_str(s);
@@ -2399,6 +2426,7 @@ impl<'a> Emitter<'a> {
                     open = false;
                 }
                 cur.clear();
+                self.lds_sync_point();
                 self.line("do {");
                 self.loop_depth += 1;
                 self.line(&format!("tb_c{b} = false;"));
@@ -2411,17 +2439,25 @@ impl<'a> Emitter<'a> {
                     open = false;
                 }
                 if !active.is_empty() {
+                    self.lds_sync_point();
                     let c: Vec<String> = active.iter().map(|t| format!("j{t}")).collect();
                     self.line(&format!("if (!({})) {{", c.join(" || ")));
                     open = true;
                 }
                 cur = active;
             }
+            let is_lds = ins.enc == Enc::Ds && ins.mnemonic != "ds_swizzle_b32";
+            if is_lds && !open {
+                self.lds_sync_point();
+            }
             for o in ins.src.iter().chain(ins.dst.iter()) {
                 self.touch(o);
             }
             self.emit_insn(i, ins, is_ps, target.get(&i).copied())
                 .map_err(|e| format!("{e} [{} @ {:#x}]", ins.mnemonic, ins.offset))?;
+            if is_lds {
+                self.lds_pending = true;
+            }
             if back.contains_key(&i) {
                 // Evaluate the back-edge condition inside the guard (a skipped branch is not taken).
                 let cond = Self::branch_cond(ins.op).unwrap_or("false");

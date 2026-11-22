@@ -366,3 +366,38 @@ fn vopc_cmpx_writes_exec_and_f16_compares_are_split() {
     ];
     assert_eq!(got, want.map(|(m, d)| (m.to_string(), d)));
 }
+
+/// One-wave compute shader (8x8 threads) that uses LDS without `s_barrier`, as in the
+/// title's bloom-chain setup (`251ed6ba5631cd6d`): every lane writes slot 0, then lanes add
+/// into it atomically, then read it back. The console runs the 64 lanes in lockstep; on a
+/// PC the group may be several waves, so a group barrier must separate each LDS phase.
+/// Without them the count was read early and groups took the wrong path (flickering blocks
+/// of infinite values in the bloom chain).
+#[test]
+fn one_wave_compute_lds_phases_get_group_barriers() {
+    let words = [
+        0xd834_0000, 0x0000_0909, // ds_write_b32 v0, v9 (addr v9)
+        0xbf8c_c07f,              // s_waitcnt lgkmcnt(0)
+        0xd800_0000, 0x0000_0609, // ds_add_u32 v9, v6
+        0xbf8c_c07f,              // s_waitcnt
+        0xd8d8_0000, 0x0700_0007, // ds_read_b32 v7, v7
+        0xbf8c_c07f,
+        S_ENDPGM,
+    ];
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], None);
+    ex.psv_numthreads = Some([8, 8, 1]);
+    let t = translate(&ex).expect("translate");
+    let lines: Vec<&str> = t.hlsl.lines().collect();
+    let at = |pat: &str| lines.iter().position(|l| l.contains(pat)).unwrap_or_else(|| panic!("{pat} missing\n{}", t.hlsl));
+    let write = at("] = v9;");
+    let add = at("InterlockedAdd(tb_lds");
+    let read = lines.iter().position(|l| l.contains("= tb_lds[")).expect("read");
+    let barriers: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.contains("GroupMemoryBarrierWithGroupSync")).map(|(i, _)| i).collect();
+    assert!(barriers.iter().any(|&b| write < b && b < add), "no barrier between write and add\n{}", t.hlsl);
+    assert!(barriers.iter().any(|&b| add < b && b < read), "no barrier between add and read\n{}", t.hlsl);
+
+    // Groups larger than one wave are left alone (they would carry their own s_barrier).
+    ex.psv_numthreads = Some([16, 16, 1]);
+    let t = translate(&ex).expect("translate");
+    assert!(!t.hlsl.contains("wave_lds_sync"), "{}", t.hlsl);
+}

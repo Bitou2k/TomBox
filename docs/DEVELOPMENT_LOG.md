@@ -1398,3 +1398,28 @@ shaders. Both runs used empty compiler caches.
   TC_Normalmap (optional green flip), `MaxTextureSize` (default 2048), surroundings ring of
   the next coarser level (default 1 km), unbound post-process volume forcing Lumen GI and
   reflections. Host project (local) config: DX12, Lumen, virtual shadow maps, TSR.
+
+## 2026-11-22 — Fortnite lobby: bloom "yellow boxes" traced to missing wave lockstep in LDS code
+
+- Output path checked first: `PresentX` now logs the plane / parameter structures the title
+  passes (template copied in `FD3D12Viewport::PresentInternal`, filled at run time). Every
+  field beyond token, resource count and resource pointer is zero, i.e. no HDR colour space:
+  the title presents SDR, matching the host swap chain. Not the cause.
+- Capture (lobby, raw dumps): scene colour targets have no non-finite values; the bloom
+  chain does. In two levels (400x225, 800x450) the sources are blocks exactly 10 pixels wide
+  and about 3 rows tall, red channel only, in the top rows, where the full-resolution input
+  is 0; the other levels hold the same blocks spread by the blur into hard-edged rectangles
+  (the flashing yellow boxes after tone mapping).
+- The two full-resolution compute shaders at the start of the chain (`251ed6ba5631cd6d`,
+  `1e8bbd9bbe7ab9b7`, 8x8 threads) use LDS without any `s_barrier`. `251ed6ba` counts lanes
+  that pass a test (all write slot 0, atomically add, read back, compare with 64); `1e8bbd9b`
+  exchanges values between lanes. On console the 64 threads are one wave in lockstep; on PC
+  the group can run as several waves, so the count was read early and groups took the wrong
+  path. Fix: for compute shaders of <= 64 threads with LDS and no `s_barrier`, a group
+  barrier is emitted at the first top-level point after each LDS access (before the next
+  top-level LDS access, a skip block or a loop). Test `one_wave_compute_lds_phases_get_group_barriers`;
+  both shaders compile with DXC; Fortnite archive still 105,506 / 105,506 translated.
+- Mistake during the analysis, recorded: the first capture read was a folder from 2026-11-18
+  (picked by sorting on modification time); the conclusions were re-checked on the current
+  captures.
+- Not yet verified in the running title (needs a restart with the new DLL).
