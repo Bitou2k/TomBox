@@ -1013,6 +1013,279 @@ Not done: a proper extractor in the repo (the scan was a scratch script), pixel/
 sampling, the `SGD5` index, mesh-shader translation, and a binding model for shaders
 without root signatures.
 
+## 2026-11-20 — Second title: what is and is not encrypted in the data packages
+
+Read-only survey with scratch scripts (samples of 17–34 MB per file at several offsets;
+not exhaustive).
+
+* **Only the tables of contents are opaque.** Every `RPF9` archive (including archives
+  nested inside `levels.rpf`, `navmeshes.rpf`, `anim.rpf`, …) has a plain 0x40-byte header
+  followed by a high-entropy table. The first bytes of that table are identical across
+  different archives. Not investigated further.
+* **File contents are zlib streams, not encrypted.** Sampled streams inflate cleanly:
+  `levels.rpf` 132 streams (22.8 MB → 88.5 MB), `navmeshes.rpf` 362, `anim.rpf` 857,
+  `data.rpf` 847, `core_bvh4.rpf` 730. Inflated payloads seen: resource objects carrying a
+  `0DRP` tag at +0x10 and pointers of the form `0x5000xxxx` (relocatable resource
+  memory), `PSIN`-tagged metadata blobs (most of `data.rpf`), raw float/index arrays
+  (navigation meshes), and `RSC8`-tagged records stored plain in `audio.rpf` and
+  `story000.rpf` next to readable asset names (`pack:/….clip`).
+* **`.ttpf` (magic `RDS5`)**: plain header (entry count at +4) and a plain 8-byte-per-entry
+  table, then zlib streams of 12–128 KiB that inflate to what look like block-compressed
+  texture pages (repeating 8-byte colour-pair + index blocks). By directory names these
+  are streamed texture databases (maps, terrain, peds, props, UI, …).
+
+Consequence: contents can be listed by scanning for streams, but without the tables there
+are no file names, sizes or boundaries for anything that is not self-describing. Nothing
+here was decrypted and no keys were looked for.
+
+## 2026-11-21 — Second title: 97% of shaders translate; descriptor-heap mode, mesh shaders; viewer
+
+Corpus: the 25,889 distinct shader containers of the second title's `shaders.rpf`
+(`rpf-shaders` extracts them; no table of contents needed). Translation coverage, measured
+with `xscan` over all of them after each step:
+
+| step | translated |
+|---|---|
+| start (Fortnite-only translator) | 1,792 (6.9%) |
+| heap mode, compares, MTBUF, f16 interpolation, wave ops | 9,566 (37.0%) |
+| mesh shaders | 15,713 (60.7%) |
+| DPP quad swaps, samplers as data, clip distances, SOP1 additions | 20,654 (79.8%) |
+| FSSM pixel-input table | 21,787 (84.2%) |
+| size/LOD queries, image atomics, MUBUF scalar offsets, 16-bit ops, 64-bit compares | 25,214 (97.4%) |
+
+Fortnite's archive stays at 105,506 / 105,506 after every step. Translation is not
+compilation and not correctness: a DXC compile sweep of this corpus is running separately.
+
+What was learned (evidence in the commits and the notes in `hlsl.rs`):
+
+* **No root signature, SM 6.6.** Descriptors are reached through pointers in entry SGPRs, at
+  constant and run-time offsets. Translated as `ResourceDescriptorHeap[address >> 5]`
+  (samplers `>> 4`) declared at each use, with entry SGPRs from a host constant buffer
+  (`TbUserData`, b0 space100) and a binding report per shader (`heap_bindings`). Whether a
+  read-only buffer/image is really an SRV, and whether a scalar-loaded buffer is a constant
+  buffer, is chosen by use (debt).
+* **Sampler descriptors as data** (loaded from a constant buffer): mapped through a 512-entry
+  host sampler table selected by address modes, filter, mip filter and compare function.
+* **Opcode tables corrected from LLVM** (GFX10): VOPC (v_cmpx, 16-/64-bit compares; the old
+  table had 0xd0-0xd7 wrong), VOP3 (f16 interpolation, v_pack_b32_f16, v_cvt_pk_u8_f32,
+  16-bit integer ops), SOP1 (wrexec, 64-bit bit scans), MTBUF formats (`UfmtGFX10`). The
+  decoder mis-sized VOP1/VOPC instructions with DPP sources (fixed).
+* **Mesh shaders** run as 64-wide waves; counts from GS_ALLOC_REQ, vertex/primitive exports
+  per thread, outputs written after the body. Entry registers v5 / s3 are inferred from
+  their use (debt).
+* **PS inputs** come from a table in the FSSM container (16-bit registers packed in pairs);
+  the half offset of the second register of a pair is inferred.
+* Performance: the resource dataflow copied the instruction list per basic block; large
+  shaders went from 11-20 s to under 0.1 s.
+
+`tombox-viewer` runs a translated vertex+pixel (or compute) pair on the host GPU over
+procedural models with made-up inputs and writes the targets as PNG. 73 of 81 pixel shaders
+that link with the title's blit vertex shader ran without a device removal and produced
+finite output; the 8 others write depth only (not handled by the viewer). The images show
+execution, not what the game draws: the harness does not know the title's data.
+
+Not done: the remaining 675 failures (mostly packed 16-bit attribute variants, d16 buffer
+loads, a few addressing forms), compile sweep results, runtime support for heap mode in
+`d3d12_xs` (needs the executable, which the dump does not contain).
+
+## 2026-11-21 — Second title: asset carving without the package table of contents
+
+- `rpf-carve` (crates/tombox-rpf): finds zlib streams in an RPF9 data area, inflates them,
+  joins consecutive 64 KiB streams into one file, classifies by leading bytes. Unit test with
+  streams between noise. Observed: data areas are compressed, not encrypted; only the table of
+  contents is encrypted, so file names are not recoverable except where a format embeds them.
+- Resource blocks: virtual data based at `0x50000000`, GPU data at `0x60000000` in the block
+  that follows. Texture dictionaries parsed (`tools/rage/txd.py`, field offsets inferred from
+  1,356 dictionaries: pointer array at +0x30, texture name/size/format/mips/GPU offset).
+- Untiling uses the title's own `xg_xs.dll` (`XGCreateTextureComputer`) through
+  `tools/rage/xgtry.py`; layout value `0x105` decodes every format checked by eye (uncompressed
+  gradient map, BC1/3/7 icons, normal maps). `tools/rage/texexport.py` exported 4,409 of the
+  texture package's textures to PNG (Pillow BC decoding). Not exported: 195 whose GPU data falls
+  outside the carved block, ~150 in formats Pillow does not decode (RGBA16F, R8, BC1 sRGB...).
+  Only mip 0 / slice 0 is written.
+- Models: drawable resources found (bounding box, LOD distances, names). Their GPU buffers are
+  not plain vertex/index buffers: each starts with a `B@` header and the bounding box, followed
+  by packed data, consistent with meshlet data for the mesh shaders. Not decoded yet.
+- Exported assets live under the git-ignored `input/`; nothing from the title is committed.
+
+## 2026-11-21 — Second title: meshlet geometry decoded; translator fixes from a DXC sample
+
+**Geometry** (`tools/rage/meshlets.py`, `modelexport.py`, `objshot.py`). Model GPU data is
+packed meshlets; the layout is read from the title's own mesh shaders (RDNA2 disassembly of
+`MS_VS_Transform_PositionOnly` and textured `MS_VS_Transform` variants), not guessed:
+- Meshlet buffer: header `0x80000000 | count`, triangle-dword total, vertex-reference total;
+  16-byte records from byte 12 (vertex count-1 and triangle count-1 in 7 bits each, 17-bit
+  vertex/triangle bases); triangles = three 7-bit local indices per dword; u16 vertex refs.
+- Position buffer (`B@`): header words = streams (offset `(w>>7)&0x1fffffc`, stride
+  `(w>>3)&60`). Positions 24/24/16-bit quantized, scale/bias at +0x70/+0x60, axis-order code at
+  +0x6c. Word 2 normals (octahedral), word 3 UVs (`16_16_SNORM` x float at +0x7c, or 2 x f32).
+- Checks: every meshlet's local indices in range; position buffers paired with meshlet
+  buffers by exact vertex count (header stream offsets); normals: 10:10 encoding matched the
+  sample terrain's face normals (mean dot 0.986), although the shader's branch reads as if
+  that data were 8:8 — unresolved, so the encoding is picked per model by the face-normal fit;
+  UVs: checker renders are continuous on terrain and a fan.
+- Minigame package: 13,437 geometries exported to OBJ (names from the resource); 1,718 not
+  (492 buffers with the meshlet flag that fail the checks, the rest ambiguous pairings of tiny
+  parts). Material -> texture linkage is not decoded (texture refs are joaat hashes in 32-byte
+  records; generic `blank_*` maps confirmed by hash).
+
+**Packages.** In the world package most of the 1.3 GB is neither zlib, raw deflate nor gzip,
+4 KiB-aligned with no recognisable leading bytes. Possibly per-file encryption, possibly an
+unidentified compressor; not pursued further (no decryption). Models' own textures are likely
+there or in the story package, so textured previews use a checker for now.
+
+**Translator** (400-shader random DXC sample of the second title: 359 compiled, 39 failed,
+3 translate failures; 9 hit the 300 s per-shader timeout):
+- SMEM SOFFSET register was not counted as an entry read: 14 shaders had an undeclared `sN`.
+  Fixed, regression test `smem_soffset_register_is_entry_live`.
+- PSV0 NumThreads offsets were wrong (40/44/48 instead of 36/40/44): mesh shaders declared
+  `numthreads(1, 1, name offset)`; 17 failed validation and the rest ran with one thread.
+  Compute shaders now prefer PSV0 over the ISA preamble (the title's preambles say 1,1,1; one
+  shader using derivatives failed validation). Fortnite's shaders carry no PSV0 thread counts:
+  still 105,506 / 105,506.
+
+## 2026-11-21 — Second title: texture packs (`.ttpf`) read; models linked to their textures; `levels.rpf` geometry
+
+**Texture packs** (`tools/rage/ttpf.py`, `ttpfexport.py`). Not encrypted; layout read off the
+files and cross-checked against inflated sizes (details in the `ttpf.py` docstring):
+- `RDS5` header: chunk count, virtual size, offset/256 of the `ETPF` texture table; then u64
+  chunk entries = file offset/256 (bits 0-25), codec (bits 26-29), virtual 4 KiB page (bits
+  30-51). Inflated chunk lengths equal the gaps between consecutive virtual pages (checked on
+  every chunk read).
+- `ETPF`: count at +8, 16-byte records (width, height, mip count, DXGI format in d1 bits 3-9,
+  array size, first page), then one sorted u64 hash per record. No names stored.
+- Tiling: the title's own layout library (`xg_xs.dll`). Record field d1 bits 24-26 select it:
+  0 -> layout 0x2, 1-3 -> 0x105. Chosen by rendering every layout value for sample textures
+  and checking visually (UI pack logos, photos and car renders; a ped decal and a monitor
+  screen that were tile-scrambled under 0x105 are correct under 0x2). A first rule keyed on
+  mip count 0 fixed the UI cases but not the decals, which is how the field was found.
+- Cube maps (array size 6, selector 4 plus higher bits) do not untile with any 2D or 3D layout
+  value tried (their 860,160-byte span is not any computed size); rejected explicitly. Under
+  1% of records. About 1.8% of a 3,600-record sample have a page span shorter than their
+  mip chain; also rejected (the following pages may belong to another texture).
+- 357,067 textures in 57 packs. 306,222 (85.8%) are stored entirely in zlib chunks and
+  decode. The rest touch chunks with codec values 1/3/4/5/6/7, and those values match the
+  BC format of the texture (1 = BC1, 3 = BC3, 4 = BC4, 5 = BC5, 6 = BC6H, 7 = BC7): a
+  BC-aware compressor, plausibly the console's hardware texture decompressor. No decoder for
+  it is in the dump or in Fortnite's binaries; reported as unsupported, not guessed. Worst
+  categories: terrain 67% and UI 65% decodable; vehicles 98%.
+- Some records' page span is smaller than the layout's size for their declared mip count
+  (e.g. a 1024x1024 BC1 with a 36 KiB span); not understood, reported per texture.
+- Uncompressed R8G8B8A8 records (graphics pack, small) have not been confirmed visually.
+
+**Model -> texture link.** A drawable's 32-byte texture records carry, after the joaat name
+hash and pointer, a u64 that is exactly a texture-pack hash: 6,615 of the 7,361 distinct keys
+in the minigame models resolve, and all 766 textures of the minigame's own map pack are
+referenced. `tools/rage/modeltex.py` resolves and decodes them (index of all packs in
+`input/carved2/ttpf_index.json`). The industrial fan resolves to painted-metal, rust and
+normal-map layers: these are tiling layer textures of a blended material, so which texture
+goes on which part (shader parameters -> geometry) is the next structure to decode; the
+earlier guess that model textures sat in the world/story packages is withdrawn.
+
+**`levels.rpf`** (76 GB). Random 1 MiB samples are dense zlib streams with `B@` position
+buffers. `rpf-carve` gained `--start/--len`; one 4 GiB slice (0x2c0000000..0x3c0000000)
+gave 20k+ resources named `levels/americas/...`, and `modelexport.py` exported
+level geometry from it (warehouse curtains, condo parts, car parks, a swing bridge, signs;
+spot-checked by render). Parts are in local coordinates; placement data not decoded.
+
+## 2026-11-21 — Second title: map placement records found
+
+`tools/rage/placements.py`. Placement ("entity") records are 0x90 bytes inside map resources in
+`levels.rpf`: quaternion at +0x0c, position at +0x34, joaat(model name) at +0x40 (equals a
+drawable's own name), flags at +0x44, scale XY/Z at +0x50/+0x54, index/parent at +0x58,
+draw distance at +0x5c. How it was found: object-type (archetype) records gave a name-hash
+pattern; an area file (`sb_38`) held the same name hashes inside 0x90-strided records with
+unit quaternions and world-sized positions. Not yet read through the resource's own header;
+found by a validated scan (unit quaternion, plausible scales, neighbouring record valid).
+
+Evidence:
+- 4 GiB slice: 352,071 records with the `0x0018xxxx`/`0x001cxxxx` flag form. Plotted from
+  above they draw the city (~5.1 x 5.8 km: street grid, coastline, islands, a port). Only
+  8,317 name a model inside the same slice; the rest name models elsewhere in the 76 GB.
+- Balusters around a pool (172 records) form continuous balustrades with curved corners.
+- Rotation convention: the stored quaternion is the inverse rotation. Hotel facade glass
+  panels form level bands with the conjugate and zigzag without it.
+Unknown: header/array pointers of the map resource, the per-file constant at +0x70, flags,
+the LOD-parent hierarchy (parent index != 0xffff on part of the records).
+
+## 2026-11-21 — Second title: whole `levels.rpf` mount index; streaming map viewer
+
+- `tombox_rpf::files::each_file`: windowed stream carving with 64 KiB-continuation joining,
+  shared by `rpf-carve` and the new `rpf-index`. Fixes a carver bug: the stream straddling each
+  64 MiB window was dropped (the overlap was read but never scanned). On the 4 GiB slice the new
+  reader finds 56 files the old one missed, all starting just before a window edge. Tests:
+  `carve_range` limit, joining across a range end (12 crate tests pass).
+- `rpf-index <package> <out>`: one pass, 4 threads at below-normal priority, writes
+  `files.tsv` (offset, extent, size, tag, kind, `name.#ext` strings) and `entities.bin`
+  (placement records, scanner ported from `placements.py`). Slice check against the Python
+  scanner: 354,753 records in common; the 15,683 only Python reported are overlapping false
+  positives (flags 0 / float-like); the 58 only Rust reported are flag-0x18 records from
+  recovered files. Full package: 878,673 files, 235,788 named, 2,250,307 records (2,057,950
+  with the 0x18/0x1c flag form) in 219 s.
+- Names: in a 4,000-file sample, half of the model resources carry their `name.#dr` after the
+  first 16 KiB, so names are searched in whole files. 97% of named files carry one name; the
+  rest hold several `_lod`/`_slod` models. Using single-name `.#dr` and `.#ft` files,
+  1,544,464 of 1,656,073 world placements resolve to a model file.
+- `meshnp.py`: numpy decoder, identical to `meshlets.py` on 4,018 model parts (positions,
+  triangles, normals, UVs compared).
+- `tools/rage/mapview`: `server.py` (127.0.0.1 only) loads the index and, per request,
+  inflates a model's two files from `levels.rpf` by offset and decodes them; `index.html`
+  (three.js) streams 250 m tiles around a fly camera and instances models by placement.
+  Sampled 400 models near the densest tile: 394 decode; 1,387 of 1,697 parts in a 200-model
+  sample. The first page version issued every model request at once and the browser dropped
+  them (~33k "failed" in the user's run); requests are now queued (6 at a time, with retries),
+  and decode failures and request errors are counted separately.
+
+## 2026-11-21 — Second title: model materials decoded; textured map viewer
+
+- `tools/rage/drawable.py`: model resource structure by pointer-following (layout in its
+  docstring). Shader group -> shaders -> parameter table (joaat name hash, slot code) ->
+  texture slot -> texture record (pack key). Model -> geometries with a u16 shader index each.
+  Each geometry points to its own position buffer (inline record +0x58) and meshlet buffer
+  (+0x40 struct, which also states meshlet and triangle counts). Fragments (`.#ft`) hold
+  their drawable at +0x18; multi-model files are dictionaries (name hashes + drawable
+  pointers).
+- Checks: 4,000 sampled level files - every geometry's meshlet buffer has exactly the stated
+  meshlet and triangle counts (15,866 parts), every shader index in range; all 776 dictionary
+  member hashes equal names stored in their files; 200 of 200 sampled fragments decode via
+  +0x18. Only two parameter hashes matched guessed names (DiffuseTex 0xc8e8c282, SpecularTex
+  0xc6f46e79); DiffuseTex slots hold only sRGB colour formats (BC1/BC7/BC3 sRGB). Shaders
+  without DiffuseTex: the first sRGB-format slot is used (92% of them layer 1 of layered
+  terrain shaders, 0x346394ea).
+- Second vertex format: header "c0" (low nibble 3, stride 12) = float32 x, y, z positions
+  (and float normals); extents equal the drawable bounding box on the samples. 4% of parts.
+- `ttpfexport.untile` takes a mip level; the viewer decodes the largest mip <= 512 px (median
+  29 ms per texture). A8/R8 formats decoded as grey.
+- Short texture records (span < mip chain, ~3.6%): not explained by missing top mips (16 of 218
+  match a cut-down chain exactly); left unsupported.
+- Viewer: per-part colour textures; 400 sampled models near the densest tile all decode
+  (2,677 parts, no part errors; previously 394 models with 18% of parts skipped); 256 of 292
+  tested colour textures decode. Offline renders of signs and a dumpster through the
+  server's own output show correct UV orientation (decals, rust along edges). Stop sign face
+  is missing: it is in the layered shader's overlay slot (0x7485dafb) and uses the unsupported
+  codec.
+
+## 2026-11-21 — Second title: textures, LOD and interiors - what closed, what is blocked
+
+- Unsupported texture codec: searched every DLL/EXE of both dumps and the OS image for a
+  software BCPack (or other) decoder: none. Blocked on a decoder; no guessing.
+- Short texture records: `ttpfexport.decode` (mip fallback, in-span only by default; an
+  `overlap` mode reads past the span avoiding other textures' footprints). Visual samples:
+  small textures do sit in unused parts of larger layouts, but ~25% stay garbled even within
+  their own span under every layout tried, so short records are still refused.
+- Map structure: map resources are a table of hashed sections (header +0x38, count +0x48);
+  0xce501483 = the placement array, 0xd3593fa6 = map header (name hash at +0x08, two
+  bounding boxes, placement count), 0x4a = list of other maps' name hashes. 20,404 map
+  files carry the header.
+- LOD links: (+0x58, +0x5a) tested as (index into 0x4a, index into that map's placements):
+  parents are `_lod` models (897 of 906) but their distance to the children equals an
+  off-by-one baseline; most +0x58 values exceed the list. Not decoded.
+- Viewer LOD: per tile, one detail level by distance (full < R, `_lod` < 3R, `_slod` < 8R,
+  by model name; fallback to the nearest level the tile has); per-level tile fetches. World
+  placements by level: 1,537,819 / 84,102 / 34,152.
+- Interiors: no placement record found (368-byte section 0xba049770 holds bounding boxes and
+  bitmasks, no rotation).
+
 ## 2026-11-22 — DXC coverage of the RPF9 shader archive
 
 `xscan shaders.rpf --compile 1 --fresh 1 --jobs 12 --shader-limit 3` processed
@@ -1075,3 +1348,78 @@ An independent build of [PR #4](https://github.com/drycheetah84/TomBox/pull/4)
 at `991903d` compiled 102 of the 320 shaders in the comparison sample,
 up from 93 at `7e8064f`. The nine additional shaders were all pixel
 shaders. Both runs used empty compiler caches.
+
+## 2026-11-22 — Merge of upstream (PSO-aware bindings, v_cmpx decoding, capture diagnostics)
+
+- Upstream reimplemented parts of the translator in parallel. Resolution in `hlsl.rs`:
+  PSO bindings (`translate_with_pso`, raw buffers, register spaces, inline samplers,
+  dynamic descriptor offsets) kept and combined with heap mode (exclusive: bindings turn heap
+  mode off); my wave-reduction lowering, compare emitter (class f16, 64-bit operands) and
+  typed declarations kept, with declarations routed through upstream's `register()`.
+- Mesh shaders, owner's decision: upstream's strict path (hlsl/mesh.rs: 128 threads, one
+  immediate GS_ALLOC_REQ, no branches, no entry registers) is the default; the inferred-ABI
+  path is behind `Options::infer_mesh_abi` (`xscan --infer-mesh-abi 1`, tombox-viewer on).
+  The runtime uses the default.
+- Upstream test `mesh_allocation_and_triangle_exports_compile_to_dxil` failed on upstream's
+  own branch (asserted `SetMeshOutputCounts(m0 & 0xfffu`, the code emits named counts);
+  assertion corrected, DXC compile part passes.
+- Checks: workspace tests 68 passed, 0 failed; Fortnite archive 105,506 / 105,506 translated
+  (no mesh shaders). Second title corpus not re-measured after the merge.
+
+## 2026-11-22 — Unreal Engine level importer (second title's map)
+
+- `ue/Plugins/TomBoxLevelImport` (UE 5.5 editor module): client of the map server. Imports an
+  area (centre, radius, detail level) as one static mesh per model (one material slot per
+  part, normals from the model or area-weighted face normals), `Texture2D` assets from the
+  server's PNGs, material instances of a two-sided base material, and a map with one HISM
+  actor per model plus sun, sky light, atmosphere and fog. Game right-handed metres -> UE
+  left-handed centimetres by mirroring Y (winding reversed; rotation conj(q) mirrored to
+  (x, -y, z, w)); area re-centred. Tools menu window and a `TomBoxImport` commandlet.
+- Built with UE 5.5 against the VS 2026 toolset (MSVC 14.51); no plugin warnings.
+- Headless test (100 m around -375, -875, full detail): 1,971 placements (2 without a model),
+  367 models built, 0 failed, 1 part skipped, 718 textures, 73 undecodable; 3.5 minutes.
+- Fixed during the test: `-center=X,Y` was cut at the comma (FParse separator); the commandlet's
+  options object was garbage-collected during asset saves (now held by TStrongObjectPtr).
+- Not verified: the result in the editor viewport (orientation of the mirrored transforms has
+  not been checked visually in UE).
+
+## 2026-11-22 — UE importer: image quality pass
+
+- User report: the imported area looks low quality. Causes: no renderer settings in the
+  host project (no Lumen / virtual shadow maps), textures capped at 512 px, colour map only,
+  nothing outside the import radius.
+- Normal-map slot identified visually: 0x1e77bf4c holds blue-purple tangent-space normal maps
+  (BC1 / BC7 linear) in sampled shaders (`drawable.NORMAL`, `normal_texture`); 0x739e3d0d
+  and SpecularTex (0xc6f46e79) look like packed masks (meaning not decoded, not used).
+- Tile layouts re-checked by smoothness (each texture untiled with every candidate layout):
+  215 of 217 sampled colour/normal textures are smoothest with the current rule.
+- Server: `/api/tex/<key>?max=N` (up to 4096); model parts carry their normal-map key.
+- Plugin: lit base material (colour + normal parameters), normal textures imported linear as
+  TC_Normalmap (optional green flip), `MaxTextureSize` (default 2048), surroundings ring of
+  the next coarser level (default 1 km), unbound post-process volume forcing Lumen GI and
+  reflections. Host project (local) config: DX12, Lumen, virtual shadow maps, TSR.
+
+## 2026-11-22 — Fortnite lobby: bloom "yellow boxes" traced to missing wave lockstep in LDS code
+
+- Output path checked first: `PresentX` now logs the plane / parameter structures the title
+  passes (template copied in `FD3D12Viewport::PresentInternal`, filled at run time). Every
+  field beyond token, resource count and resource pointer is zero, i.e. no HDR colour space:
+  the title presents SDR, matching the host swap chain. Not the cause.
+- Capture (lobby, raw dumps): scene colour targets have no non-finite values; the bloom
+  chain does. In two levels (400x225, 800x450) the sources are blocks exactly 10 pixels wide
+  and about 3 rows tall, red channel only, in the top rows, where the full-resolution input
+  is 0; the other levels hold the same blocks spread by the blur into hard-edged rectangles
+  (the flashing yellow boxes after tone mapping).
+- The two full-resolution compute shaders at the start of the chain (`251ed6ba5631cd6d`,
+  `1e8bbd9bbe7ab9b7`, 8x8 threads) use LDS without any `s_barrier`. `251ed6ba` counts lanes
+  that pass a test (all write slot 0, atomically add, read back, compare with 64); `1e8bbd9b`
+  exchanges values between lanes. On console the 64 threads are one wave in lockstep; on PC
+  the group can run as several waves, so the count was read early and groups took the wrong
+  path. Fix: for compute shaders of <= 64 threads with LDS and no `s_barrier`, a group
+  barrier is emitted at the first top-level point after each LDS access (before the next
+  top-level LDS access, a skip block or a loop). Test `one_wave_compute_lds_phases_get_group_barriers`;
+  both shaders compile with DXC; Fortnite archive still 105,506 / 105,506 translated.
+- Mistake during the analysis, recorded: the first capture read was a folder from 2026-11-18
+  (picked by sorting on modification time); the conclusions were re-checked on the current
+  captures.
+- Not yet verified in the running title (needs a restart with the new DLL).

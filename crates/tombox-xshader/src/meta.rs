@@ -75,6 +75,54 @@ pub struct GsInfo {
 /// Parse the GS part of PSV0's PSVRuntimeInfo: the stage union starts at +4
 /// ({InputPrimitive u32, OutputTopology u32, OutputStreamMask u32, ...}); PSVRuntimeInfo1
 /// adds ShaderStage u8 @+24, UsesViewID u8 @+25 and MaxVertexCount u16 @+26.
+/// Mesh-shader facts from the PSV0 runtime info (MSInfo + MS1 fields + thread counts).
+#[derive(Debug, Clone, Copy)]
+pub struct MsInfo {
+    pub max_vertices: u16,
+    pub max_primitives: u16,
+    /// 1 line, 2 triangle.
+    pub topology: u8,
+    pub numthreads: [u32; 3],
+}
+
+/// MSInfo is { groupshared bytes, view-id offset, view-id size, u16 max vertices, u16 max
+/// primitives } at the start of the runtime info; byte 26 is the mesh output topology
+/// (PSVRuntimeInfo1); PSVRuntimeInfo2 (size >= 52) ends with NumThreads X, Y, Z.
+pub fn parse_psv0_ms(body: &[u8]) -> Option<MsInfo> {
+    let info_size = u32_at(body, 0).ok()? as usize;
+    if info_size < 52 {
+        return None;
+    }
+    let info = body.get(4..4 + info_size)?;
+    if info[24] != 13 {
+        return None; // not a mesh shader
+    }
+    Some(MsInfo {
+        max_vertices: u16::from_le_bytes([info[12], info[13]]),
+        max_primitives: u16::from_le_bytes([info[14], info[15]]),
+        topology: info[27],
+        // PSVRuntimeInfo2 NumThreadsX/Y/Z at 36/40/44 (offset 48 is RuntimeInfo3's entry-name
+        // offset; reading 40..52 gave (1, 1, name offset), e.g. a 178-thread Z size).
+        numthreads: [u32_at(info, 36).ok()?, u32_at(info, 40).ok()?, u32_at(info, 44).ok()?],
+    })
+}
+
+/// `NumThreadsX/Y/Z` of `PSVRuntimeInfo2` (info offsets 36/40/44; present when the runtime
+/// info is at least 48 bytes). Only meaningful for compute, mesh and amplification shaders;
+/// None when absent or zero.
+pub fn parse_psv0_numthreads(body: &[u8]) -> Option<[u32; 3]> {
+    let info_size = u32_at(body, 0).ok()? as usize;
+    if info_size < 48 {
+        return None;
+    }
+    let info = body.get(4..4 + info_size)?;
+    let t = [u32_at(info, 36).ok()?, u32_at(info, 40).ok()?, u32_at(info, 44).ok()?];
+    if t.iter().any(|&x| x == 0) || t.iter().product::<u32>() > 1024 {
+        return None;
+    }
+    Some(t)
+}
+
 pub fn parse_psv0_gs(body: &[u8]) -> Option<GsInfo> {
     let info_size = u32_at(body, 0).ok()? as usize;
     if info_size < 28 {

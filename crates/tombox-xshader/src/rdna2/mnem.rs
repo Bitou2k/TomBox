@@ -44,62 +44,56 @@ pub fn vop1(op: u32) -> Option<&'static str> {
 }
 
 pub fn vopc(op: u32) -> Option<&'static str> {
-    const F: [&str; 16] = [
-        "v_cmp_f_f32", "v_cmp_lt_f32", "v_cmp_eq_f32", "v_cmp_le_f32", "v_cmp_gt_f32",
-        "v_cmp_lg_f32", "v_cmp_ge_f32", "v_cmp_o_f32", "v_cmp_u_f32", "v_cmp_nge_f32",
-        "v_cmp_nlg_f32", "v_cmp_ngt_f32", "v_cmp_nle_f32", "v_cmp_neq_f32", "v_cmp_nlt_f32",
-        "v_cmp_tru_f32",
+    // GFX10 opcode assignment, from LLVM's VOPCInstructions.td (gfx10 real instructions).
+    // f16 compares are split over two ranges (F..O at 0xc8/0xd8, U..TRU at 0xe8/0xf8).
+    const F32: [&str; 16] = [
+        "v_cmp_f_f32", "v_cmp_lt_f32", "v_cmp_eq_f32", "v_cmp_le_f32", "v_cmp_gt_f32", "v_cmp_lg_f32", "v_cmp_ge_f32", "v_cmp_o_f32",
+        "v_cmp_u_f32", "v_cmp_nge_f32", "v_cmp_nlg_f32", "v_cmp_ngt_f32", "v_cmp_nle_f32", "v_cmp_neq_f32", "v_cmp_nlt_f32", "v_cmp_tru_f32",
     ];
-    const H: [&str; 16] = [
-        "v_cmp_f_f16", "v_cmp_lt_f16", "v_cmp_eq_f16", "v_cmp_le_f16", "v_cmp_gt_f16",
-        "v_cmp_lg_f16", "v_cmp_ge_f16", "v_cmp_o_f16", "v_cmp_u_f16", "v_cmp_nge_f16",
-        "v_cmp_nlg_f16", "v_cmp_ngt_f16", "v_cmp_nle_f16", "v_cmp_neq_f16", "v_cmp_nlt_f16",
-        "v_cmp_tru_f16",
+    const F32X: [&str; 16] = [
+        "v_cmpx_f_f32", "v_cmpx_lt_f32", "v_cmpx_eq_f32", "v_cmpx_le_f32", "v_cmpx_gt_f32", "v_cmpx_lg_f32", "v_cmpx_ge_f32", "v_cmpx_o_f32",
+        "v_cmpx_u_f32", "v_cmpx_nge_f32", "v_cmpx_nlg_f32", "v_cmpx_ngt_f32", "v_cmpx_nle_f32", "v_cmpx_neq_f32", "v_cmpx_nlt_f32", "v_cmpx_tru_f32",
     ];
-    const I: [&str; 8] = [
-        "v_cmp_f_i32", "v_cmp_lt_i32", "v_cmp_eq_i32", "v_cmp_le_i32", "v_cmp_gt_i32",
-        "v_cmp_ne_i32", "v_cmp_ge_i32", "v_cmp_t_i32",
+    const F16: [&str; 16] = [
+        "v_cmp_f_f16", "v_cmp_lt_f16", "v_cmp_eq_f16", "v_cmp_le_f16", "v_cmp_gt_f16", "v_cmp_lg_f16", "v_cmp_ge_f16", "v_cmp_o_f16",
+        "v_cmp_u_f16", "v_cmp_nge_f16", "v_cmp_nlg_f16", "v_cmp_ngt_f16", "v_cmp_nle_f16", "v_cmp_neq_f16", "v_cmp_nlt_f16", "v_cmp_tru_f16",
     ];
-    const U: [&str; 8] = [
-        "v_cmp_f_u32", "v_cmp_lt_u32", "v_cmp_eq_u32", "v_cmp_le_u32", "v_cmp_gt_u32",
-        "v_cmp_ne_u32", "v_cmp_ge_u32", "v_cmp_t_u32",
+    const F16X: [&str; 16] = [
+        "v_cmpx_f_f16", "v_cmpx_lt_f16", "v_cmpx_eq_f16", "v_cmpx_le_f16", "v_cmpx_gt_f16", "v_cmpx_lg_f16", "v_cmpx_ge_f16", "v_cmpx_o_f16",
+        "v_cmpx_u_f16", "v_cmpx_nge_f16", "v_cmpx_nlg_f16", "v_cmpx_ngt_f16", "v_cmpx_nle_f16", "v_cmpx_neq_f16", "v_cmpx_nlt_f16", "v_cmpx_tru_f16",
     ];
-    // v_cmpx forms: opcode bit 4 set (see is_cmpx). Opcodes per LLVM AMDGPU
-    // VOPCInstructions.td, GFX10 section: the f16 compares are split over 0xc8-0xcf and
-    // 0xe8-0xef because 0xd0-0xd7 is v_cmpx_*_u32.
-    const FX: [&str; 16] = [
-        "v_cmpx_f_f32", "v_cmpx_lt_f32", "v_cmpx_eq_f32", "v_cmpx_le_f32", "v_cmpx_gt_f32",
-        "v_cmpx_lg_f32", "v_cmpx_ge_f32", "v_cmpx_o_f32", "v_cmpx_u_f32", "v_cmpx_nge_f32",
-        "v_cmpx_nlg_f32", "v_cmpx_ngt_f32", "v_cmpx_nle_f32", "v_cmpx_neq_f32", "v_cmpx_nlt_f32",
-        "v_cmpx_tru_f32",
-    ];
-    const HX: [&str; 16] = [
-        "v_cmpx_f_f16", "v_cmpx_lt_f16", "v_cmpx_eq_f16", "v_cmpx_le_f16", "v_cmpx_gt_f16",
-        "v_cmpx_lg_f16", "v_cmpx_ge_f16", "v_cmpx_o_f16", "v_cmpx_u_f16", "v_cmpx_nge_f16",
-        "v_cmpx_nlg_f16", "v_cmpx_ngt_f16", "v_cmpx_nle_f16", "v_cmpx_neq_f16", "v_cmpx_nlt_f16",
-        "v_cmpx_tru_f16",
-    ];
-    const IX: [&str; 8] = [
-        "v_cmpx_f_i32", "v_cmpx_lt_i32", "v_cmpx_eq_i32", "v_cmpx_le_i32", "v_cmpx_gt_i32",
-        "v_cmpx_ne_i32", "v_cmpx_ge_i32", "v_cmpx_t_i32",
-    ];
-    const UX: [&str; 8] = [
-        "v_cmpx_f_u32", "v_cmpx_lt_u32", "v_cmpx_eq_u32", "v_cmpx_le_u32", "v_cmpx_gt_u32",
-        "v_cmpx_ne_u32", "v_cmpx_ge_u32", "v_cmpx_t_u32",
-    ];
+    const I32: [&str; 8] = ["v_cmp_f_i32", "v_cmp_lt_i32", "v_cmp_eq_i32", "v_cmp_le_i32", "v_cmp_gt_i32", "v_cmp_ne_i32", "v_cmp_ge_i32", "v_cmp_t_i32"];
+    const I32X: [&str; 8] = ["v_cmpx_f_i32", "v_cmpx_lt_i32", "v_cmpx_eq_i32", "v_cmpx_le_i32", "v_cmpx_gt_i32", "v_cmpx_ne_i32", "v_cmpx_ge_i32", "v_cmpx_t_i32"];
+    const U32: [&str; 8] = ["v_cmp_f_u32", "v_cmp_lt_u32", "v_cmp_eq_u32", "v_cmp_le_u32", "v_cmp_gt_u32", "v_cmp_ne_u32", "v_cmp_ge_u32", "v_cmp_t_u32"];
+    const U32X: [&str; 8] = ["v_cmpx_f_u32", "v_cmpx_lt_u32", "v_cmpx_eq_u32", "v_cmpx_le_u32", "v_cmpx_gt_u32", "v_cmpx_ne_u32", "v_cmpx_ge_u32", "v_cmpx_t_u32"];
+    const I16: [&str; 6] = ["v_cmp_lt_i16", "v_cmp_eq_i16", "v_cmp_le_i16", "v_cmp_gt_i16", "v_cmp_ne_i16", "v_cmp_ge_i16"];
+    const I16X: [&str; 6] = ["v_cmpx_lt_i16", "v_cmpx_eq_i16", "v_cmpx_le_i16", "v_cmpx_gt_i16", "v_cmpx_ne_i16", "v_cmpx_ge_i16"];
+    const U16: [&str; 6] = ["v_cmp_lt_u16", "v_cmp_eq_u16", "v_cmp_le_u16", "v_cmp_gt_u16", "v_cmp_ne_u16", "v_cmp_ge_u16"];
+    const U16X: [&str; 6] = ["v_cmpx_lt_u16", "v_cmpx_eq_u16", "v_cmpx_le_u16", "v_cmpx_gt_u16", "v_cmpx_ne_u16", "v_cmpx_ge_u16"];
+    let i = op as usize;
     Some(match op {
-        0x00..=0x0f => F[op as usize],
-        0x10..=0x1f => FX[(op - 0x10) as usize],
-        0x80..=0x87 => I[(op - 0x80) as usize],
+        0x00..=0x0f => F32[i],
+        0x10..=0x1f => F32X[i - 0x10],
+        0x80..=0x87 => I32[i - 0x80],
         0x88 => "v_cmp_class_f32",
-        0x90..=0x97 => IX[(op - 0x90) as usize],
+        0x89..=0x8e => I16[i - 0x89],
+        0x8f => "v_cmp_class_f16",
+        0x90..=0x97 => I32X[i - 0x90],
         0x98 => "v_cmpx_class_f32",
-        0xc0..=0xc7 => U[(op - 0xc0) as usize],
-        0xc8..=0xcf => H[(op - 0xc8) as usize],
-        0xd0..=0xd7 => UX[(op - 0xd0) as usize],
-        0xd8..=0xdf => HX[(op - 0xd8) as usize],
-        0xe8..=0xef => H[(op - 0xe0) as usize],
-        0xf8..=0xff => HX[(op - 0xf0) as usize],
+        0x99..=0x9e => I16X[i - 0x99],
+        0x9f => "v_cmpx_class_f16",
+        0xa9..=0xae => U16[i - 0xa9],
+        0xb9..=0xbe => U16X[i - 0xb9],
+        0xc0..=0xc7 => U32[i - 0xc0],
+        0xa0..=0xa7 => ["v_cmp_f_i64", "v_cmp_lt_i64", "v_cmp_eq_i64", "v_cmp_le_i64", "v_cmp_gt_i64", "v_cmp_ne_i64", "v_cmp_ge_i64", "v_cmp_t_i64"][i - 0xa0],
+        0xb0..=0xb7 => ["v_cmpx_f_i64", "v_cmpx_lt_i64", "v_cmpx_eq_i64", "v_cmpx_le_i64", "v_cmpx_gt_i64", "v_cmpx_ne_i64", "v_cmpx_ge_i64", "v_cmpx_t_i64"][i - 0xb0],
+        0xe0..=0xe7 => ["v_cmp_f_u64", "v_cmp_lt_u64", "v_cmp_eq_u64", "v_cmp_le_u64", "v_cmp_gt_u64", "v_cmp_ne_u64", "v_cmp_ge_u64", "v_cmp_t_u64"][i - 0xe0],
+        0xf0..=0xf7 => ["v_cmpx_f_u64", "v_cmpx_lt_u64", "v_cmpx_eq_u64", "v_cmpx_le_u64", "v_cmpx_gt_u64", "v_cmpx_ne_u64", "v_cmpx_ge_u64", "v_cmpx_t_u64"][i - 0xf0],
+        0xc8..=0xcf => F16[i - 0xc8],
+        0xd0..=0xd7 => U32X[i - 0xd0],
+        0xd8..=0xdf => F16X[i - 0xd8],
+        0xe8..=0xef => F16[i - 0xe8 + 8],
+        0xf8..=0xff => F16X[i - 0xf8 + 8],
         _ => return None,
     })
 }
@@ -135,6 +129,11 @@ pub fn vop3(op: u32) -> Option<&'static str> {
         0x344 => "v_perm_b32", 0x351 => "v_min3_f16", 0x354 => "v_max3_f16", 0x357 => "v_med3_f16",
         0x360 => "v_readlane_b32", 0x361 => "v_writelane_b32", 0x363 => "v_bfm_b32", 0x364 => "v_bcnt_u32_b32",
         0x34b => "v_fma_f16",
+        0x303 => "v_add_nc_u16", 0x304 => "v_sub_nc_u16", 0x305 => "v_mul_lo_u16", 0x307 => "v_lshrrev_b16",
+        0x308 => "v_ashrrev_i16", 0x309 => "v_max_u16", 0x30a => "v_max_i16", 0x30b => "v_min_u16", 0x30c => "v_min_i16",
+        0x30d => "v_add_nc_i16", 0x30e => "v_sub_nc_i16", 0x314 => "v_lshlrev_b16",
+        0x15e => "v_cvt_pk_u8_f32", 0x311 => "v_pack_b32_f16",
+        0x342 => "v_interp_p1ll_f16", 0x343 => "v_interp_p1lv_f16", 0x35a => "v_interp_p2_f16",
         0x40e => "v_pk_fma_f16", 0x40f => "v_pk_add_f16", 0x410 => "v_pk_mul_f16", 0x411 => "v_pk_min_f16", 0x412 => "v_pk_max_f16",
         0x421 => "v_fma_mixlo_f16", 0x422 => "v_fma_mixhi_f16",
         0x420 => "v_fma_mix_f32", // VOP3P opcode 0x20 (see rdna2.rs: VOP3P opcodes are offset by 0x400)
@@ -175,6 +174,12 @@ pub fn sop1(op: u32) -> Option<&'static str> {
         0x27 => "s_andn2_saveexec_b64", 0x28 => "s_orn2_saveexec_b64", 0x29 => "s_nand_saveexec_b64",
         0x34 => "s_abs_i32", 0x37 => "s_andn1_saveexec_b64", 0x3c => "s_and_saveexec_b32",
         0x3d => "s_or_saveexec_b32", 0x3e => "s_xor_saveexec_b32", 0x3f => "s_andn2_saveexec_b32",
+        // GFX10 additions (opcode numbers from LLVM's SOPInstructions.td gfx10 table).
+        0x14 => "s_ff1_i32_b64", 0x16 => "s_flbit_i32_b64", 0x2a => "s_nor_saveexec_b64", 0x2b => "s_xnor_saveexec_b64",
+        0x38 => "s_orn1_saveexec_b64", 0x39 => "s_andn1_wrexec_b64", 0x3a => "s_andn2_wrexec_b64",
+        0x40 => "s_orn2_saveexec_b32", 0x41 => "s_nand_saveexec_b32", 0x42 => "s_nor_saveexec_b32",
+        0x43 => "s_xnor_saveexec_b32", 0x44 => "s_andn1_saveexec_b32", 0x45 => "s_orn1_saveexec_b32",
+        0x46 => "s_andn1_wrexec_b32", 0x47 => "s_andn2_wrexec_b32",
         _ => return None,
     })
 }
@@ -229,6 +234,9 @@ pub fn mimg(op: u32) -> Option<&'static str> {
         // 0x11 / 0x17: image atomics, named from the public GFX10 opcode table; consistent with
         // their use in 0de8a1db88825b8e (counter add, packed-value max). Other atomics unmapped.
         0x11 => "image_atomic_add", 0x17 => "image_atomic_umax",
+        0x0f => "image_atomic_swap", 0x10 => "image_atomic_cmpswap", 0x12 => "image_atomic_sub",
+        0x14 => "image_atomic_smin", 0x15 => "image_atomic_umin", 0x16 => "image_atomic_smax",
+        0x18 => "image_atomic_and", 0x19 => "image_atomic_or", 0x1a => "image_atomic_xor",
         0x00 => "image_load", 0x01 => "image_load_mip", 0x08 => "image_store", 0x09 => "image_store_mip",
         0x0e => "image_get_resinfo", 0x20 => "image_sample", 0x21 => "image_sample_cl",
         0x22 => "image_sample_d", 0x23 => "image_sample_d_cl", 0x24 => "image_sample_l",
@@ -256,6 +264,8 @@ pub fn mubuf(op: u32) -> Option<&'static str> {
         0x37 => "buffer_atomic_smax", 0x38 => "buffer_atomic_umax", 0x39 => "buffer_atomic_and",
         0x3a => "buffer_atomic_or", 0x3b => "buffer_atomic_xor", 0x3c => "buffer_atomic_inc",
         0x3d => "buffer_atomic_dec",
+        // GFX10 d16 typed loads (results packed as half pairs): 0x80-0x83.
+        0x80 => "buffer_load_format_d16_x", 0x81 => "buffer_load_format_d16_xy", 0x82 => "buffer_load_format_d16_xyz", 0x83 => "buffer_load_format_d16_xyzw", 0x84 => "buffer_store_format_d16_x", 0x85 => "buffer_store_format_d16_xy", 0x86 => "buffer_store_format_d16_xyz", 0x87 => "buffer_store_format_d16_xyzw",
         _ => return None,
     })
 }
@@ -274,6 +284,8 @@ pub fn lookup(enc: Enc, op: u32) -> Option<&'static str> {
         Enc::Smem => smem(op),
         Enc::Mimg => mimg(op),
         Enc::Mubuf => mubuf(op),
+        Enc::Mtbuf => Some(["tbuffer_load_format_x", "tbuffer_load_format_xy", "tbuffer_load_format_xyz", "tbuffer_load_format_xyzw",
+            "tbuffer_store_format_x", "tbuffer_store_format_xy", "tbuffer_store_format_xyz", "tbuffer_store_format_xyzw"][(op & 7) as usize]),
         Enc::Exp => Some("exp"),
         Enc::Flat => match op & 0x7f {
             0x0c => Some("flat_load_dword"),

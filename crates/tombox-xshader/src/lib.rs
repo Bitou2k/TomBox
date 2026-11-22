@@ -142,6 +142,10 @@ pub struct ShaderExtract {
     pub resources: Vec<meta::PsvResource>,
     /// Geometry-shader info from PSV0 (only meaningful for `Stage::Geometry`).
     pub gs_info: Option<meta::GsInfo>,
+    /// Mesh-shader info from PSV0 (only for `Stage::Mesh`).
+    pub ms_info: Option<meta::MsInfo>,
+    /// Thread-group size from PSV0 (`PSVRuntimeInfo2`), when the chunk has it.
+    pub psv_numthreads: Option<[u32; 3]>,
     pub mesh_info: Option<meta::MeshPipelineInfo>,
     pub root_sig: Option<meta::RootSig>,
 }
@@ -243,6 +247,8 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
         output_sig: chunk_body(b"OSG1").and_then(|b| meta::parse_signature(b).ok()).unwrap_or_default(),
         resources: chunk_body(b"PSV0").and_then(|b| meta::parse_psv0(b).ok()).unwrap_or_default(),
         gs_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_gs),
+        ms_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_ms),
+        psv_numthreads: chunk_body(b"PSV0").and_then(meta::parse_psv0_numthreads),
         mesh_info: chunk_body(b"PSV0").and_then(meta::parse_psv0_mesh_pipeline),
         root_sig: chunk_body(b"RTS0").and_then(|b| meta::parse_rts0(b).ok()),
     })

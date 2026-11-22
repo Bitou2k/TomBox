@@ -21,6 +21,11 @@
 //! Input is untrusted: every read is bounds-checked and nothing is allocated from sizes found
 //! in the file.
 
+pub mod carve;
+pub mod files;
+pub mod index;
+pub mod shaders;
+
 /// A contiguous part of the file with one character.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Region {

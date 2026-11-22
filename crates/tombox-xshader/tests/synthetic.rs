@@ -30,7 +30,11 @@ fn mesh_allocation_and_triangle_exports_compile_to_dxil() {
     });
     let translated = translate(&ex).unwrap();
     assert_eq!(translated.profile, "ms_6_5");
-    assert!(translated.hlsl.contains("SetMeshOutputCounts(m0 & 0xfffu"));
+    // Counts come from M0 (GS_ALLOC_REQ). The strict path names them before the call; the
+    // earlier assertion looked for `SetMeshOutputCounts(m0 & 0xfffu` and failed on its own
+    // branch as well.
+    assert!(translated.hlsl.contains("tb_vertex_count = m0 & 0xfffu"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("SetMeshOutputCounts(tb_vertex_count, tb_primitive_count)"), "{}", translated.hlsl);
     #[cfg(windows)]
     {
         let dxil = tombox_xshader::dxc::compile(&translated.hlsl, translated.profile).unwrap();
@@ -107,6 +111,8 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         output_sig,
         resources: Vec::new(),
         gs_info: None,
+        ms_info: None,
+        psv_numthreads: None,
         mesh_info: None,
         root_sig: root,
     }
@@ -358,6 +364,31 @@ fn translated_compute_buffer_adds_seven() {
     assert_eq!(output, [10, 36, 4, 957]);
 }
 
+/// A scalar constant-buffer load whose byte offset comes from an entry SGPR (SOFFSET field,
+/// not a decoded source operand) must count that register as read at entry; it was left
+/// undeclared, and DXC rejected the shader (second title, PS_CascadeShadows_texture).
+#[test]
+fn smem_soffset_register_is_entry_live() {
+    let root = Some(RootSig { version: 2, flags: 1, params: vec![table(2, 16, 5)], num_static_samplers: 0 });
+    let words = [
+        0xf408_0004, // s_load_dwordx4 s0, s8 [off=0]: constant buffer descriptor
+        0xfa00_0000,
+        0xf420_0100, // s_buffer_load_dword s4, s0 [off=0], soffset = s13
+        0x1a00_0000,
+        0x7e04_0204, // v_mov_b32 v2, s4
+        PACK_V0_V2_V2,
+        PACK_V1_V2_V2,
+        EXP_MRT0_COMPR[0],
+        EXP_MRT0_COMPR[1],
+        S_ENDPGM,
+    ];
+    let ex = shader(Stage::Pixel, &words, vec![], vec![sig("SV_Target", 64, 3, 0, 0xf)], root);
+    let t = translate(&ex).expect("translate");
+    let live = t.hlsl.lines().find(|l| l.starts_with("// entry-live registers")).expect("live line");
+    assert!(live.split_whitespace().any(|r| r == "s13"), "{live}\n{}", t.hlsl);
+    assert!(t.hlsl.contains("+ s13) >> 2"), "{}", t.hlsl);
+}
+
 /// GFX10 VOPC opcode layout (LLVM AMDGPU VOPCInstructions.td): bit 4 is the v_cmpx form,
 /// which writes EXEC only, in every encoding; 0xd0-0xd7 is v_cmpx_*_u32, and the f16
 /// compares continue at 0xe8, not 0xd0.
@@ -380,4 +411,39 @@ fn vopc_cmpx_writes_exec_and_f16_compares_are_split() {
         ("v_cmpx_ge_i32", Opnd::ExecLo),
     ];
     assert_eq!(got, want.map(|(m, d)| (m.to_string(), d)));
+}
+
+/// One-wave compute shader (8x8 threads) that uses LDS without `s_barrier`, as in the
+/// title's bloom-chain setup (`251ed6ba5631cd6d`): every lane writes slot 0, then lanes add
+/// into it atomically, then read it back. The console runs the 64 lanes in lockstep; on a
+/// PC the group may be several waves, so a group barrier must separate each LDS phase.
+/// Without them the count was read early and groups took the wrong path (flickering blocks
+/// of infinite values in the bloom chain).
+#[test]
+fn one_wave_compute_lds_phases_get_group_barriers() {
+    let words = [
+        0xd834_0000, 0x0000_0909, // ds_write_b32 v0, v9 (addr v9)
+        0xbf8c_c07f,              // s_waitcnt lgkmcnt(0)
+        0xd800_0000, 0x0000_0609, // ds_add_u32 v9, v6
+        0xbf8c_c07f,              // s_waitcnt
+        0xd8d8_0000, 0x0700_0007, // ds_read_b32 v7, v7
+        0xbf8c_c07f,
+        S_ENDPGM,
+    ];
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], None);
+    ex.psv_numthreads = Some([8, 8, 1]);
+    let t = translate(&ex).expect("translate");
+    let lines: Vec<&str> = t.hlsl.lines().collect();
+    let at = |pat: &str| lines.iter().position(|l| l.contains(pat)).unwrap_or_else(|| panic!("{pat} missing\n{}", t.hlsl));
+    let write = at("] = v9;");
+    let add = at("InterlockedAdd(tb_lds");
+    let read = lines.iter().position(|l| l.contains("= tb_lds[")).expect("read");
+    let barriers: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.contains("GroupMemoryBarrierWithGroupSync")).map(|(i, _)| i).collect();
+    assert!(barriers.iter().any(|&b| write < b && b < add), "no barrier between write and add\n{}", t.hlsl);
+    assert!(barriers.iter().any(|&b| add < b && b < read), "no barrier between add and read\n{}", t.hlsl);
+
+    // Groups larger than one wave are left alone (they would carry their own s_barrier).
+    ex.psv_numthreads = Some([16, 16, 1]);
+    let t = translate(&ex).expect("translate");
+    assert!(!t.hlsl.contains("wave_lds_sync"), "{}", t.hlsl);
 }

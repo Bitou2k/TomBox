@@ -1,0 +1,23 @@
+[package]
+name = "tombox-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Test harness: runs translated console shaders on the host GPU over procedural models and writes the render targets as images."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "tombox-viewer"
+path = "src/main.rs"
+
+[dependencies]
+tombox-xshader = { path = "../tombox-xshader" }
+png = "0.17"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }

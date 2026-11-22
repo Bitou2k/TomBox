@@ -366,6 +366,29 @@ unsafe fn present_frame(st: &mut State, queue: *mut c_void, src: *mut c_void) ->
     Ok(())
 }
 
+/// Logs the plane (0x90 bytes, as copied by `FD3D12Viewport::PresentInternal` from a
+/// run-time template) and present-parameter (0x20 bytes) structures the title passes, the
+/// first time and whenever their contents other than the per-frame token / float change.
+/// Purpose: find the colour-space / HDR fields (layout not documented; the template is
+/// filled at run time, so the values must be observed).
+unsafe fn log_present_structs(planes: *const u8, params: *const u8) {
+    static LAST: Mutex<Option<(Vec<u8>, Vec<u8>)>> = Mutex::new(None);
+    let mut plane = std::slice::from_raw_parts(planes, 0x90).to_vec();
+    plane[0..8].fill(0); // token changes every frame
+    let mut par = if params.is_null() { Vec::new() } else { std::slice::from_raw_parts(params, 0x20).to_vec() };
+    if par.len() >= 4 {
+        par[0..4].fill(0); // per-frame float (interval / timing)
+    }
+    let mut last = LAST.lock().unwrap();
+    if last.as_ref().map_or(false, |(a, b)| *a == plane && *b == par) {
+        return;
+    }
+    let hex = |b: &[u8]| b.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))).collect::<Vec<_>>().join(" ");
+    record("d3d12_xs", "PresentX", &format!("plane struct (token zeroed): {}", hex(&plane)));
+    record("d3d12_xs", "PresentX", &format!("params struct (float zeroed): {}", hex(&par)));
+    *last = Some((plane, par));
+}
+
 /// Xbox `PresentX` (queue slot 30).
 unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -378,6 +401,7 @@ unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes
     if FAILED.load(Ordering::Relaxed) || plane_count == 0 || planes.is_null() {
         return 0;
     }
+    log_present_structs(planes, _params);
     let res_count = core::ptr::read_unaligned(planes.add(8) as *const u32);
     let pp = core::ptr::read_unaligned(planes.add(0x10) as *const *const *mut c_void);
     if res_count == 0 || pp.is_null() || (*pp).is_null() {

@@ -434,7 +434,10 @@ fn process(blob: &[u8], compile: bool, use_cache: bool, dxc_limit: Option<u64>) 
         Err(e) => (String::from("?"), Err(format!("extract: {e}")), false),
         Ok(ex) => {
             let st = stage_name(&ex.stage).to_string();
-            let tr = hlsl::translate_with_pso(&ex, layouts_for(blob));
+            // `--infer-mesh-abi 1` (inherited by worker processes through the environment):
+            // mesh shaders take the inferred-ABI path instead of the strict one.
+            let opts = hlsl::Options { infer_mesh_abi: std::env::var_os("TOMBOX_INFER_MESH_ABI").is_some(), ..Default::default() };
+            let tr = hlsl::translate_with_pso_opts(&ex, layouts_for(blob), &opts);
             if MNEM.load(Ordering::Relaxed) != 0 {
                 // Instruction usage: (shaders using it, of which translated).
                 let names: std::collections::BTreeSet<String> =
@@ -573,7 +576,7 @@ fn main() -> ExitCode {
         }
     }
     if args.len() < 2 {
-        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1] [--fresh 1] [--dxc-limit <seconds>] [--shader-limit <seconds>]", args[0]);
+        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1] [--fresh 1] [--dxc-limit <seconds>] [--shader-limit <seconds>] [--infer-mesh-abi 1]", args[0]);
         return ExitCode::FAILURE;
     }
     let mut examples: Option<String> = None;
@@ -592,6 +595,11 @@ fn main() -> ExitCode {
             "--limit" => limit = args[i + 1].parse().unwrap_or(usize::MAX),
             "--jobs" => jobs = args[i + 1].parse().unwrap_or(jobs).max(1),
             "--compile" => compile = args[i + 1] == "1",
+            "--infer-mesh-abi" => {
+                if args[i + 1] == "1" {
+                    std::env::set_var("TOMBOX_INFER_MESH_ABI", "1");
+                }
+            }
             "--fresh" => use_cache = args[i + 1] != "1",
             "--pso-archive" => pso_archive = Some(args[i + 1].clone()),
             "--pso-offset" => {

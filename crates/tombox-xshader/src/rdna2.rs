@@ -407,6 +407,17 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
              vec![Opnd::Vgpr((d1 & 0xff) as u8), Opnd::Sgpr((((d1 >> 16) & 0x1f) * 4) as u8),
                   ssrc8(((d1 >> 24) & 0xff) as u16, None)], aux)
         }
+        Enc::Mtbuf => {
+            // GFX10 MTBUF: offset[11:0], offen 12, idxen 13, glc 14, op[2:0] 18:16, unified
+            // format [25:19]; dword 1 as MUBUF plus op[3] at bit 21.
+            let d1 = raw.get(1).copied().unwrap_or(0);
+            aux.imm = (w & 0xfff) as i64;
+            aux.mask = (((w >> 12) & 1) | (((w >> 13) & 1) << 1) | (((w >> 14) & 1) << 2) | (((d1 >> 21) & 1) << 3)) as u8;
+            aux.imm2 = ((w >> 19) & 0x7f) as i64;
+            (vec![Opnd::Vgpr(((d1 >> 8) & 0xff) as u8)],
+             vec![Opnd::Vgpr((d1 & 0xff) as u8), Opnd::Sgpr((((d1 >> 16) & 0x1f) * 4) as u8),
+                  ssrc8(((d1 >> 24) & 0xff) as u16, None)], aux)
+        }
         Enc::Vinterp => {
             let vdst = (w >> 18) & 0xff;
             let attr = (w >> 10) & 0x3f;
@@ -454,8 +465,8 @@ fn instr_len(enc: Enc, w: u32, next: Option<u32>) -> (usize, bool) {
             (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(w & 0x1ff, 233 | 234 | 250) || matches!(op, 0x20 | 0x21 | 0x2c | 0x2d | 0x37 | 0x38))
         }
         // A trailing dword follows for an inline literal (255) or an SDWA modifier (249).
-        Enc::Vop1 => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA),
-        Enc::Vopc => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA),
+        Enc::Vop1 => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(w & 0x1ff, 233 | 234 | 250)),
+        Enc::Vopc => (1, (w & 0x1ff) == 255 || (w & 0x1ff) == SRC_SDWA || matches!(w & 0x1ff, 233 | 234 | 250)),
         // VOP3/VOP3P: 2 dwords.
         Enc::Vop3 => {
             // GFX10 allows a trailing 32-bit literal on VOP3 when any source == 255.
@@ -490,6 +501,9 @@ fn opcode_field(enc: Enc, w: u32) -> u32 {
         Enc::Vop3 => (w >> 16) & 0x3ff,
         Enc::Mimg => ((w >> 18) & 0x7f) | ((w & 1) << 7),
         Enc::Mubuf => (w >> 18) & 0xff,
+        // MTBUF: op[2:0] in dword 0 bits 18:16 (op[3], in dword 1, selects the d16 forms and
+        // is checked by the translator).
+        Enc::Mtbuf => (w >> 16) & 7,
         Enc::Vinterp => (w >> 16) & 0x3,
         _ => (w >> 18) & 0xff,
     }

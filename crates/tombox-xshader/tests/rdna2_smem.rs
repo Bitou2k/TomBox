@@ -27,7 +27,7 @@ fn entry_scalar_offset_is_tracked_in_translation() {
         isa_offset_in_fssm: 0, isa_preamble: [0; 4], has_input_sig: true,
         has_output_sig: true, has_psv0: true, has_root_sig: false,
         input_sig: vec![], output_sig: vec![], resources: vec![], gs_info: None,
-        mesh_info: None, root_sig: None,
+        mesh_info: None, ms_info: None, psv_numthreads: None, root_sig: None,
     };
     let translated = tombox_xshader::hlsl::translate(&ex).unwrap();
     assert!(translated.hlsl.lines().next().unwrap().split_whitespace().any(|word| word == "s37"));

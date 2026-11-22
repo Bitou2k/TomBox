@@ -161,3 +161,40 @@ Honest ledger. Updated continuously.
 - **Binding trace cost.** Diagnostic only; it holds a reference on every buffer and a map
   entry per descriptor. Not suitable for normal runs as written. The same tracking is what
   a run-time check of structured-buffer strides would need.
+
+## Second title asset tools (tools/rage)
+- Normal encoding chosen per model by fit to face normals because the shader's top-bit branch
+  disagrees with the observed data (unresolved).
+- Model structure (`drawable.py`): shader group, shaders, parameter tables, models and
+  geometries decoded by pointer-following; parameter names are hashes, only DiffuseTex and
+  SpecularTex named. Other texture roles (normal, specular, masks, terrain layers 2+, the
+  overlay slot 0x7485dafb of layered shaders) are not applied; layered materials show layer 1.
+  `modelexport.py` (OBJ export) still uses the older vertex-count pairing.
+- Texture packs: 14% of textures use a BC-aware chunk codec (values 1-7 track BC1-BC7) with
+  no available decoder; layout choice (d1 bits 24-26: 0 -> 0x2, 1-3 -> 0x105) is from visual
+  checks; cube maps not untiled; ~1.8% of records' page spans are smaller than their declared
+  mip chain; R8G8B8A8 records unconfirmed; fields marked unknown in `ttpf.py`.
+- `levels.rpf`: indexed in full by `rpf-index` (no extraction), but placement records are found
+  by scanning, not via the map resource header; LOD hierarchy, flags and the per-file constant
+  undecoded. 5.5% of world placements name a model carried by no file in the package; 110k name
+  a model only inside multi-model (LOD dictionary) files, whose part -> name split is not
+  decoded; ~400k (5,351 files) lie within 250 m of the origin, presumably interiors in local
+  space, with no decoded world placement.
+- UE importer (`ue/Plugins/TomBoxLevelImport`): mirrored transforms not yet checked visually
+  in the editor; opaque materials only (decal alpha not used); no collision or lightmap UVs;
+  synchronous import (about 0.5 s per model).
+- Map viewer (`tools/rage/mapview`): colour texture only (see above); level of detail by
+  model name and distance band per tile, not the game's parent links; interiors left out.
+- Texture chunk codecs other than zlib (14% of textures): no decoder exists in the dump (no
+  BCPack or similar code in any DLL, executable or the OS image); blocked, not guessed.
+- Short texture records (~3.6%): layouts extend past the next texture's first page. Reading
+  past it while avoiding other textures' footprints recovers many, but ~25% of a visual
+  sample stayed garbled even inside their own span; no field separates them. Unsupported.
+- LOD hierarchy: placement +0x58/+0x5a look like (dependency index, parent index); section
+  0x4a of a map is a list of other maps' name hashes (from section 0xd3593fa6, +0x08). The
+  parents found that way are `_lod` models (897/906) but no closer to their children than an
+  off-by-one baseline, and most +0x58 values exceed the list: not decoded.
+- Interiors: 5,278 near-origin files, only 34 with the map header section; no world
+  placement record for them found (the 368-byte section 0xba049770 is not it).
+- Python, single-threaded; position/UV/normal only (colour, tangent streams ignored).
+- DXC: some generated compute shaders take > 2 minutes or time out (9 of 400 at 300 s).
