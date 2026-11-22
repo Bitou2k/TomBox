@@ -281,7 +281,14 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             if let Some(d1) = raw.get(1) {
                 aux.imm = (d1 & 0x1f_ffff) as i64; // 21-bit OFFSET in dword1
             }
-            (vec![ssrc8(sdata as u16, None)], vec![sgpr_pair(sbase as u16)], aux)
+            let mut src = vec![sgpr_pair(sbase as u16)];
+            if let Some(d1) = raw.get(1) {
+                let soffset = (d1 >> 25) as u16;
+                if soffset != 0x7d {
+                    src.push(ssrc8(soffset, None));
+                }
+            }
+            (vec![ssrc8(sdata as u16, None)], src, aux)
         }
         Enc::Vop2 => {
             let vdst = (w >> 17) & 0xff;
@@ -319,10 +326,17 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
                 let s0 = if (sd >> 23) & 1 != 0 { ssrc8((sd & 0xff) as u16, None) } else { Opnd::Vgpr((sd & 0xff) as u8) };
                 let s1 = if (sd >> 31) & 1 != 0 { ssrc8(vsrc1 as u16, None) } else { Opnd::Vgpr(vsrc1 as u8) };
                 // VOPC-SDWA: explicit scalar destination when SD (bit 15) is set, else VCC.
-                let dst = if (sd >> 15) & 1 != 0 { ssrc8(((sd >> 8) & 0x7f) as u16, None) } else { Opnd::VccLo };
+                let dst = if mnem::is_cmpx((w >> 17) & 0xff) {
+                    Opnd::ExecLo
+                } else if (sd >> 15) & 1 != 0 {
+                    ssrc8(((sd >> 8) & 0x7f) as u16, None)
+                } else {
+                    Opnd::VccLo
+                };
                 return (vec![dst], vec![s0, s1], aux);
             }
-            (vec![Opnd::VccLo], vec![src9(src0 as u16, lit), Opnd::Vgpr(vsrc1 as u8)], aux)
+            let dst = if mnem::is_cmpx((w >> 17) & 0xff) { Opnd::ExecLo } else { Opnd::VccLo };
+            (vec![dst], vec![src9(src0 as u16, lit), Opnd::Vgpr(vsrc1 as u8)], aux)
         }
         Enc::Vop3 => {
             let vdst = w & 0xff;
@@ -339,7 +353,13 @@ fn decode_operands(enc: Enc, raw: &[u32]) -> (Vec<Opnd>, Vec<Opnd>, InsnAux) {
             aux.imm2 = ((d1 >> 27) & 3) as i64;
             aux.imm = ((w >> 15) & 1) as i64;
             // Compare forms (op < 0x100) write a scalar mask register, not a VGPR.
-            let dst = if op < 0x100 { ssrc8(vdst as u16, None) } else { Opnd::Vgpr(vdst as u8) };
+            let dst = if mnem::is_cmpx(op) {
+                Opnd::ExecLo
+            } else if op < 0x100 {
+                ssrc8(vdst as u16, None)
+            } else {
+                Opnd::Vgpr(vdst as u8)
+            };
             (vec![dst],
              vec![src9(s0 as u16, l3), src9(s1 as u16, l3), src9(s2 as u16, l3)], aux)
         }

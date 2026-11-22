@@ -13,10 +13,80 @@
 //! (offsets normalised). With --examples, one sample blob per distinct failure is saved.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::{Read, Seek};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tombox_xshader::{extract, hlsl, Stage};
+use tombox_xshader::psocache::{self, BindingLayout, PsoCache, UserDataBinding, UserDataKind};
+
+static PSO_CACHE: std::sync::OnceLock<PsoCache> = std::sync::OnceLock::new();
+static WORKER_BINDINGS: std::sync::OnceLock<Vec<BindingLayout>> = std::sync::OnceLock::new();
+
+fn layouts_for(blob: &[u8]) -> &[BindingLayout] {
+    if let Some(layouts) = WORKER_BINDINGS.get() {
+        return layouts;
+    }
+    psocache::shader_hash(blob).and_then(|hash| PSO_CACHE.get().map(|cache| cache.bindings(&hash))).unwrap_or(&[])
+}
+
+fn encode_bindings(layouts: &[BindingLayout]) -> Vec<u8> {
+    let mut words = vec![layouts.len() as u32];
+    for layout in layouts {
+        words.extend([layout.metadata_index, layout.entries.len() as u32]);
+        for entry in &layout.entries {
+            let kind = match entry.kind {
+                UserDataKind::ShaderResource => 0x300,
+                UserDataKind::ConstantBuffer => 0x302,
+                UserDataKind::UnorderedAccess => 0x303,
+                UserDataKind::Sampler => 0x401,
+                UserDataKind::Other(value) => value,
+            };
+            words.extend([kind, entry.byte_offset, entry.register]);
+            words.extend(entry.raw_fields);
+        }
+    }
+    words.into_iter().flat_map(u32::to_le_bytes).collect()
+}
+
+fn decode_bindings(bytes: &[u8]) -> Result<Vec<BindingLayout>, String> {
+    if bytes.len() > 16 * 1024 * 1024 || bytes.len() % 4 != 0 {
+        return Err("invalid worker binding data length".into());
+    }
+    let mut words = bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap()));
+    let mut next = || words.next().ok_or("truncated worker binding data");
+    let count = next()?;
+    if count > 4096 {
+        return Err("worker binding layout count exceeds limit".into());
+    }
+    let mut layouts = Vec::new();
+    for _ in 0..count {
+        let metadata_index = next()?;
+        let count = next()?;
+        if count > 4096 {
+            return Err("worker binding entry count exceeds limit".into());
+        }
+        let mut entries = Vec::new();
+        for _ in 0..count {
+            let kind = match next()? {
+                0x300 => UserDataKind::ShaderResource,
+                0x302 => UserDataKind::ConstantBuffer,
+                0x303 => UserDataKind::UnorderedAccess,
+                0x401 => UserDataKind::Sampler,
+                other => UserDataKind::Other(other),
+            };
+            entries.push(UserDataBinding {
+                kind, byte_offset: next()?, register: next()?,
+                raw_fields: [next()?, next()?, next()?, next()?],
+            });
+        }
+        layouts.push(BindingLayout { metadata_index, entries });
+    }
+    if next().is_ok() {
+        return Err("unexpected trailing worker binding data".into());
+    }
+    Ok(layouts)
+}
 
 fn fnv1a(b: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -250,28 +320,36 @@ mod fxc {
 /// Compile with `fxc.exe` in a child process that is killed after `limit` seconds: an
 /// in-process D3DCompile cannot be cancelled, and some generated shaders take minutes.
 /// Returns Ok(seconds) or Err(reason).
-fn fxc_child(hlsl: &str, profile: &str, out: &std::path::Path, limit: u64) -> Result<f64, String> {
+fn compile_child(hlsl: &str, profile: &str, out: Option<&std::path::Path>, limit: u64, fxc: bool) -> Result<f64, String> {
     use std::process::{Command, Stdio};
     static FXC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let exe = FXC.get_or_init(|| {
-        std::env::var("FXC").unwrap_or_else(|_| r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe".to_string())
-    });
+    let compiler = if fxc { "fxc" } else { "dxc" };
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join("tombox_sweep_tmp");
     let _ = std::fs::create_dir_all(&dir);
     let id = N.fetch_add(1, Ordering::Relaxed);
     let src = dir.join(format!("{}_{id}.hlsl", std::process::id()));
     let tmp_out = dir.join(format!("{}_{id}.cso", std::process::id()));
-    std::fs::write(&src, hlsl).map_err(|e| format!("fxc: cannot write temp file: {e}"))?;
+    std::fs::write(&src, hlsl).map_err(|e| format!("{compiler}: cannot write temp file: {e}"))?;
     let t0 = std::time::Instant::now();
-    let mut child = Command::new(exe)
-        .args(["/nologo", "/T", profile, "/E", "main", "/Fo"])
-        .arg(&tmp_out)
-        .arg(&src)
+    let mut command = if fxc {
+        let exe = FXC.get_or_init(|| {
+            std::env::var("FXC").unwrap_or_else(|_| r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe".to_string())
+        });
+        let mut command = Command::new(exe);
+        command.args(["/nologo", "/T", profile, "/E", "main", "/Fo"]).arg(&tmp_out).arg(&src);
+        command
+    } else {
+        let exe = std::env::current_exe().map_err(|e| format!("dxc: cannot locate xscan: {e}"))?;
+        let mut command = Command::new(exe);
+        command.args(["--dxc-worker", profile]).arg(&src).arg(&tmp_out);
+        command
+    };
+    let mut child = command
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("fxc: cannot start {exe}: {e}"))?;
+        .map_err(|e| format!("{compiler}: cannot start compiler: {e}"))?;
     // Drain stderr on a helper thread so a chatty compiler cannot block on a full pipe.
     let mut stderr = child.stderr.take();
     let reader = std::thread::spawn(move || {
@@ -290,18 +368,28 @@ fn fxc_child(hlsl: &str, profile: &str, out: &std::path::Path, limit: u64) -> Re
                 break None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(e) => return Err(format!("fxc: wait failed: {e}")),
+            Err(e) => return Err(format!("{compiler}: wait failed: {e}")),
         }
     };
     let err = reader.join().unwrap_or_default();
     let secs = t0.elapsed().as_secs_f64();
     let _ = std::fs::remove_file(&src);
     let res = match status {
-        None => Err(format!("fxc: timeout after {limit} s")),
-        Some(_) if tmp_out.exists() => std::fs::rename(&tmp_out, out).map(|_| secs).map_err(|e| format!("fxc: cannot store result: {e}")),
+        None => Err(format!("{compiler}: timeout after {limit} s")),
+        Some(status) if status.success() && std::fs::metadata(&tmp_out).is_ok_and(|m| m.len() != 0) => {
+            if let Some(out) = out {
+                std::fs::rename(&tmp_out, out).map(|_| secs).map_err(|e| format!("{compiler}: cannot store result: {e}"))
+            } else {
+                Ok(secs)
+            }
+        }
         Some(_) => {
             let line = err.lines().find(|l| l.contains("error")).unwrap_or(err.lines().next().unwrap_or("no output")).to_string();
-            Err(format!("fxc: {}", line.split("): ").nth(1).unwrap_or(&line)))
+            if fxc {
+                Err(format!("fxc: {}", line.split("): ").nth(1).unwrap_or(&line)))
+            } else {
+                Err(line)
+            }
         }
     };
     let _ = std::fs::remove_file(&tmp_out);
@@ -341,12 +429,12 @@ static MNEM: AtomicUsize = AtomicUsize::new(0);
 static MNEM_USE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Translate (and optionally compile) one container. Returns (stage, result, compiled_now).
-fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
+fn process(blob: &[u8], compile: bool, use_cache: bool, dxc_limit: Option<u64>) -> (String, Result<(), String>, bool) {
     let r = std::panic::catch_unwind(|| match extract(blob) {
         Err(e) => (String::from("?"), Err(format!("extract: {e}")), false),
         Ok(ex) => {
             let st = stage_name(&ex.stage).to_string();
-            let tr = hlsl::translate(&ex);
+            let tr = hlsl::translate_with_pso(&ex, layouts_for(blob));
             if MNEM.load(Ordering::Relaxed) != 0 {
                 // Instruction usage: (shaders using it, of which translated).
                 let names: std::collections::BTreeSet<String> =
@@ -366,11 +454,12 @@ fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
                 }
                 Ok(t) if USE_FXC.load(Ordering::Relaxed) != 0 => {
                     let path = cache_path(&t.hlsl, t.profile);
-                    if path.exists() {
+                    if use_cache && std::fs::metadata(&path).is_ok_and(|m| m.len() != 0) {
                         return (st, Ok(()), false);
                     }
                     let _ = fxc::compile; // in-process FXC kept for reference; FXC runs as a killable child
-                    match fxc_child(&t.hlsl, t.profile, &path, LIMIT.load(Ordering::Relaxed) as u64) {
+                    let output = use_cache.then_some(path.as_path());
+                    match compile_child(&t.hlsl, t.profile, output, LIMIT.load(Ordering::Relaxed) as u64, true) {
                         Ok(secs) => {
                             if secs > 5.0 {
                                 SLOW.lock().unwrap().push((secs, fnv1a(blob), t.hlsl.lines().count()));
@@ -384,14 +473,22 @@ fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
                     // Default: DXC (shader model 6.0), in process.
                     let profile = tombox_xshader::dxc::profile_for(t.profile);
                     let path = tombox_xshader::dxc::cache_path(&t.hlsl, &profile);
-                    if path.exists() {
+                    if use_cache && std::fs::metadata(&path).is_ok_and(|m| m.len() != 0) {
                         return (st, Ok(()), false);
                     }
-                    let t0 = std::time::Instant::now();
-                    match tombox_xshader::dxc::compile(&t.hlsl, &profile) {
-                        Ok(code) => {
-                            let _ = std::fs::write(&path, code);
-                            let secs = t0.elapsed().as_secs_f64();
+                    let compiled = if let Some(limit) = dxc_limit {
+                        compile_child(&t.hlsl, &profile, use_cache.then_some(path.as_path()), limit, false)
+                    } else {
+                        let t0 = std::time::Instant::now();
+                        tombox_xshader::dxc::compile(&t.hlsl, &profile).map(|code| {
+                            if use_cache {
+                                let _ = std::fs::write(&path, code);
+                            }
+                            t0.elapsed().as_secs_f64()
+                        })
+                    };
+                    match compiled {
+                        Ok(secs) => {
                             if secs > 5.0 {
                                 SLOW.lock().unwrap().push((secs, fnv1a(blob), t.hlsl.lines().count()));
                             }
@@ -406,16 +503,88 @@ fn process(blob: &[u8], compile: bool) -> (String, Result<(), String>, bool) {
     r.unwrap_or_else(|_| (String::from("?"), Err("PANIC in translator".to_string()), false))
 }
 
+fn process_bounded(blob: &[u8], compile: bool, use_cache: bool, seconds: u64) -> (String, Result<(), String>, bool) {
+    use std::process::{Command, Stdio};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join("tombox_sweep_tmp");
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let input = dir.join(format!("shader_{}_{id}.dxbc", std::process::id()));
+    let sidecar = input.with_extension("bindings");
+    let run = || -> Result<_, String> {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(&input, blob).map_err(|e| e.to_string())?;
+        let layouts = layouts_for(blob);
+        if !layouts.is_empty() {
+            std::fs::write(&sidecar, encode_bindings(layouts)).map_err(|e| e.to_string())?;
+        }
+        let mut child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+            .arg("--shader-worker")
+            .arg(if compile { "1" } else { "0" })
+            .arg(if use_cache { "1" } else { "0" })
+            .arg(&input)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if start.elapsed().as_secs() >= seconds {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("shader pipeline: timeout after {seconds} s"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let mut output = String::new();
+        child.stdout.take().ok_or("shader worker: no stdout")?
+            .read_to_string(&mut output).map_err(|e| e.to_string())?;
+        let mut fields = output.trim_end_matches(['\r', '\n']).splitn(3, '\t');
+        let stage = fields.next().filter(|field| !field.is_empty()).ok_or("shader worker: no result")?;
+        let invoked = fields.next() == Some("1");
+        let diagnostics = fields.next().ok_or("shader worker: incomplete result")?;
+        let result = if status.success() { Ok(()) } else { Err(diagnostics.to_owned()) };
+        Ok((stage.to_owned(), result, invoked))
+    };
+    let result = run();
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&sidecar);
+    result.unwrap_or_else(|error| (String::from("?"), Err(error), false))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    if let [_, worker, compile, cache, input] = args.as_slice() {
+        if worker == "--shader-worker" {
+            return shader_worker(input, compile == "1", cache == "1");
+        }
+    }
+    if let [_, worker, profile, input, output] = args.as_slice() {
+        if worker == "--dxc-worker" {
+            return match dxc_worker(profile, input, output) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
     if args.len() < 2 {
-        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1]", args[0]);
+        eprintln!("usage: {} <file> [--examples <dir>] [--limit <n>] [--jobs <n>] [--compile 1] [--fresh 1] [--dxc-limit <seconds>] [--shader-limit <seconds>]", args[0]);
         return ExitCode::FAILURE;
     }
     let mut examples: Option<String> = None;
     let mut limit = usize::MAX;
     let mut jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let mut compile = false;
+    let mut use_cache = true;
+    let mut dxc_limit = None;
+    let mut shader_limit = None;
+    let mut pso_offset = None;
+    let mut pso_archive = None;
     let mut i = 2;
     while i + 1 < args.len() {
         match args[i].as_str() {
@@ -423,6 +592,33 @@ fn main() -> ExitCode {
             "--limit" => limit = args[i + 1].parse().unwrap_or(usize::MAX),
             "--jobs" => jobs = args[i + 1].parse().unwrap_or(jobs).max(1),
             "--compile" => compile = args[i + 1] == "1",
+            "--fresh" => use_cache = args[i + 1] != "1",
+            "--pso-archive" => pso_archive = Some(args[i + 1].clone()),
+            "--pso-offset" => {
+                let value = &args[i + 1];
+                pso_offset = match value.strip_prefix("0x") {
+                    Some(hex) => u64::from_str_radix(hex, 16).ok(),
+                    None => value.parse().ok(),
+                };
+                if pso_offset.is_none() {
+                    eprintln!("--pso-offset requires a byte offset");
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--dxc-limit" => match args[i + 1].parse::<u64>() {
+                Ok(seconds @ 1..) => dxc_limit = Some(seconds),
+                _ => {
+                    eprintln!("--dxc-limit requires a positive number of seconds");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--shader-limit" => match args[i + 1].parse::<u64>() {
+                Ok(seconds @ 1..) => shader_limit = Some(seconds),
+                _ => {
+                    eprintln!("--shader-limit requires a positive number of seconds");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--mnemonics" => MNEM.store((args[i + 1] == "1") as usize, Ordering::Relaxed),
             "--fxc-limit" => LIMIT.store(args[i + 1].parse().unwrap_or(120), Ordering::Relaxed),
             "--compiler" => USE_FXC.store((args[i + 1] == "fxc") as usize, Ordering::Relaxed),
@@ -430,8 +626,26 @@ fn main() -> ExitCode {
         }
         i += 2;
     }
-    let data = match std::fs::read(&args[1]) {
-        Ok(d) => d,
+    if shader_limit.is_some() && (dxc_limit.is_some() || USE_FXC.load(Ordering::Relaxed) != 0 || MNEM.load(Ordering::Relaxed) != 0) {
+        eprintln!("--shader-limit is for translation or DXC sweeps without --dxc-limit or --mnemonics");
+        return ExitCode::FAILURE;
+    }
+    if let Some(offset) = pso_offset {
+        let path = pso_archive.as_deref().unwrap_or(&args[1]);
+        let loaded = std::fs::File::open(path).and_then(|mut file| PsoCache::read(&mut file, offset));
+        match loaded {
+            Ok(cache) => { let _ = PSO_CACHE.set(cache); }
+            Err(error) => {
+                eprintln!("PSO cache: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if pso_archive.is_some() {
+        eprintln!("--pso-archive requires --pso-offset");
+        return ExitCode::FAILURE;
+    }
+    let blobs = match load_blobs(&args[1], limit) {
+        Ok(blobs) => blobs,
         Err(e) => {
             eprintln!("cannot read {}: {e}", args[1]);
             return ExitCode::FAILURE;
@@ -441,7 +655,9 @@ fn main() -> ExitCode {
         let _ = std::fs::create_dir_all(d);
     }
     if compile {
-        let _ = std::fs::create_dir_all(std::env::temp_dir().join("tombox_shader_cache").join("by_hlsl"));
+        if use_cache {
+            let _ = std::fs::create_dir_all(std::env::temp_dir().join("tombox_shader_cache").join("by_hlsl"));
+        }
         // A full sweep runs for a long time on someone's desktop: stay out of the way.
         #[cfg(windows)]
         unsafe {
@@ -454,26 +670,6 @@ fn main() -> ExitCode {
         if !args.iter().any(|a| a == "--jobs") {
             jobs = jobs.min(4);
         }
-    }
-    // Gather candidate blobs: UE shader-archive entries (LZ4 blocks) if the file holds
-    // an archive, otherwise raw DXBC containers found by magic.
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
-    let archives = find_archives(&data);
-    let mut lz_fail = 0usize;
-    for a in &archives {
-        for &(off, size, usize_) in &a.entries {
-            let src = &data[off..off + size];
-            let dec = if size == usize_ { Some(src.to_vec()) } else { lz4_block(src, usize_) };
-            match dec {
-                Some(d) => blobs.push(d),
-                None => lz_fail += 1,
-            }
-        }
-    }
-    if !archives.is_empty() {
-        eprintln!("decompressed {} archive entries ({lz_fail} LZ4 failures)", blobs.len());
-    } else {
-        blobs.push(data.clone());
     }
     // Unique containers.
     let mut seen: HashSet<u64> = HashSet::new();
@@ -515,7 +711,11 @@ fn main() -> ExitCode {
                     break;
                 }
                 let (h, blob) = work[i];
-                let (stage, res, compiled) = process(blob, compile);
+                let (stage, res, compiled) = if let Some(seconds) = shader_limit {
+                    process_bounded(blob, compile, use_cache, seconds)
+                } else {
+                    process(blob, compile, use_cache, dxc_limit)
+                };
                 let mut t = tally.lock().unwrap();
                 if compiled {
                     t.2 += 1;
@@ -547,7 +747,7 @@ fn main() -> ExitCode {
     println!("containers found: {found}   unique: {}   {}: {ok}   failed: {fail}   ({:.2}% ok)",
         seen.len(), if compile { "translated+compiled" } else { "translated" }, 100.0 * ok as f64 / (ok + fail).max(1) as f64);
     if compile {
-        println!("  compiled in this run: {compiled_now} (the rest came from the cache)");
+        println!("  compiler invocations: {compiled_now} (including failed compiles)");
     }
     for (st, (o, f)) in &by_stage {
         println!("  {st}: ok={o} fail={f}");
@@ -573,4 +773,91 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+fn shader_worker(input: &str, compile: bool, cache: bool) -> ExitCode {
+    let sidecar = std::path::Path::new(input).with_extension("bindings");
+    if sidecar.exists() {
+        let decoded = std::fs::read(sidecar).map_err(|error| error.to_string())
+            .and_then(|data| decode_bindings(&data));
+        match decoded {
+            Ok(layouts) => { let _ = WORKER_BINDINGS.set(layouts); }
+            Err(error) => {
+                println!("?\t0\t{error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let (stage, result, attempted) = match std::fs::read(input) {
+        Ok(blob) => process(&blob, compile, cache, None),
+        Err(error) => (String::from("?"), Err(error.to_string()), false),
+    };
+    let invoked = usize::from(attempted);
+    match result {
+        Ok(()) => {
+            println!("{stage}\t{invoked}\t");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let line = error.lines().next().unwrap_or("shader worker: no diagnostics");
+            println!("{stage}\t{invoked}\t{}", &line[..line.floor_char_boundary(800)]);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn dxc_worker(profile: &str, input: &str, output: &str) -> Result<(), String> {
+    let source = std::fs::read_to_string(input).map_err(|e| format!("dxc: cannot read HLSL: {e}"))?;
+    let bytecode = tombox_xshader::dxc::compile(&source, profile)?;
+    std::fs::write(output, bytecode).map_err(|e| format!("dxc: cannot write DXIL: {e}"))
+}
+
+fn load_blobs(path: &str, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut magic = [0; 4];
+    let has_magic = match file.read_exact(&mut magic) {
+        Ok(()) => &magic == b"9FPR",
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(error) => return Err(error),
+    };
+    file.rewind()?;
+    if has_magic {
+        let mut seen = HashSet::new();
+        let mut shaders = Vec::new();
+        let mut records = 0;
+        tombox_xshader::rpf::scan(file, |record| {
+            records += 1;
+            if seen.len() < limit && seen.insert(fnv1a(record.dxbc)) {
+                shaders.push(record.dxbc.to_vec());
+            }
+            Ok(())
+        })?;
+        eprintln!("RPF9 shader records: {records}, unique containers selected: {}", shaders.len());
+        return Ok(shaders);
+    }
+
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    let archives = find_archives(&data);
+    if archives.is_empty() {
+        return Ok(vec![data]);
+    }
+    let mut blobs = Vec::new();
+    let mut lz_fail = 0;
+    for archive in archives {
+        for (off, size, unpacked) in archive.entries {
+            let compressed = &data[off..off + size];
+            let decoded = if size == unpacked {
+                Some(compressed.to_vec())
+            } else {
+                lz4_block(compressed, unpacked)
+            };
+            match decoded {
+                Some(blob) => blobs.push(blob),
+                None => lz_fail += 1,
+            }
+        }
+    }
+    eprintln!("decompressed {} archive entries ({lz_fail} LZ4 failures)", blobs.len());
+    Ok(blobs)
 }

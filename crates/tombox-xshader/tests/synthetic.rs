@@ -14,6 +14,62 @@ mod d3d12;
 
 const S_ENDPGM: u32 = 0xbf81_0000;
 const S_NOP: u32 = 0xbf80_0000;
+
+#[test]
+fn mesh_allocation_and_triangle_exports_compile_to_dxil() {
+    let mut ex = shader(Stage::Mesh, &[
+        0xbefc03ff, 0x80080, 0xbf900009,
+        0x7e000280, 0x7e020280, 0x7e040280, 0x7e060280,
+        0xf8000141, 0,
+        0xf80008cf, 0x03020100,
+        S_ENDPGM,
+    ], vec![], vec![sig("SV_Position", 1, 3, 0, 15)], None);
+    ex.mesh_info = Some(tombox_xshader::meta::MeshPipelineInfo::Mesh {
+        threads: Some([128, 1, 1]), payload_bytes: 0, max_vertices: 128,
+        max_primitives: 128, topology: "triangle",
+    });
+    let translated = translate(&ex).unwrap();
+    assert_eq!(translated.profile, "ms_6_5");
+    assert!(translated.hlsl.contains("SetMeshOutputCounts(m0 & 0xfffu"));
+    #[cfg(windows)]
+    {
+        let dxil = tombox_xshader::dxc::compile(&translated.hlsl, translated.profile).unwrap();
+        assert!(dxil.starts_with(b"DXBC"));
+    }
+}
+
+#[test]
+fn mesh_rejects_unresolved_entry_registers() {
+    for (instruction, expected) in [(0x7e000305, "VGPR ABI unresolved: v5"), (0xbe800304, "SGPR ABI unresolved: s4")] {
+        let mut ex = shader(Stage::Mesh, &[instruction, 0xbefc03ff, 0x80080, 0xbf900009, S_ENDPGM], vec![], vec![], None);
+        ex.mesh_info = Some(tombox_xshader::meta::MeshPipelineInfo::Mesh {
+            threads: Some([128, 1, 1]), payload_bytes: 0, max_vertices: 128,
+            max_primitives: 128, topology: "triangle",
+        });
+        let error = translate(&ex).err().unwrap();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn mesh_rejects_unverified_control_flow_counts_and_wave_dimensions() {
+    let cases: &[(&[u32], Option<[u32; 3]>, &str)] = &[
+        (&[0xbf840002, 0xbefc03ff, 0x80080, 0xbf900009, S_ENDPGM], Some([128, 1, 1]), "uniform allocation dominance"),
+        (&[0xbe800380, 0xbefc0300, 0xbf900009, S_ENDPGM], Some([128, 1, 1]), "uniform immediate allocation"),
+        (&[0xbefc03ff, 0x81081, 0xbf900009, S_ENDPGM], Some([128, 1, 1]), "exceeds PSV bounds"),
+        (&[0xbefc03ff, 0x80080, 0xbf900009, S_ENDPGM], Some([64, 1, 1]), "verified 128-thread ABI"),
+        (&[0xbefc03ff, 0x80080, 0xbf900009, S_ENDPGM], None, "requires PSV thread dimensions"),
+    ];
+    for (words, threads, expected) in cases {
+        let mut ex = shader(Stage::Mesh, words, vec![], vec![], None);
+        ex.mesh_info = Some(tombox_xshader::meta::MeshPipelineInfo::Mesh {
+            threads: *threads, payload_bytes: 0, max_vertices: 128,
+            max_primitives: 128, topology: "triangle",
+        });
+        let error = translate(&ex).err().unwrap();
+        assert!(error.contains(expected), "{error}");
+    }
+}
 /// `v_cvt_pkrtz_f16_f32 v0, v2, v2` / `v1, v2, v2`: the default colour-export packing.
 const PACK_V0_V2_V2: u32 = 0x5e00_0502;
 const PACK_V1_V2_V2: u32 = 0x5e02_0502;
@@ -51,7 +107,91 @@ fn shader(stage: Stage, words: &[u32], input_sig: Vec<SigElement>, output_sig: V
         output_sig,
         resources: Vec::new(),
         gs_info: None,
+        mesh_info: None,
         root_sig: root,
+    }
+}
+
+#[test]
+fn floating_point_lg_and_nlg_compare_nan_with_opposite_results() {
+    let words = [
+        0x7c0a_0702,
+        0x7c14_0702,
+        S_ENDPGM,
+    ];
+    let ex = shader(Stage::Pixel, &words, vec![], vec![], None);
+    let t = translate(&ex).expect("translate");
+    assert!(t.hlsl.contains("!isnan(asfloat(v2)) && !isnan(asfloat(v3)) && (asfloat(v2) != asfloat(v3))"));
+    assert!(t.hlsl.contains("isnan(asfloat(v2)) || isnan(asfloat(v3)) || (asfloat(v2) == asfloat(v3))"));
+}
+
+#[test]
+fn pso_bindings_preserve_mixed_table_types_and_register_spaces() {
+    use tombox_xshader::hlsl::translate_with_pso;
+    use tombox_xshader::meta::PsvResource;
+    use tombox_xshader::psocache::{BindingLayout, UserDataBinding, UserDataKind};
+    let words = [
+        0xf408_0206, 0xfa00_0060,
+        0xf420_0084, 0xfa00_0000,
+        0xf408_0106, 0xfa00_01e0,
+        0xf420_0082, 0xfa00_0000,
+        S_ENDPGM,
+    ];
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], None);
+    ex.isa_preamble = [0, 1, 1, 1];
+    ex.resources = vec![
+        PsvResource { res_type: 4, space: 1, lower: 320, upper: 320 },
+        PsvResource { res_type: 2, space: 1, lower: 38, upper: 38 },
+    ];
+    let layout = BindingLayout {
+        metadata_index: 0,
+        entries: vec![
+            UserDataBinding { kind: UserDataKind::ShaderResource, byte_offset: 0x60, register: 320, raw_fields: [0, 0x10c04, u32::MAX, 0] },
+            UserDataBinding { kind: UserDataKind::ConstantBuffer, byte_offset: 0x1e0, register: 38, raw_fields: [0, 0x10c04, u32::MAX, 0] },
+        ],
+    };
+    let translated = translate_with_pso(&ex, &[layout]).unwrap();
+    assert!(translated.hlsl.contains("register(t320, space1)"));
+    assert!(translated.hlsl.contains("register(b38, space1)"));
+    assert!(translated.hlsl.contains(".Load(t"));
+    #[cfg(windows)]
+    if tombox_xshader::dxc::available() {
+        tombox_xshader::dxc::compile(&translated.hlsl, "cs_6_0").unwrap();
+    }
+}
+
+#[test]
+fn pso_dynamic_descriptor_offset_selects_raw_buffers_at_runtime() {
+    use tombox_xshader::hlsl::translate_with_pso;
+    use tombox_xshader::meta::PsvResource;
+    use tombox_xshader::psocache::{BindingLayout, UserDataBinding, UserDataKind};
+    let words = [
+        0xbe84_0380,
+        0xf408_0206, 0x0800_0000,
+        0xf420_0084, 0xfa00_0000,
+        S_ENDPGM,
+    ];
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], None);
+    ex.isa_preamble = [0, 1, 1, 1];
+    ex.resources = vec![
+        PsvResource { res_type: 4, space: 1, lower: 5, upper: 5 },
+        PsvResource { res_type: 4, space: 2, lower: 6, upper: 6 },
+    ];
+    let layout = BindingLayout {
+        metadata_index: 0,
+        entries: vec![
+            UserDataBinding { kind: UserDataKind::ShaderResource, byte_offset: 0, register: 5, raw_fields: [0, 0x10c04, u32::MAX, 0] },
+            UserDataBinding { kind: UserDataKind::ShaderResource, byte_offset: 32, register: 6, raw_fields: [0, 0x20c04, u32::MAX, 0] },
+        ],
+    };
+    let translated = translate_with_pso(&ex, &[layout]).unwrap();
+    assert!(translated.hlsl.contains("register(t5, space1)"));
+    assert!(translated.hlsl.contains("register(t6, space2)"));
+    assert!(translated.hlsl.contains("tb_dsel8 = 0xc000000u | (s4 + 0u);"));
+    assert!(translated.hlsl.contains("if (tb_dsel8 == 0xc000020u)"));
+    #[cfg(windows)]
+    if tombox_xshader::dxc::available() {
+        tombox_xshader::dxc::compile(&translated.hlsl, "cs_6_0").unwrap();
     }
 }
 
@@ -216,4 +356,28 @@ fn translated_compute_buffer_adds_seven() {
     let input = [3, 29, u32::MAX - 2, 950];
     let output = d3d12::dispatch_buffer(&dxil, input).expect("dispatch on D3D12 WARP");
     assert_eq!(output, [10, 36, 4, 957]);
+}
+
+/// GFX10 VOPC opcode layout (LLVM AMDGPU VOPCInstructions.td): bit 4 is the v_cmpx form,
+/// which writes EXEC only, in every encoding; 0xd0-0xd7 is v_cmpx_*_u32, and the f16
+/// compares continue at 0xe8, not 0xd0.
+#[test]
+fn vopc_cmpx_writes_exec_and_f16_compares_are_split() {
+    use tombox_xshader::rdna2::{disassemble, Opnd};
+    let words = [
+        0x7c28_0300u32,          // v_cmpx_gt_f32 v0, v1 (e32)
+        0x7da2_0300,             // v_cmpx_lt_u32 v0, v1 (e32)
+        0x7dd0_0300,             // v_cmp_u_f16 v0, v1 (e32)
+        0xd496_006a, 0x0002_0300, // v_cmpx_ge_i32 v0, v1 (e64, SDST field ignored)
+        S_ENDPGM,
+    ];
+    let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let got: Vec<(String, Opnd)> = disassemble(&isa).into_iter().map(|i| (i.mnemonic, i.dst[0])).take(4).collect();
+    let want = [
+        ("v_cmpx_gt_f32", Opnd::ExecLo),
+        ("v_cmpx_lt_u32", Opnd::ExecLo),
+        ("v_cmp_u_f16", Opnd::VccLo),
+        ("v_cmpx_ge_i32", Opnd::ExecLo),
+    ];
+    assert_eq!(got, want.map(|(m, d)| (m.to_string(), d)));
 }

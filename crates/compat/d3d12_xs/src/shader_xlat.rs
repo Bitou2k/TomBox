@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 type Cached = Result<Arc<Vec<u8>>, Arc<String>>;
-static CACHE: OnceLock<Mutex<HashMap<u64, Cached>>> = OnceLock::new();
+type ShaderCompilation = Arc<OnceLock<Cached>>;
+static CACHE: OnceLock<Mutex<HashMap<u64, ShaderCompilation>>> = OnceLock::new();
 static OK: AtomicUsize = AtomicUsize::new(0);
 static FAIL: AtomicUsize = AtomicUsize::new(0);
 static DUMPED: AtomicUsize = AtomicUsize::new(0);
@@ -198,17 +199,19 @@ pub unsafe fn translate(ptr: *const u8, len: usize) -> Cached {
     let blob = core::slice::from_raw_parts(ptr, len);
     let hash = fnv1a(blob);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().unwrap().get(&hash) {
-        return hit.clone();
-    }
+    let compilation = cache.lock().unwrap().entry(hash).or_default().clone();
+    compilation.get_or_init(|| compile_and_record(blob, hash)).clone()
+}
+
+fn compile_and_record(blob: &[u8], hash: u64) -> Cached {
     // Translation never unwinds across the FFI boundary: a panic becomes an error.
     let res = std::panic::catch_unwind(|| translate_uncached(blob, hash))
         .unwrap_or_else(|_| Err("translator panicked".to_string()));
-    let entry: Cached = match res {
+    match res {
         Ok(v) => {
             let n = OK.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n % 50 == 0 {
-                record("d3d12_xs", "shader_xlat", &format!("ok #{n} hash={hash:016x} {len}B -> {}B DXBC", v.len()));
+                record("d3d12_xs", "shader_xlat", &format!("ok #{n} hash={hash:016x} {}B -> {}B DXBC", blob.len(), v.len()));
             }
             let v = Arc::new(v);
             if crate::rtcap::enabled() {
@@ -224,9 +227,7 @@ pub unsafe fn translate(ptr: *const u8, len: usize) -> Cached {
             }
             Err(Arc::new(e))
         }
-    };
-    cache.lock().unwrap().insert(hash, entry.clone());
-    entry
+    }
 }
 
 pub fn counts() -> (usize, usize) {

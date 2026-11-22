@@ -34,13 +34,13 @@
     }
   },
   "stages": {
-    "comment": "shader stages the translator accepts; mesh and amplification first seen in the second title",
-    "Vertex": "done",
-    "Pixel": "done",
-    "Compute": "done",
+    "comment": "HLSL translation by stage. Partial stages have known failures in the second title.",
+    "Vertex": "partial",
+    "Pixel": "partial",
+    "Compute": "partial",
     "Geometry": "done",
-    "Hull": "done",
-    "Domain": "done",
+    "Hull": "none",
+    "Domain": "none",
     "Mesh": "none",
     "Amplification": "none"
   },

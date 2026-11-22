@@ -65,6 +65,16 @@ fn main() -> ExitCode {
         "DXBC chunks: inputSig={} outputSig={} PSV0={} rootSig={}",
         ex.has_input_sig, ex.has_output_sig, ex.has_psv0, ex.has_root_sig
     );
+    if matches!(ex.stage, Stage::Mesh | Stage::Amplification) {
+        if let Ok(container) = tombox_xshader::Dxbc::parse(&blob) {
+            if let Some(chunk) = container.chunk(b"PSV0") {
+                let psv = &blob[chunk.offset..chunk.offset + chunk.size];
+                if let Some(info) = tombox_xshader::meta::parse_psv0_mesh_pipeline(psv) {
+                    println!("PSV0 mesh pipeline: {info:?}");
+                }
+            }
+        }
+    }
     println!(
         "FSSM: {} bytes   ISA: {} bytes ({} dwords) @ FSSM+{:#x}",
         ex.fssm.len(),
